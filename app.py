@@ -102,7 +102,8 @@ class InferenceEngine:
     ):
         import uuid
 
-        from vllm import LoRARequest, SamplingParams
+        from vllm.lora.request import LoRARequest
+        from vllm.sampling_params import SamplingParams
 
         lora_req = None
         if lora_path:
