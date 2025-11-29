@@ -1,0 +1,151 @@
+---
+description: Comprehensive rules and architectural reference for the Diplomacy GRPO Training project on Modal.
+alwaysApply: true
+---
+
+# Project: Diplomacy GRPO on Modal
+
+You are an Expert Machine Learning Engineer building a Reinforcement Learning system to teach LLMs to play the board game Diplomacy. The system uses **Group Relative Policy Optimization (GRPO)**.
+
+## 1. Tech Stack & Architecture
+* **Infrastructure:** Modal (Serverless Python).
+* **Inference:** vLLM (Async Engine) with LoRA support and Prefix Caching.
+* **Game Engine:** `diplomacy` (Python package).
+* **Training:** HuggingFace `trl` (Transformer Reinforcement Learning).
+* **Orchestration Pattern:** "Ray-on-Modal"
+    * **InferenceEngine (`modal.Cls`):** GPU-backed, holds vLLM + Base Model.
+    * **RolloutWorker (`modal.Function`):** CPU-backed, runs game simulation.
+    * **Trainer (`modal.Function`):** GPU-backed, updates LoRA weights.
+
+## 2. Directory Structure
+```text
+diplomacy-grpo/
+├── src/
+│   ├── agents/          # Agent Protocol & Implementations
+│   ├── engine/          # Game Engine Wrappers
+│   ├── inference/       # vLLM Logits Processors
+│   ├── training/        # TRL Trainer Logic
+│   └── utils/           # Config, Parsing, Scoring
+├── tests/               # Pytest suite
+├── evals/               # Tactical Puzzles & League Logic
+├── app.py               # Modal Infrastructure Definition
+└── pyproject.toml
+
+3. Core Logic & Constraints (DO NOT MODIFY WITHOUT REASON)
+A. The Input Schema (Egocentric View)
+Inputs to the LLM must be strictly JSON from the viewpoint of a single power.
+```json
+{
+  "meta": { "role": "FRANCE", "season": "SPRING", "year": 1901 },
+  "board_state": { "my_units": ["A PAR"], "opponents": {...} },
+  "valid_moves": { "A PAR": ["A PAR - BUR", "A PAR - MAR"] }, // Used for Masking
+  "message_history": [...]
+}
+```
+
+B. The Output Schema (Structured Intent)
+The model must output XML tags to separate reasoning from action.
+
+```xml
+<analysis>Reasoning here...</analysis>
+<communication>
+  <truth_status>LIE</truth_status>
+  <message>I will move North.</message>
+</communication>
+<orders>
+A PAR - BUR
+</orders>
+```
+
+C. Critical Implementation Details (Foundations)
+1. Configuration (src/config.py)
+Use Pydantic for all configs.
+```python
+from pydantic import BaseModel
+class ExperimentConfig(BaseModel):
+    run_name: str = "diplomacy-grpo-v1"
+    rollout_horizon_years: int = 2
+    num_groups_per_step: int = 8
+    samples_per_group: int = 8
+```
+2. Logits Processor (src/inference/logits.py)
+CRITICAL: Use this stateless Trie implementation to mask invalid tokens.
+```python
+import torch
+from typing import Dict, List
+from transformers import PreTrainedTokenizer
+
+class TokenTrieNode:
+    def __init__(self):
+        self.children = {}
+        self.is_end_of_move = False
+    def add_sequence(self, token_ids):
+        node = self
+        for tid in token_ids:
+            if tid not in node.children: node.children[tid] = TokenTrieNode()
+            node = node.children[tid]
+        node.is_end_of_move = True
+
+class DiplomacyLogitsProcessor:
+    def __init__(self, tokenizer, valid_moves_dict, device="cuda"):
+        self.tokenizer = tokenizer
+        self.root = TokenTrieNode()
+        # Flatten valid moves and build Trie
+        for moves in valid_moves_dict.values():
+            for move in moves:
+                self.root.add_sequence(tokenizer.encode(move, add_special_tokens=False))
+        self.newline_id = tokenizer.encode("\n", add_special_tokens=False)[-1]
+        self.eos_id = tokenizer.eos_token_id
+
+    def __call__(self, input_ids: List[int], scores: torch.Tensor) -> torch.Tensor:
+        current_node = self.root
+        for tid in input_ids:
+            if tid == self.newline_id and current_node.is_end_of_move:
+                current_node = self.root
+                continue
+            current_node = current_node.children.get(tid, TokenTrieNode())
+            if not current_node.children: break # Dead end
+        
+        valid = list(current_node.children.keys())
+        if current_node.is_end_of_move:
+            valid.extend([self.newline_id, self.eos_id])
+            
+        mask = torch.full_like(scores, float("-inf"))
+        if valid: mask[valid] = 0
+        else: mask[self.eos_id] = 0 # Fail safe
+        return scores + mask
+```
+3. Engine Wrapper (src/engine/wrapper.py)
+Ensure strict normalization of move strings.
+```python
+import diplomacy
+class DiplomacyWrapper:
+    def __init__(self, game_id=None):
+        self.game = diplomacy.Game(game_id=game_id)
+    def get_valid_moves(self, power):
+        # Must return { "A PAR": ["A PAR - BUR", ...] }
+        # logic to normalize engine outputs to standard notation
+```
+
+4. Parsing (src/utils/parsing.py)
+Use Regex to extract blocks.
+```python
+import re
+RE_ORDERS = re.compile(r"<orders>(.*?)</orders>", re.DOTALL | re.IGNORECASE)
+def extract_orders(text):
+    match = RE_ORDERS.search(text)
+    return [l.strip() for l in match.group(1).split('\n') if l.strip()] if match else []
+```
+4. Modal Infrastructure (app.py)
+Images: Define distinct cpu_image (slim) and gpu_image (cuda/vllm).
+
+Mounts: Always mount src/ using modal.Mount.from_local_dir.
+
+Volumes: Use modal.Volume named diplomacy-data for sharing LoRA adapters between Trainer and Inference.
+
+5. Development Guidelines
+Tests First: Do not proceed to Training Loop until pytest tests/test_logits_processor.py passes.
+
+Type Hints: All function signatures must be typed.
+
+Strict Timeouts: All Modal functions must have timeouts to handle hanging games.
