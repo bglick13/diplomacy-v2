@@ -90,7 +90,7 @@ class DiplomacyWrapper:
                 # We omit full board state for brevity in this snippet,
                 # but normally you'd add self.get_state_json() filtered for viewpoint
             }
-            prompt_str = f"You are playing Diplomacy as {power}. Output XML with your moves.\nContext: {json.dumps(state)}"
+            prompt_str = f"You are playing Diplomacy as {power}.\nContext: {json.dumps(state)}]\nOutput XML with your moves. The format of your output must be strictly as follows:<think>...</think><orders>...</orders>"
 
             prompts.append(prompt_str)
             valid_moves_list.append(vm)

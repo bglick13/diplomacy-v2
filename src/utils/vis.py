@@ -32,7 +32,12 @@ class GameVisualizer:
         except Exception as e:
             print(f"⚠️ Visualization Warning: Could not render turn. {e}")
 
+    def _make_path_if_not_exists(self, filepath: str):
+        if not os.path.exists(filepath):
+            os.makedirs(filepath)
+
     def save_html(self, filepath: str):
+        self._make_path_if_not_exists(os.path.dirname(filepath))
         """
         Builds the HTML file with embedded SVGs and navigation controls.
         """

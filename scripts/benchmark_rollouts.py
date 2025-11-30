@@ -9,7 +9,7 @@ app = modal.App("diplomacy-grpo")
 
 def benchmark():
     # Scale this up to 50 when ready
-    N_GAMES = 
+    N_GAMES = 2
     print(f"🚀 Benchmarking: Launching {N_GAMES} concurrent rollouts...")
 
     run_rollout = modal.Function.from_name("diplomacy-grpo", "run_rollout")

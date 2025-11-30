@@ -56,6 +56,7 @@ volume = modal.Volume.from_name("diplomacy-data", create_if_missing=True)
 
 VOLUME_PATH = Path("/data")
 MODELS_PATH = VOLUME_PATH / "models"
+REPLAYS_PATH = VOLUME_PATH / "replays"
 
 # ==============================================================================
 # 3. INFERENCE ENGINE (THE BRAIN)
@@ -155,6 +156,7 @@ class InferenceEngine:
     memory=2048,  # Increased memory to hold G game copies
     timeout=3600,
     secrets=[modal.Secret.from_name("axiom-secrets")],
+    volumes={str(VOLUME_PATH): volume},
 )
 async def run_rollout(config_dict: dict, lora_path: str | None = None):
     import random
@@ -170,9 +172,11 @@ async def run_rollout(config_dict: dict, lora_path: str | None = None):
     )  # Make sure to mount/include this
     from src.utils.parsing import extract_orders
     from src.utils.scoring import calculate_final_scores
+    from src.utils.vis import GameVisualizer
 
     try:
         cfg = ExperimentConfig(**config_dict)
+        should_visualize = random.random() < cfg.rollout_visualize_chance
 
         # 1. THE WARMUP (Generate a random state)
         # ---------------------------------------
@@ -182,6 +186,11 @@ async def run_rollout(config_dict: dict, lora_path: str | None = None):
 
         # Init main game
         main_game = DiplomacyWrapper(horizon=99)  # Infinite horizon for warmup
+        vis = None
+        if should_visualize:
+            logger.info("Visualizing game...")
+            vis = GameVisualizer()
+            vis.capture_turn(main_game.game, "Warmup Start")
         logger.info(f"🔥 Starting Warmup: {warmup_phases} phases")
 
         # Play through warmup
@@ -192,6 +201,7 @@ async def run_rollout(config_dict: dict, lora_path: str | None = None):
                 break
             with stopwatch(f"Warmup Inference {i + 1}/{warmup_phases}"):
                 inputs = main_game.get_all_inputs()
+                logger.info(f"Prompts:\n{'\n'.join(inputs['prompts'])}")
                 raw_responses = InferenceEngine().generate.remote(
                     prompts=inputs["prompts"],
                     valid_moves=inputs["valid_moves"],
@@ -200,8 +210,17 @@ async def run_rollout(config_dict: dict, lora_path: str | None = None):
             # Parse & Execute (Linear)
             all_orders = []
             for r in raw_responses:
+                logger.info(f"Raw response: {r}")
+                logger.info(f"Extracted orders: {extract_orders(r)}")
                 all_orders.extend(extract_orders(r))
             main_game.step(all_orders)
+            if should_visualize and vis:
+                logger.info(f"Visualizing warmup step {i + 1}/{warmup_phases}")
+                logger.info(f"Orders: {'\n'.join(all_orders)}")
+                vis.capture_turn(
+                    main_game.game,
+                    f"Warmup step {i + 1}/{warmup_phases}\n{'\n'.join(all_orders)}",
+                )
 
         if main_game.is_done():
             return []  # Game ended during warmup, discard.
@@ -213,6 +232,11 @@ async def run_rollout(config_dict: dict, lora_path: str | None = None):
         # Cloudpickle handles local classes (like StringComparator in diplomacy package)
         # better than standard pickle
         frozen_state = cloudpickle.dumps(main_game)
+        frozen_vis = cloudpickle.dumps(vis)
+        if should_visualize and vis:
+            visualizers = [cloudpickle.loads(frozen_vis)] * cfg.samples_per_group
+        else:
+            visualizers = None
 
         # Create G independent game objects
         games = [cloudpickle.loads(frozen_state) for _ in range(cfg.samples_per_group)]
@@ -295,6 +319,11 @@ async def run_rollout(config_dict: dict, lora_path: str | None = None):
             for g_idx in active_indices:
                 if g_idx in game_orders:
                     games[g_idx].step(game_orders[g_idx])
+                    if should_visualize and visualizers is not None:
+                        visualizers[g_idx].capture_turn(
+                            games[g_idx].game,
+                            f"Rollout step {step_count}\n{'\n'.join(game_orders[g_idx])}",
+                        )
                     # Check if it should continue next loop
                     if not (
                         games[g_idx].get_year() >= target_year or games[g_idx].is_done()
@@ -323,8 +352,22 @@ async def run_rollout(config_dict: dict, lora_path: str | None = None):
                             "group_id": f"{main_game.game.game_id}_{power}_{current_year}",  # Unique ID for GRPO grouping
                         }
                     )
+        if should_visualize and vis and visualizers is not None:
+            output_file = str(REPLAYS_PATH / f"rollout_{main_game.game.game_id}.html")
+            vis.save_html(output_file)
+            logger.info(f"✅ Saved replay to {output_file}")
+
+            for g_idx, game in enumerate(games):
+                output_file = str(
+                    REPLAYS_PATH / f"rollout_{game.game.game_id}_{g_idx}.html"
+                )
+                visualizers[g_idx].save_html(output_file)
+                logger.info(f"✅ Saved group replay {g_idx} to {output_file}")
 
         return trajectories
+    except Exception as e:
+        logger.error(f"❌ Error running rollout: {e}")
+        raise e
     finally:
         await axiom.flush()
 

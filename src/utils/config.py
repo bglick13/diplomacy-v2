@@ -18,6 +18,7 @@ class ExperimentConfig(BaseModel):
 
     # Environment Settings
     rollout_horizon_years: int = 2
+    rollout_visualize_chance: float = 1.0
 
     # Training Loop
     total_steps: int = 100
