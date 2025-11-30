@@ -1,0 +1,60 @@
+{
+  "name": "Diplomacy GRPO - Rollout Health",
+  "description": "Monitor rollout performance, order extraction quality, and errors",
+  "charts": [
+    {
+      "name": "Empty Orders (Critical)",
+      "chartType": "count",
+      "query": {
+        "apl": "['diplomacy'] | where event == 'orders_empty' | summarize count()",
+        "startTime": "-1h",
+        "endTime": "now"
+      }
+    },
+    {
+      "name": "Extraction Status Over Time",
+      "chartType": "timeseries",
+      "query": {
+        "apl": "['diplomacy'] | where event in ('orders_extracted', 'orders_empty', 'orders_partial') | summarize count() by event, bin(_time, 5m)",
+        "startTime": "-1h",
+        "endTime": "now"
+      }
+    },
+    {
+      "name": "Rollout Completion Rate",
+      "chartType": "timeseries", 
+      "query": {
+        "apl": "['diplomacy'] | where event in ('rollout_start', 'rollout_complete', 'rollout_error') | summarize count() by event, bin(_time, 5m)",
+        "startTime": "-1h",
+        "endTime": "now"
+      }
+    },
+    {
+      "name": "Empty Orders by Power",
+      "chartType": "bar",
+      "query": {
+        "apl": "['diplomacy'] | where event == 'orders_empty' | summarize count() by power_name | order by count_ desc",
+        "startTime": "-1h",
+        "endTime": "now"
+      }
+    },
+    {
+      "name": "Inference Latency (p50/p90)",
+      "chartType": "timeseries",
+      "query": {
+        "apl": "['diplomacy'] | where event == 'span_duration' and span_name contains 'Inference' | summarize p50=percentile(duration_ms, 50), p90=percentile(duration_ms, 90) by bin(_time, 5m)",
+        "startTime": "-1h",
+        "endTime": "now"
+      }
+    },
+    {
+      "name": "Recent Empty Orders (Debug)",
+      "chartType": "table",
+      "query": {
+        "apl": "['diplomacy'] | where event == 'orders_empty' | project _time, power_name, phase, raw_response_length, raw_response_preview | order by _time desc | take 20",
+        "startTime": "-1h",
+        "endTime": "now"
+      }
+    }
+  ]
+}

@@ -84,7 +84,7 @@ class InferenceEngine:
 
         print("🥶 Initializing vLLM v1 Engine...")
 
-        model_id = "mistralai/Mistral-7B-v0.1"
+        model_id = "Qwen/Qwen2.5-7B-Instruct"
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
 
         # vLLM v1: Pass logits_processors at engine initialization
@@ -160,32 +160,55 @@ class InferenceEngine:
 )
 async def run_rollout(config_dict: dict, lora_path: str | None = None):
     import random
+    import time
 
     import cloudpickle
 
+    from src.agents import LLMAgent
     from src.engine.wrapper import DiplomacyWrapper
     from src.utils.config import ExperimentConfig
     from src.utils.observability import (
+        RolloutMetrics,
         axiom,
+        log_orders_extracted,
+        log_rollout_complete,
+        log_rollout_error,
+        log_rollout_start,
         logger,
         stopwatch,
-    )  # Make sure to mount/include this
+    )
     from src.utils.parsing import extract_orders
     from src.utils.scoring import calculate_final_scores
     from src.utils.vis import GameVisualizer
+
+    rollout_start_time = time.time()
+    rollout_id = ""
+    metrics: RolloutMetrics | None = None
 
     try:
         cfg = ExperimentConfig(**config_dict)
         should_visualize = random.random() < cfg.rollout_visualize_chance
 
+        # Initialize the LLM agent for prompt generation
+        agent = LLMAgent()
+
         # 1. THE WARMUP (Generate a random state)
         # ---------------------------------------
-        # Randomly pick a start year between 0 and 4 (1901-1905)
-        # We multiply by 2 because each year has roughly 2 move phases (Spring/Fall)
         warmup_phases = random.randint(0, 8)
 
         # Init main game
-        main_game = DiplomacyWrapper(horizon=99)  # Infinite horizon for warmup
+        main_game = DiplomacyWrapper(horizon=99)
+        rollout_id = main_game.game.game_id
+        metrics = RolloutMetrics(rollout_id=rollout_id)
+
+        # Log rollout start
+        log_rollout_start(
+            rollout_id=rollout_id,
+            warmup_phases=warmup_phases,
+            samples_per_group=cfg.samples_per_group,
+            horizon_years=cfg.rollout_horizon_years,
+        )
+
         vis = None
         if should_visualize:
             logger.info("Visualizing game...")
@@ -194,124 +217,141 @@ async def run_rollout(config_dict: dict, lora_path: str | None = None):
         logger.info(f"🔥 Starting Warmup: {warmup_phases} phases")
 
         # Play through warmup
-        # Note: We use the same policy (the model) to generate the warmup
-        # This ensures the mid-game states are "reachable" by the model.
         for i in range(warmup_phases):
             if main_game.is_done():
                 break
+
             with stopwatch(f"Warmup Inference {i + 1}/{warmup_phases}"):
-                inputs = main_game.get_all_inputs()
-                logger.info(f"Prompts:\n{'\n'.join(inputs['prompts'])}")
+                inputs = main_game.get_all_inputs(agent=agent)
+                metrics.inference_calls += 1
+
                 raw_responses = InferenceEngine().generate.remote(
                     prompts=inputs["prompts"],
                     valid_moves=inputs["valid_moves"],
                     lora_path=lora_path,
                 )
-            # Parse & Execute (Linear)
+
+            # Parse & Execute with observability
             all_orders = []
-            for r in raw_responses:
-                logger.info(f"Raw response: {r}")
-                logger.info(f"Extracted orders: {extract_orders(r)}")
-                all_orders.extend(extract_orders(r))
+            phase = main_game.get_current_phase()
+
+            for idx, (response, power) in enumerate(
+                zip(raw_responses, inputs["power_names"])
+            ):
+                orders = extract_orders(response)
+                expected_count = len(inputs["valid_moves"][idx])
+
+                # Log extraction result
+                log_orders_extracted(
+                    rollout_id=rollout_id,
+                    power_name=power,
+                    orders_count=len(orders),
+                    expected_count=expected_count,
+                    raw_response_length=len(response),
+                    phase=phase,
+                    raw_response=response,
+                )
+                metrics.record_extraction(len(orders), expected_count)
+
+                all_orders.extend(orders)
+
             main_game.step(all_orders)
+
             if should_visualize and vis:
-                logger.info(f"Visualizing warmup step {i + 1}/{warmup_phases}")
-                logger.info(f"Orders: {'\n'.join(all_orders)}")
                 vis.capture_turn(
                     main_game.game,
-                    f"Warmup step {i + 1}/{warmup_phases}\n{'\n'.join(all_orders)}",
+                    f"Warmup step {i + 1}/{warmup_phases}\n{chr(10).join(all_orders)}",
                 )
 
         if main_game.is_done():
-            return []  # Game ended during warmup, discard.
+            logger.info("Game ended during warmup, discarding.")
+            return []
 
         # 2. THE FORK (Clone the state G times)
         # -------------------------------------
-        # We now have a specific state S. We want G samples from this S.
-
-        # Cloudpickle handles local classes (like StringComparator in diplomacy package)
-        # better than standard pickle
         frozen_state = cloudpickle.dumps(main_game)
         frozen_vis = cloudpickle.dumps(vis)
         if should_visualize and vis:
-            visualizers = [cloudpickle.loads(frozen_vis)] * cfg.samples_per_group
+            # IMPORTANT: Create SEPARATE visualizer objects for each game
+            # Using [obj] * n would create n references to the SAME object!
+            visualizers = [
+                cloudpickle.loads(frozen_vis) for _ in range(cfg.samples_per_group)
+            ]
         else:
             visualizers = None
 
-        # Create G independent game objects
         games = [cloudpickle.loads(frozen_state) for _ in range(cfg.samples_per_group)]
-
-        # Set the Horizon for these games (e.g. Current + 2 Years)
         current_year = main_game.get_year()
         target_year = current_year + cfg.rollout_horizon_years
 
-        # Store the prompt/response for the fork point (The Training Data)
-        # format: {game_index: {power_name: {prompt: ..., completion: ...}}}
         fork_data = {i: {} for i in range(len(games))}
-
-        # 3. THE GROUP ROLLOUT (Simulate parallel universes)
-        # --------------------------------------------------
-        # We assume all G games move in lockstep phases for efficiency,
-        # though eventually they might diverge in phase timing (rare but possible).
-
-        active_indices = list(range(len(games)))  # Games still running
-
-        # Mark the first step of the fork to capture the "Action"
+        active_indices = list(range(len(games)))
         is_fork_step = True
         step_count = 0
 
+        # 3. THE GROUP ROLLOUT
+        # --------------------------------------------------
         while active_indices:
             step_count += 1
-            # Batching: We collect inputs from ALL active games
             batch_prompts = []
             batch_valid_moves = []
-            # Metadata to map result back to (game_idx, power_name)
-            batch_meta = []
+            batch_meta = []  # (game_idx, power_name, expected_orders)
 
             for g_idx in active_indices:
                 g = games[g_idx]
-
-                # Check horizon/done
                 if g.get_year() >= target_year or g.is_done():
                     continue
 
-                inputs = g.get_all_inputs()
+                inputs = g.get_all_inputs(agent=agent)
 
                 for p_idx, power in enumerate(inputs["power_names"]):
                     batch_prompts.append(inputs["prompts"][p_idx])
                     batch_valid_moves.append(inputs["valid_moves"][p_idx])
-                    batch_meta.append((g_idx, power))
+                    expected = len(inputs["valid_moves"][p_idx])
+                    batch_meta.append((g_idx, power, expected))
 
-            # If no games are active, break
             if not batch_prompts:
                 break
 
-            # Massive Inference Call
-            # We send G * 7 prompts at once.
-            # vLLM handles this efficiently.
+            # Inference call
             with stopwatch(
                 f"Rollout Step {step_count} (Batch Size: {len(batch_prompts)})"
             ):
+                metrics.inference_calls += 1
                 responses = InferenceEngine().generate.remote(
                     prompts=batch_prompts,
                     valid_moves=batch_valid_moves,
                     lora_path=lora_path,
                 )
 
-            # Distribute responses back to games
+            # Distribute responses with observability
             game_orders = {g_idx: [] for g_idx in active_indices}
+            phase = (
+                games[active_indices[0]].get_current_phase() if active_indices else ""
+            )
 
             for i, response in enumerate(responses):
-                g_idx, power = batch_meta[i]
+                g_idx, power, expected_count = batch_meta[i]
+                orders = extract_orders(response)
 
-                # Capture data if this is the Fork Step (The one we train on)
+                # Log extraction result
+                log_orders_extracted(
+                    rollout_id=rollout_id,
+                    power_name=power,
+                    orders_count=len(orders),
+                    expected_count=expected_count,
+                    raw_response_length=len(response),
+                    phase=phase,
+                    raw_response=response,
+                )
+                metrics.record_extraction(len(orders), expected_count)
+
                 if is_fork_step:
                     fork_data[g_idx][power] = {
                         "prompt": batch_prompts[i],
                         "completion": response,
                     }
 
-                orders = extract_orders(response)
                 game_orders[g_idx].extend(orders)
 
             # Step all games
@@ -322,9 +362,8 @@ async def run_rollout(config_dict: dict, lora_path: str | None = None):
                     if should_visualize and visualizers is not None:
                         visualizers[g_idx].capture_turn(
                             games[g_idx].game,
-                            f"Rollout step {step_count}\n{'\n'.join(game_orders[g_idx])}",
+                            f"Rollout step {step_count}\n{chr(10).join(game_orders[g_idx])}",
                         )
-                    # Check if it should continue next loop
                     if not (
                         games[g_idx].get_year() >= target_year or games[g_idx].is_done()
                     ):
@@ -335,8 +374,6 @@ async def run_rollout(config_dict: dict, lora_path: str | None = None):
 
         # 4. SCORING & RETURN
         # -------------------
-        # Now we have G final states. We calculate rewards relative to the group.
-
         trajectories = []
 
         for g_idx, game in enumerate(games):
@@ -349,9 +386,11 @@ async def run_rollout(config_dict: dict, lora_path: str | None = None):
                             "prompt": data["prompt"],
                             "completion": data["completion"],
                             "reward": final_scores[power],
-                            "group_id": f"{main_game.game.game_id}_{power}_{current_year}",  # Unique ID for GRPO grouping
+                            "group_id": f"{main_game.game.game_id}_{power}_{current_year}",
                         }
                     )
+
+        # Save visualizations
         if should_visualize and vis and visualizers is not None:
             output_file = str(REPLAYS_PATH / f"rollout_{main_game.game.game_id}.html")
             vis.save_html(output_file)
@@ -364,10 +403,24 @@ async def run_rollout(config_dict: dict, lora_path: str | None = None):
                 visualizers[g_idx].save_html(output_file)
                 logger.info(f"✅ Saved group replay {g_idx} to {output_file}")
 
+        # Log successful completion
+        total_duration_ms = int((time.time() - rollout_start_time) * 1000)
+        log_rollout_complete(
+            rollout_id=rollout_id,
+            trajectories_count=len(trajectories),
+            total_inference_calls=metrics.inference_calls,
+            total_duration_ms=total_duration_ms,
+        )
+        metrics.log_summary()
+
         return trajectories
+
     except Exception as e:
         logger.error(f"❌ Error running rollout: {e}")
+        if rollout_id:
+            log_rollout_error(rollout_id=rollout_id, error=str(e))
         raise e
+
     finally:
         await axiom.flush()
 

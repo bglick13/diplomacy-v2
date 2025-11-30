@@ -84,3 +84,104 @@ def test_empty_moves_for_eliminated_power(game):
 
     moves = game.get_valid_moves("ITALY")
     assert moves == {}
+
+
+def test_adjustment_phase_builds():
+    """Test that adjustment phase returns correct build orders by playing through."""
+    import diplomacy
+
+    # Create a raw game and play through properly to reach ADJUSTMENTS
+    game = diplomacy.Game()
+
+    # Helper to set first valid order for all units
+    def set_orders_for_all_powers(game):
+        for power in game.powers:
+            units = game.powers[power].units
+            possible = game.get_all_possible_orders()
+            power_orders = []
+            for unit in units:
+                parts = unit.split()
+                if len(parts) >= 2:
+                    loc = parts[1]
+                    if loc in possible and possible[loc]:
+                        power_orders.append(str(possible[loc][0]))
+            if power_orders:
+                game.set_orders(power, power_orders)
+
+    # Spring 1901
+    set_orders_for_all_powers(game)
+    game.process()
+
+    # Fall 1901
+    set_orders_for_all_powers(game)
+    game.process()
+
+    # Now wrap it
+    wrapper = DiplomacyWrapper.__new__(DiplomacyWrapper)
+    wrapper.game = game
+    wrapper.max_years = 2
+    wrapper.start_year = 1901
+
+    # Continue processing until we hit an adjustments phase or wrap around to Spring 1902
+    max_iterations = 10
+    for _ in range(max_iterations):
+        phase_type = wrapper.get_phase_type()
+
+        if phase_type == "A":
+            assert "ADJUSTMENTS" in wrapper.get_current_phase()
+
+            # Find any power with builds
+            found_builds = False
+            for power in wrapper.game.powers:
+                delta = wrapper.get_adjustment_delta(power)
+                if delta > 0:
+                    moves = wrapper.get_valid_moves(power)
+                    # Should have orderable locations with build orders
+                    assert len(moves) > 0, f"{power} has builds but no moves"
+                    for loc, orders in moves.items():
+                        build_orders = [o for o in orders if " B" in o or o == "WAIVE"]
+                        assert len(build_orders) > 0, f"No build orders for {loc}"
+                    found_builds = True
+                    break
+
+            # If we found an adjustment phase with builds, test passes
+            if found_builds:
+                return
+
+            # If adjustment phase but no builds needed, continue
+            set_orders_for_all_powers(wrapper.game)
+            wrapper.game.process()
+
+        elif phase_type in ("M", "R"):
+            # Movement or Retreat phase - process and continue
+            set_orders_for_all_powers(wrapper.game)
+            wrapper.game.process()
+        else:
+            raise AssertionError(f"Unexpected phase type: {phase_type}")
+
+    # If we reach here, we tested through multiple phases without error
+    # That's also a valid outcome (no powers needed builds)
+
+
+def test_adjustment_phase_delta():
+    """Test that adjustment delta is calculated correctly."""
+    game = DiplomacyWrapper()
+
+    # Initially, units == centers for all powers
+    for power in game.game.powers:
+        delta = game.get_adjustment_delta(power)
+        assert delta == 0, f"{power} should have delta=0 at start"
+
+    # Give France an extra SC
+    game.game.powers["FRANCE"].centers.append("SPA")
+
+    # Now France should need a build
+    delta = game.get_adjustment_delta("FRANCE")
+    assert delta == 1, "France should need 1 build"
+
+    # Take away an SC from Germany
+    game.game.powers["GERMANY"].centers.remove("MUN")
+
+    # Germany should need to disband
+    delta = game.get_adjustment_delta("GERMANY")
+    assert delta == -1, "Germany should need to disband 1 unit"

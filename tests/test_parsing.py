@@ -28,6 +28,22 @@ MESSY_OUTPUT = """
 
 NO_TAGS_OUTPUT = "I think I should move A PAR to BUR."
 
+# Simulates when stop=["</orders>"] truncates the closing tag
+TRUNCATED_OUTPUT = """<orders>
+A PAR - BUR
+F BRE - MAO
+A MAR H
+"""
+
+# Very short response with no orders tag at all
+SHORT_NO_TAG = "I will move north."
+
+# Raw orders (when prompt was primed with <orders>\n)
+RAW_ORDERS_OUTPUT = """A PAR - BUR
+F BRE - MAO
+A MAR H
+"""
+
 
 def test_extract_orders_clean():
     orders = extract_orders(CLEAN_OUTPUT)
@@ -47,6 +63,30 @@ def test_extract_orders_messy():
 def test_extract_orders_missing():
     orders = extract_orders(NO_TAGS_OUTPUT)
     assert orders == []
+
+
+def test_extract_orders_truncated():
+    """Test handling of truncated output (stop token cut off closing tag)."""
+    orders = extract_orders(TRUNCATED_OUTPUT)
+    assert len(orders) == 3
+    assert "A PAR - BUR" in orders
+    assert "F BRE - MAO" in orders
+    assert "A MAR H" in orders
+
+
+def test_extract_orders_short_no_tag():
+    """Test very short response with no orders tag."""
+    orders = extract_orders(SHORT_NO_TAG)
+    assert orders == []
+
+
+def test_extract_orders_raw():
+    """Test raw orders without tags (primed prompt case)."""
+    orders = extract_orders(RAW_ORDERS_OUTPUT)
+    assert len(orders) == 3
+    assert "A PAR - BUR" in orders
+    assert "F BRE - MAO" in orders
+    assert "A MAR H" in orders
 
 
 def test_extract_metadata_full():

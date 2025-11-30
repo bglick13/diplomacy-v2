@@ -267,16 +267,24 @@ class DiplomacyLogitsProcessor(LogitsProcessor):
             # ACTIVE: Inside <orders> block - apply trie constraint
             current_node = state.current_node
 
-            # Determine valid next tokens
+            # Determine valid next tokens from trie
             valid_tokens = list(current_node.children.keys())
             is_at_end = current_node.is_end_of_move
+            is_at_root = current_node is state.root
 
             # Build allowed set
             allowed = set(valid_tokens)
+
+            # At root: allow newlines (formatting) and closing tag start
+            if is_at_root:
+                allowed.add(state.newline_token_id)
+                if state.end_tag_ids:
+                    allowed.add(state.end_tag_ids[0])
+
+            # At end of move: allow newline (to start next move) or close
             if is_at_end:
                 allowed.add(state.newline_token_id)
                 allowed.add(state.eos_token_id)
-                # Allow start of closing tag
                 if state.end_tag_ids:
                     allowed.add(state.end_tag_ids[0])
 

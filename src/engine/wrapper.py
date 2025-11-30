@@ -1,4 +1,3 @@
-import json
 from typing import Any, Dict, List
 
 import diplomacy
@@ -41,15 +40,35 @@ class DiplomacyWrapper:
         except:
             return 1900
 
+    def get_phase_type(self) -> str:
+        """Get the phase type: M (Movement), R (Retreat), A (Adjustment)."""
+        return self.game.phase_type
+
     def get_valid_moves(self, power_name: str) -> Dict[str, List[str]]:
-        # ... (Same as previous correct version) ...
-        # Ensure we have a valid power name
+        """
+        Get valid moves for a power based on the current phase type.
+
+        Returns a dict mapping:
+        - MOVEMENT/RETREAT: unit_str -> list of orders (e.g. "A PAR" -> ["A PAR - BUR", ...])
+        - ADJUSTMENT: location -> list of orders (e.g. "PAR" -> ["A PAR B", "WAIVE"])
+        """
         if power_name not in self.game.powers:
             return {}
 
+        phase_type = self.game.phase_type
         possible_orders = self.game.get_all_possible_orders()
-        current_units = self.game.powers[power_name].units
+        power = self.game.powers[power_name]
 
+        if phase_type == "A":  # Adjustment phase (builds/disbands)
+            return self._get_adjustment_moves(power_name, possible_orders)
+        else:  # Movement or Retreat phase
+            return self._get_movement_moves(power_name, possible_orders)
+
+    def _get_movement_moves(
+        self, power_name: str, possible_orders: Dict
+    ) -> Dict[str, List[str]]:
+        """Get valid moves for movement/retreat phases."""
+        current_units = self.game.powers[power_name].units
         normalized_moves = {}
 
         for unit_str in current_units:
@@ -65,35 +84,68 @@ class DiplomacyWrapper:
 
         return normalized_moves
 
-    def get_all_inputs(self) -> Dict[str, List]:
+    def _get_adjustment_moves(
+        self, power_name: str, possible_orders: Dict
+    ) -> Dict[str, List[str]]:
+        """
+        Get valid moves for adjustment phases (builds/disbands).
+
+        During adjustments:
+        - Builds: orderable_locations are empty home centers
+        - Disbands: orderable_locations are all unit locations
+        - Orders format: "A LOC B", "F LOC B", "WAIVE", "A LOC D", "F LOC D"
+        """
+        orderable_locs = self.game.get_orderable_locations(power_name)
+        normalized_moves = {}
+
+        for loc in orderable_locs:
+            if loc in possible_orders:
+                orders = possible_orders[loc]
+                clean_orders = [str(order) for order in orders]
+                # Use location as key (not unit string) for adjustments
+                normalized_moves[loc] = clean_orders
+
+        return normalized_moves
+
+    def get_adjustment_delta(self, power_name: str) -> int:
+        """
+        Get the number of builds (positive) or disbands (negative) needed.
+        """
+        if power_name not in self.game.powers:
+            return 0
+        power = self.game.powers[power_name]
+        return len(power.centers) - len(power.units)
+
+    def get_all_inputs(self, agent=None) -> Dict[str, List]:
         """
         Prepares the batch of inputs for all 7 powers to send to the GPU.
+
+        Args:
+            agent: Optional LLMAgent instance for prompt generation.
+                   If None, uses a default LLMAgent.
+
         Returns: {
             "prompts": [str, str, ...],
             "valid_moves": [dict, dict, ...],
             "power_names": [str, str, ...]
         }
         """
+        # Lazy import to avoid circular dependency
+        if agent is None:
+            from src.agents.llm_agent import LLMAgent
+
+            agent = LLMAgent()
+
         prompts = []
         valid_moves_list = []
         power_names = []
 
         for power in self.game.powers:
-            # 1. Get Valid Moves (for Masking)
-            vm = self.get_valid_moves(power)
+            # Use agent to build prompt
+            prompt, valid_moves = agent.build_prompt(self, power)
 
-            # 2. Build Prompt (The Context)
-            # For Level 2, we just dump the JSON. Level 3/4 can make this prettier.
-            state = {
-                "meta": {"role": power, "phase": self.get_current_phase()},
-                "valid_moves": vm,  # Showing valid moves in prompt helps the model too
-                # We omit full board state for brevity in this snippet,
-                # but normally you'd add self.get_state_json() filtered for viewpoint
-            }
-            prompt_str = f"You are playing Diplomacy as {power}.\nContext: {json.dumps(state)}]\nOutput XML with your moves. The format of your output must be strictly as follows:<think>...</think><orders>...</orders>"
-
-            prompts.append(prompt_str)
-            valid_moves_list.append(vm)
+            prompts.append(prompt)
+            valid_moves_list.append(valid_moves)
             power_names.append(power)
 
         return {
@@ -105,50 +157,102 @@ class DiplomacyWrapper:
     def step(self, orders: List[str]):
         """
         Executes orders for the current phase.
-        orders: A flat list of strings like ['A PAR - BUR', 'F BRE H']
+
+        Movement phase orders: ['A PAR - BUR', 'F BRE H', ...]
+        Adjustment phase orders: ['A PAR B', 'F LON B', 'WAIVE', 'A MUN D', ...]
         """
-        # 1. Map all current units to their Power for fast lookup
-        # e.g. "A PAR" -> "FRANCE"
+        phase_type = self.game.phase_type
+
+        if phase_type == "A":
+            self._step_adjustment(orders)
+        else:
+            self._step_movement(orders)
+
+        self.game.process()
+
+    def _step_movement(self, orders: List[str]):
+        """Handle movement/retreat phase orders."""
+        # Map units to their Power
         unit_owner_map = {}
         for power_name, power_obj in self.game.powers.items():
             for unit in power_obj.units:
                 unit_owner_map[unit] = power_name
 
-        # 2. Group orders by Power
-        # e.g. "FRANCE": ["A PAR - BUR", ...]
+        # Group orders by Power
         orders_by_power = {p: [] for p in self.game.powers}
 
         for order in orders:
-            # Extract the unit string from the order
-            # Standard format: "A PAR - BUR" -> Unit is "A PAR"
-            # Coast format: "F SPA/NC - MAO" -> Unit is "F SPA/NC"
             parts = order.split()
             if len(parts) < 2:
                 continue
 
-            # Construct candidate unit string
+            # Extract unit string (e.g., "A PAR" from "A PAR - BUR")
             unit_str = f"{parts[0]} {parts[1]}"
-
-            # Check ownership
             owner = unit_owner_map.get(unit_str)
 
             if owner:
                 orders_by_power[owner].append(order)
-            else:
-                # Fallback logging (useful for debugging Coast inconsistencies)
-                # print(f"⚠️ skipped order: {order} (Owner not found for {unit_str})")
-                pass
 
-        # 3. Submit orders to the engine
+        # Submit orders
         for power, power_orders in orders_by_power.items():
             if power_orders:
                 try:
-                    # The correct API method for diplomacy==1.1.0
                     self.game.set_orders(power, power_orders)
                 except Exception as e:
                     print(f"❌ Engine rejected orders for {power}: {e}")
 
-        self.game.process()
+    def _step_adjustment(self, orders: List[str]):
+        """
+        Handle adjustment phase orders (builds/disbands).
+
+        Order formats:
+        - Build: "A PAR B", "F LON B"
+        - Disband: "A PAR D", "F LON D"
+        - Waive: "WAIVE"
+        """
+        # Map orderable locations to their Power
+        loc_owner_map = {}
+        for power_name in self.game.powers:
+            orderable_locs = self.game.get_orderable_locations(power_name)
+            for loc in orderable_locs:
+                loc_owner_map[loc] = power_name
+
+        # Group orders by Power
+        orders_by_power = {p: [] for p in self.game.powers}
+
+        for order in orders:
+            order = order.strip()
+            if not order:
+                continue
+
+            if order.upper() == "WAIVE":
+                # WAIVE applies to any power with builds available
+                # We'll let each power that needs a waive get one
+                continue  # Skip WAIVE for now, engine handles defaults
+
+            parts = order.split()
+            if len(parts) < 2:
+                continue
+
+            # Extract location from order (e.g., "PAR" from "A PAR B")
+            loc = parts[1]
+
+            # Handle coast notation (e.g., "STP/NC" from "F STP/NC B")
+            base_loc = loc.split("/")[0]
+
+            # Find owner by checking orderable locations
+            owner = loc_owner_map.get(loc) or loc_owner_map.get(base_loc)
+
+            if owner:
+                orders_by_power[owner].append(order)
+
+        # Submit orders
+        for power, power_orders in orders_by_power.items():
+            if power_orders:
+                try:
+                    self.game.set_orders(power, power_orders)
+                except Exception as e:
+                    print(f"❌ Engine rejected adjustment order for {power}: {e}")
 
     def get_state_json(self) -> Dict[str, Any]:
         return to_saved_game_format(self.game)

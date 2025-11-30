@@ -486,6 +486,53 @@ class TestTagDetection:
             "All tokens should be allowed with empty output (no <orders> yet)"
         )
 
+    def test_newline_allowed_at_root_inside_orders(self, batch_processor, tokenizer):
+        """
+        CRITICAL: After <orders> tag, newlines must be allowed for formatting.
+
+        The expected format is:
+        <orders>
+        A PAR - BUR
+        </orders>
+
+        The newline immediately after <orders> must be allowed.
+        """
+        valid_moves = {"A PAR": ["A PAR - BUR"]}
+        params = MockSamplingParams(extra_args={"valid_moves_dict": valid_moves})
+
+        # Model has just output <orders> tag
+        orders_tag = "<orders>"
+        output_token_ids: list[int] = tokenizer.encode(
+            orders_tag, add_special_tokens=False
+        )
+
+        batch_update = MockBatchUpdate(
+            batch_size=1,
+            added=[(0, params, None, output_token_ids)],
+        )
+        batch_processor.update_state(batch_update)  # type: ignore[arg-type]
+
+        logits = torch.zeros(1, tokenizer.vocab_size)
+        result = batch_processor.apply(logits)
+
+        # Newline token should be allowed (for formatting)
+        newline_token = tokenizer.encode("\n", add_special_tokens=False)[-1]
+        assert result[0, newline_token] > -float("inf"), (
+            "Newline should be allowed immediately after <orders> tag"
+        )
+
+        # First token of valid move should also be allowed
+        first_move_token = tokenizer.encode("A PAR - BUR", add_special_tokens=False)[0]
+        assert result[0, first_move_token] > -float("inf"), (
+            "First token of valid move should be allowed"
+        )
+
+        # Start of closing tag should also be allowed at root
+        close_tag_start = tokenizer.encode("</orders>", add_special_tokens=False)[0]
+        assert result[0, close_tag_start] > -float("inf"), (
+            "Start of </orders> tag should be allowed at root"
+        )
+
 
 # =============================================================================
 # Performance Benchmark Tests
