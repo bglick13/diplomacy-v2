@@ -356,7 +356,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/73/c2/2f274d224e021be6d
 [[package]]
 name = "diplomacy-v2"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "diplomacy" },
     { name = "modal" },

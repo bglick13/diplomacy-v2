@@ -8,11 +8,10 @@ app = modal.App("diplomacy-grpo")
 
 
 def benchmark():
-    # 1. Setup
-    N_GAMES = 4
-    print(f"🚀 Benchmarking: Launching {N_GAMES} concurrent rollouts on Modal...")
+    # Scale this up to 50 when ready
+    N_GAMES = 
+    print(f"🚀 Benchmarking: Launching {N_GAMES} concurrent rollouts...")
 
-    # Look up the function
     run_rollout = modal.Function.from_name("diplomacy-grpo", "run_rollout")
 
     # Warmup: Ensure InferenceEngine is ready before starting rollouts
@@ -25,47 +24,48 @@ def benchmark():
     )
     print("✅ InferenceEngine ready!")
 
-    # Config
-    cfg = ExperimentConfig(rollout_horizon_years=2)
-    config_dict = cfg.dict()
+    # Ensure this matches your app.py defaults (8 samples usually)
+    cfg = ExperimentConfig(rollout_horizon_years=2, samples_per_group=8)
 
     start_time = time.time()
-
-    # 2. Launch Async Map
-    # .map() returns a generator, usually we iterate it to get results
     results = []
 
     try:
-        # Pass the config to every worker
-        for res in run_rollout.map([config_dict] * N_GAMES):
+        # We iterate as they complete to see progress
+        for i, res in enumerate(run_rollout.map([cfg.dict()] * N_GAMES)):
             results.append(res)
-            print(f"✅ Game finished. Trajectories collected: {len(res)}")
+            print(
+                f"[{i + 1}/{N_GAMES}] ✅ Game finished. Trajectories collected: {len(res)}"
+            )
 
     except Exception as e:
-        import traceback
-
-        traceback.print_exc()
         print(f"❌ Critical Failure: {e}")
         return
 
-    total_time = time.time() - start_time
+    duration = time.time() - start_time
 
-    # 3. Stats
-    total_years = N_GAMES * cfg.rollout_horizon_years
+    # --- CORRECTED METRICS ---
+    # 1. Total Data Points (The "Gold")
+    total_trajectories = sum(len(r) for r in results)
+
+    # 2. Total Simulation Work (The "Throughput")
+    # We simulated N games, each split into G clones, for H years.
+    total_simulated_years = N_GAMES * cfg.samples_per_group * cfg.rollout_horizon_years
+
     print("\n" + "=" * 40)
     print("BENCHMARK COMPLETE")
-    print(f"Total Time: {total_time:.2f}s")
-    print(f"Throughput: {total_years / total_time:.2f} Years/Sec")
-    print(f"Total Trajectories: {len(results) * 7}")  # 7 powers per game
+    print(f"Total Wall Time:   {duration:.2f}s")
+    print(f"Simulated Years:   {total_simulated_years}")
+    print(f"Real Throughput:   {total_simulated_years / duration:.2f} Years/Sec")
+    print(f"Total Trajectories: {total_trajectories}")
     print("=" * 40)
 
-    # 4. Validation
-    sample = results[0][0]
-    required_keys = ["prompt", "completion", "reward"]
-    assert all(k in sample for k in required_keys), (
-        f"Missing keys in output: {sample.keys()}"
-    )
-    print("Data Structure Validation: PASS")
+    # Validation
+    if results:
+        sample = results[0][0]
+        required_keys = ["prompt", "completion", "reward", "group_id"]
+        assert all(k in sample for k in required_keys), f"Missing keys: {sample.keys()}"
+        print("Data Structure Validation: PASS")
 
 
 if __name__ == "__main__":

@@ -104,6 +104,7 @@ class InferenceEngine:
     async def generate(
         self, prompts: list[str], valid_moves: list[dict], lora_path: str | None = None
     ):
+        import asyncio
         import uuid
 
         from vllm.lora.request import LoRARequest
@@ -114,39 +115,33 @@ class InferenceEngine:
             adapter_id = str(hash(lora_path))
             lora_req = LoRARequest(adapter_id, 1, lora_path)
 
-        results = []
-
-        for i, prompt in enumerate(prompts):
+        async def _generate_single(prompt: str, moves: dict) -> str:
+            """Generate for a single prompt. Allows concurrent execution."""
             request_id = str(uuid.uuid4())
-
-            # vLLM v1: Pass valid_moves_dict via extra_args
-            # The batch-level processor reads this from SamplingParams
             sampling_params = SamplingParams(
                 temperature=0.7,
                 max_tokens=200,
-                extra_args={"valid_moves_dict": valid_moves[i]},
+                extra_args={"valid_moves_dict": moves},
+                stop=["</orders>", "</Orders>"],
             )
-
-            # AsyncLLM.generate returns an async generator
             generator = self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
                 lora_request=lora_req,
             )
-            results.append(generator)
-
-        final_texts = []
-        for generator in results:
             final_output = None
             async for output in generator:
                 final_output = output
-            if final_output is not None:
-                final_texts.append(final_output.outputs[0].text)
-            else:
-                final_texts.append("")  # Fallback for empty generation
+            return final_output.outputs[0].text if final_output else ""
 
-        return final_texts
+        # CRITICAL: Await all generators concurrently for proper batching
+        # Old code awaited sequentially, killing vLLM's continuous batching
+        final_texts = await asyncio.gather(
+            *[_generate_single(p, m) for p, m in zip(prompts, valid_moves)]
+        )
+
+        return list(final_texts)
 
 
 # ==============================================================================
@@ -159,8 +154,9 @@ class InferenceEngine:
     cpu=1.0,
     memory=2048,  # Increased memory to hold G game copies
     timeout=3600,
+    secrets=[modal.Secret.from_name("axiom-secrets")],
 )
-def run_rollout(config_dict: dict, lora_path: str | None = None):
+async def run_rollout(config_dict: dict, lora_path: str | None = None):
     import random
 
     import cloudpickle
@@ -168,163 +164,169 @@ def run_rollout(config_dict: dict, lora_path: str | None = None):
     from src.engine.wrapper import DiplomacyWrapper
     from src.utils.config import ExperimentConfig
     from src.utils.observability import (
+        axiom,
         logger,
         stopwatch,
     )  # Make sure to mount/include this
     from src.utils.parsing import extract_orders
     from src.utils.scoring import calculate_final_scores
 
-    cfg = ExperimentConfig(**config_dict)
+    try:
+        cfg = ExperimentConfig(**config_dict)
 
-    # 1. THE WARMUP (Generate a random state)
-    # ---------------------------------------
-    # Randomly pick a start year between 0 and 4 (1901-1905)
-    # We multiply by 2 because each year has roughly 2 move phases (Spring/Fall)
-    warmup_phases = random.randint(0, 8)
+        # 1. THE WARMUP (Generate a random state)
+        # ---------------------------------------
+        # Randomly pick a start year between 0 and 4 (1901-1905)
+        # We multiply by 2 because each year has roughly 2 move phases (Spring/Fall)
+        warmup_phases = random.randint(0, 8)
 
-    # Init main game
-    main_game = DiplomacyWrapper(horizon=99)  # Infinite horizon for warmup
-    logger.info(f"🔥 Starting Warmup: {warmup_phases} phases")
+        # Init main game
+        main_game = DiplomacyWrapper(horizon=99)  # Infinite horizon for warmup
+        logger.info(f"🔥 Starting Warmup: {warmup_phases} phases")
 
-    # Play through warmup
-    # Note: We use the same policy (the model) to generate the warmup
-    # This ensures the mid-game states are "reachable" by the model.
-    for i in range(warmup_phases):
+        # Play through warmup
+        # Note: We use the same policy (the model) to generate the warmup
+        # This ensures the mid-game states are "reachable" by the model.
+        for i in range(warmup_phases):
+            if main_game.is_done():
+                break
+            with stopwatch(f"Warmup Inference {i + 1}/{warmup_phases}"):
+                inputs = main_game.get_all_inputs()
+                raw_responses = InferenceEngine().generate.remote(
+                    prompts=inputs["prompts"],
+                    valid_moves=inputs["valid_moves"],
+                    lora_path=lora_path,
+                )
+            # Parse & Execute (Linear)
+            all_orders = []
+            for r in raw_responses:
+                all_orders.extend(extract_orders(r))
+            main_game.step(all_orders)
+
         if main_game.is_done():
-            break
-        with stopwatch(f"Warmup Inference {i + 1}/{warmup_phases}"):
-            inputs = main_game.get_all_inputs()
-            raw_responses = InferenceEngine().generate.remote(
-                prompts=inputs["prompts"],
-                valid_moves=inputs["valid_moves"],
-                lora_path=lora_path,
-            )
-        # Parse & Execute (Linear)
-        all_orders = []
-        for r in raw_responses:
-            all_orders.extend(extract_orders(r))
-        main_game.step(all_orders)
+            return []  # Game ended during warmup, discard.
 
-    if main_game.is_done():
-        return []  # Game ended during warmup, discard.
+        # 2. THE FORK (Clone the state G times)
+        # -------------------------------------
+        # We now have a specific state S. We want G samples from this S.
 
-    # 2. THE FORK (Clone the state G times)
-    # -------------------------------------
-    # We now have a specific state S. We want G samples from this S.
+        # Cloudpickle handles local classes (like StringComparator in diplomacy package)
+        # better than standard pickle
+        frozen_state = cloudpickle.dumps(main_game)
 
-    # Cloudpickle handles local classes (like StringComparator in diplomacy package)
-    # better than standard pickle
-    frozen_state = cloudpickle.dumps(main_game)
+        # Create G independent game objects
+        games = [cloudpickle.loads(frozen_state) for _ in range(cfg.samples_per_group)]
 
-    # Create G independent game objects
-    games = [cloudpickle.loads(frozen_state) for _ in range(cfg.samples_per_group)]
+        # Set the Horizon for these games (e.g. Current + 2 Years)
+        current_year = main_game.get_year()
+        target_year = current_year + cfg.rollout_horizon_years
 
-    # Set the Horizon for these games (e.g. Current + 2 Years)
-    current_year = main_game.get_year()
-    target_year = current_year + cfg.rollout_horizon_years
+        # Store the prompt/response for the fork point (The Training Data)
+        # format: {game_index: {power_name: {prompt: ..., completion: ...}}}
+        fork_data = {i: {} for i in range(len(games))}
 
-    # Store the prompt/response for the fork point (The Training Data)
-    # format: {game_index: {power_name: {prompt: ..., completion: ...}}}
-    fork_data = {i: {} for i in range(len(games))}
+        # 3. THE GROUP ROLLOUT (Simulate parallel universes)
+        # --------------------------------------------------
+        # We assume all G games move in lockstep phases for efficiency,
+        # though eventually they might diverge in phase timing (rare but possible).
 
-    # 3. THE GROUP ROLLOUT (Simulate parallel universes)
-    # --------------------------------------------------
-    # We assume all G games move in lockstep phases for efficiency,
-    # though eventually they might diverge in phase timing (rare but possible).
+        active_indices = list(range(len(games)))  # Games still running
 
-    active_indices = list(range(len(games)))  # Games still running
+        # Mark the first step of the fork to capture the "Action"
+        is_fork_step = True
+        step_count = 0
 
-    # Mark the first step of the fork to capture the "Action"
-    is_fork_step = True
-    step_count = 0
+        while active_indices:
+            step_count += 1
+            # Batching: We collect inputs from ALL active games
+            batch_prompts = []
+            batch_valid_moves = []
+            # Metadata to map result back to (game_idx, power_name)
+            batch_meta = []
 
-    while active_indices:
-        step_count += 1
-        # Batching: We collect inputs from ALL active games
-        batch_prompts = []
-        batch_valid_moves = []
-        # Metadata to map result back to (game_idx, power_name)
-        batch_meta = []
+            for g_idx in active_indices:
+                g = games[g_idx]
 
-        for g_idx in active_indices:
-            g = games[g_idx]
+                # Check horizon/done
+                if g.get_year() >= target_year or g.is_done():
+                    continue
 
-            # Check horizon/done
-            if g.get_year() >= target_year or g.is_done():
-                continue
+                inputs = g.get_all_inputs()
 
-            inputs = g.get_all_inputs()
+                for p_idx, power in enumerate(inputs["power_names"]):
+                    batch_prompts.append(inputs["prompts"][p_idx])
+                    batch_valid_moves.append(inputs["valid_moves"][p_idx])
+                    batch_meta.append((g_idx, power))
 
-            for p_idx, power in enumerate(inputs["power_names"]):
-                batch_prompts.append(inputs["prompts"][p_idx])
-                batch_valid_moves.append(inputs["valid_moves"][p_idx])
-                batch_meta.append((g_idx, power))
+            # If no games are active, break
+            if not batch_prompts:
+                break
 
-        # If no games are active, break
-        if not batch_prompts:
-            break
-
-        # Massive Inference Call
-        # We send G * 7 prompts at once.
-        # vLLM handles this efficiently.
-        with stopwatch(f"Rollout Step {step_count} (Batch Size: {len(batch_prompts)})"):
-            responses = InferenceEngine().generate.remote(
-                prompts=batch_prompts,
-                valid_moves=batch_valid_moves,
-                lora_path=lora_path,
-            )
-
-        # Distribute responses back to games
-        game_orders = {g_idx: [] for g_idx in active_indices}
-
-        for i, response in enumerate(responses):
-            g_idx, power = batch_meta[i]
-
-            # Capture data if this is the Fork Step (The one we train on)
-            if is_fork_step:
-                fork_data[g_idx][power] = {
-                    "prompt": batch_prompts[i],
-                    "completion": response,
-                }
-
-            orders = extract_orders(response)
-            game_orders[g_idx].extend(orders)
-
-        # Step all games
-        next_active = []
-        for g_idx in active_indices:
-            if g_idx in game_orders:
-                games[g_idx].step(game_orders[g_idx])
-                # Check if it should continue next loop
-                if not (
-                    games[g_idx].get_year() >= target_year or games[g_idx].is_done()
-                ):
-                    next_active.append(g_idx)
-
-        active_indices = next_active
-        is_fork_step = False
-
-    # 4. SCORING & RETURN
-    # -------------------
-    # Now we have G final states. We calculate rewards relative to the group.
-
-    trajectories = []
-
-    for g_idx, game in enumerate(games):
-        final_scores = calculate_final_scores(game)
-
-        for power, data in fork_data[g_idx].items():
-            if power in final_scores:
-                trajectories.append(
-                    {
-                        "prompt": data["prompt"],
-                        "completion": data["completion"],
-                        "reward": final_scores[power],
-                        "group_id": f"{main_game.game.game_id}_{power}_{current_year}",  # Unique ID for GRPO grouping
-                    }
+            # Massive Inference Call
+            # We send G * 7 prompts at once.
+            # vLLM handles this efficiently.
+            with stopwatch(
+                f"Rollout Step {step_count} (Batch Size: {len(batch_prompts)})"
+            ):
+                responses = InferenceEngine().generate.remote(
+                    prompts=batch_prompts,
+                    valid_moves=batch_valid_moves,
+                    lora_path=lora_path,
                 )
 
-    return trajectories
+            # Distribute responses back to games
+            game_orders = {g_idx: [] for g_idx in active_indices}
+
+            for i, response in enumerate(responses):
+                g_idx, power = batch_meta[i]
+
+                # Capture data if this is the Fork Step (The one we train on)
+                if is_fork_step:
+                    fork_data[g_idx][power] = {
+                        "prompt": batch_prompts[i],
+                        "completion": response,
+                    }
+
+                orders = extract_orders(response)
+                game_orders[g_idx].extend(orders)
+
+            # Step all games
+            next_active = []
+            for g_idx in active_indices:
+                if g_idx in game_orders:
+                    games[g_idx].step(game_orders[g_idx])
+                    # Check if it should continue next loop
+                    if not (
+                        games[g_idx].get_year() >= target_year or games[g_idx].is_done()
+                    ):
+                        next_active.append(g_idx)
+
+            active_indices = next_active
+            is_fork_step = False
+
+        # 4. SCORING & RETURN
+        # -------------------
+        # Now we have G final states. We calculate rewards relative to the group.
+
+        trajectories = []
+
+        for g_idx, game in enumerate(games):
+            final_scores = calculate_final_scores(game)
+
+            for power, data in fork_data[g_idx].items():
+                if power in final_scores:
+                    trajectories.append(
+                        {
+                            "prompt": data["prompt"],
+                            "completion": data["completion"],
+                            "reward": final_scores[power],
+                            "group_id": f"{main_game.game.game_id}_{power}_{current_year}",  # Unique ID for GRPO grouping
+                        }
+                    )
+
+        return trajectories
+    finally:
+        await axiom.flush()
 
 
 # ==============================================================================

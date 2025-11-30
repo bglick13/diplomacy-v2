@@ -1,28 +1,15 @@
 """
-Diplomacy Logits Processor for vLLM v1 Engine
+Diplomacy Logits Processor for vLLM v1 Engine (Optimized for Performance)
 
-This module implements a custom batch-level logits processor conforming to the
-vLLM v1 LogitsProcessor API. It constrains token generation to valid Diplomacy
-orders using a Trie (prefix tree) data structure.
-
-Usage:
-    1. Load the processor at engine initialization via logits_processors arg
-    2. Pass valid_moves_dict per-request via SamplingParams.extra_args:
-
-       SamplingParams(
-           extra_args={"valid_moves_dict": {"A PAR": ["A PAR - BUR", "A PAR - MAR"]}}
-       )
-
-Critical Nuances:
-- Tokenizer "Space" Sensitivity: Models treat " Paris" and "Paris" as different
-  tokens. Ensure valid_moves strings match the exact spacing in the prompt.
-- The Trie is rebuilt per-request since valid_moves changes every turn.
-- Newline token resets the Trie to allow multiple orders per generation.
+Key optimizations:
+1. Incremental tag detection - only scan new tokens, not entire history
+2. Cached trie position - don't re-walk from root each call
+3. Stateful tracking - O(1) per token instead of O(n)
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.v1.sample.logits_processor import LogitsProcessor
@@ -34,8 +21,6 @@ if TYPE_CHECKING:
 
 
 class TokenTrieNode:
-    """A node in the prefix tree of valid token sequences."""
-
     __slots__ = ("children", "is_end_of_move")
 
     def __init__(self):
@@ -51,10 +36,30 @@ class TokenTrieNode:
         node.is_end_of_move = True
 
 
-class RequestTrieState:
-    """Tracks Trie state for a single request."""
+class RequestState:
+    """
+    Cached state for a single request. Enables O(1) per-token processing.
 
-    __slots__ = ("root", "newline_token_id", "eos_token_id", "output_token_ids")
+    State machine:
+    - DORMANT: Before <orders> tag, allow all tokens
+    - ACTIVE: Inside <orders> block, constrain via trie
+    - DONE: After </orders> tag, allow all tokens
+    """
+
+    __slots__ = (
+        "root",
+        "newline_token_id",
+        "eos_token_id",
+        "output_token_ids",
+        "start_tag_ids",
+        "end_tag_ids",
+        # Cached state
+        "last_processed_len",  # How many tokens we've already processed
+        "orders_start_idx",  # Index where <orders> starts (-1 if not found)
+        "is_done",  # True if </orders> found
+        "current_node",  # Current position in trie
+        "tag_match_progress",  # Partial match progress for tags
+    )
 
     def __init__(
         self,
@@ -62,275 +67,228 @@ class RequestTrieState:
         newline_token_id: int,
         eos_token_id: int,
         output_token_ids: list[int],
+        start_tag_ids: list[int],
+        end_tag_ids: list[int],
     ):
         self.root = root
         self.newline_token_id = newline_token_id
         self.eos_token_id = eos_token_id
         self.output_token_ids = output_token_ids
+        self.start_tag_ids = start_tag_ids
+        self.end_tag_ids = end_tag_ids
+
+        # Initialize cached state
+        self.last_processed_len = 0
+        self.orders_start_idx = -1
+        self.is_done = False
+        self.current_node = root
+        self.tag_match_progress = 0  # For incremental tag matching
 
 
 class DiplomacyLogitsProcessor(LogitsProcessor):
-    """
-    Batch-level LogitsProcessor for vLLM v1 to enforce valid Diplomacy orders.
-
-    Subclasses vllm.v1.sample.logits_processor.LogitsProcessor and implements:
-    - validate_params(cls, params): Validates SamplingParams
-    - __init__(self, vllm_config, device, is_pin_memory): Initializes processor
-    - apply(self, logits): Transforms batch logits tensor
-    - is_argmax_invariant(self): Returns False (we modify argmax)
-    - update_state(self, batch_update): Handles batch state changes
-    """
-
     @classmethod
     def validate_params(cls, sampling_params: "SamplingParams") -> None:
-        """Validate that extra_args contains valid_moves_dict if present."""
         if sampling_params.extra_args is None:
             return
-
         valid_moves_dict = sampling_params.extra_args.get("valid_moves_dict")
         if valid_moves_dict is None:
             return
-
         if not isinstance(valid_moves_dict, dict):
-            raise ValueError(
-                f"valid_moves_dict must be a dict, got {type(valid_moves_dict)}"
-            )
-
-        for unit, moves in valid_moves_dict.items():
-            if not isinstance(unit, str):
-                raise ValueError(f"Unit key must be str, got {type(unit)}")
+            raise ValueError("valid_moves_dict must be a dict")
+        # Validate inner types
+        for unit_key, moves in valid_moves_dict.items():
+            if not isinstance(unit_key, str):
+                raise ValueError(f"Unit key must be str, got {type(unit_key).__name__}")
             if not isinstance(moves, list):
-                raise ValueError(f"Moves must be list, got {type(moves)}")
+                raise ValueError(f"Moves must be list, got {type(moves).__name__}")
             for move in moves:
                 if not isinstance(move, str):
-                    raise ValueError(f"Each move must be str, got {type(move)}")
+                    raise ValueError(
+                        f"Each move must be str, got {type(move).__name__}"
+                    )
 
     def __init__(
-        self,
-        vllm_config: "VllmConfig",
-        device: torch.device,
-        is_pin_memory: bool,
+        self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
     ):
-        """Initialize the batch-level logits processor."""
         from transformers import AutoTokenizer
 
         self.device = device
         self.is_pin_memory = is_pin_memory
 
-        # Load tokenizer from model config
         model_name = vllm_config.model_config.model
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-        # Cache special token IDs
+        # Cache Special Tokens
         self.newline_token_id = self.tokenizer.encode("\n", add_special_tokens=False)[
             -1
         ]
         self.eos_token_id = self.tokenizer.eos_token_id
 
-        # Per-request state: index -> RequestTrieState
-        self.req_states: dict[int, RequestTrieState] = {}
+        # Cache Tag Sequences for Fast Matching
+        self.start_tag_ids = self.tokenizer.encode("<orders>", add_special_tokens=False)
+        self.end_tag_ids = self.tokenizer.encode("</orders>", add_special_tokens=False)
+
+        self.req_states: dict[int, RequestState] = {}
 
     def is_argmax_invariant(self) -> bool:
-        """
-        Returns False because this processor modifies which token has highest logit.
-        We mask invalid tokens with -inf, fundamentally changing the distribution.
-        """
         return False
 
     def _build_trie(self, valid_moves_dict: dict[str, list[str]]) -> TokenTrieNode:
-        """Build a Trie from valid moves dictionary."""
         root = TokenTrieNode()
-
         for moves in valid_moves_dict.values():
             for move in moves:
                 token_ids = self.tokenizer.encode(move, add_special_tokens=False)
                 root.add_sequence(token_ids)
-
         return root
 
-    def _walk_trie(self, state: RequestTrieState) -> tuple[list[int], bool]:
-        """
-        Walk the Trie based on output_token_ids to find valid next tokens.
-
-        Returns:
-            (valid_token_ids, is_at_end_of_move)
-        """
-        current_node = state.root
-
-        for token_id in state.output_token_ids:
-            # Check for reset (newline after valid move end)
-            if token_id == state.newline_token_id and current_node.is_end_of_move:
-                current_node = state.root
-                continue
-
-            # Walk down the tree
-            if token_id in current_node.children:
-                current_node = current_node.children[token_id]
-            else:
-                # Dead end - off the valid path
-                return [], False
-
-        valid_tokens = list(current_node.children.keys())
-        return valid_tokens, current_node.is_end_of_move
+    def _find_sequence_at(
+        self, tokens: list[int], needle: list[int], start: int
+    ) -> int:
+        """Check if needle appears at exactly position start in tokens."""
+        if start < 0 or start + len(needle) > len(tokens):
+            return -1
+        for i, n_tok in enumerate(needle):
+            if tokens[start + i] != n_tok:
+                return -1
+        return start
 
     def update_state(self, batch_update: "BatchUpdate | None") -> None:
-        """
-        Update internal state based on batch changes.
-
-        Processes: removes, adds, then moves (in that order per vLLM spec).
-        """
         from vllm.v1.sample.logits_processor import MoveDirectionality
 
         if batch_update is None:
             return
 
-        # Process removed requests
         for index in batch_update.removed:
             self.req_states.pop(index, None)
 
-        # Process added requests
-        # AddedRequest = (index, params, prompt_tok_ids, output_tok_ids)
-        for index, params, _prompt_token_ids, output_token_ids in batch_update.added:
+        for index, params, _, output_token_ids in batch_update.added:
             if params is None or params.extra_args is None:
                 self.req_states.pop(index, None)
                 continue
 
             valid_moves_dict = params.extra_args.get("valid_moves_dict")
-            if valid_moves_dict is None:
+            if not valid_moves_dict:
                 self.req_states.pop(index, None)
                 continue
 
-            # Build Trie for this request
-            root = self._build_trie(valid_moves_dict)
-
-            # IMPORTANT: output_token_ids is a REFERENCE to the running output
-            # tokens list. Via this reference we always see the latest tokens.
-            self.req_states[index] = RequestTrieState(
-                root=root,
+            self.req_states[index] = RequestState(
+                root=self._build_trie(valid_moves_dict),
                 newline_token_id=self.newline_token_id,
                 eos_token_id=self.eos_token_id or 0,
                 output_token_ids=output_token_ids,
+                start_tag_ids=self.start_tag_ids,
+                end_tag_ids=self.end_tag_ids,
             )
 
-        # Process moves (both unidirectional and swaps)
-        for src_idx, dst_idx, directionality in batch_update.moved:
-            src_state = self.req_states.pop(src_idx, None)
-            dst_state = self.req_states.pop(dst_idx, None)
-
+        for src, dst, directionality in batch_update.moved:
+            src_state = self.req_states.pop(src, None)
+            dst_state = self.req_states.pop(dst, None)
             if src_state is not None:
-                self.req_states[dst_idx] = src_state
-
+                self.req_states[dst] = src_state
             if directionality == MoveDirectionality.SWAP and dst_state is not None:
-                self.req_states[src_idx] = dst_state
+                self.req_states[src] = dst_state
+
+    def _update_request_state(self, state: RequestState) -> None:
+        """
+        Incrementally update cached state based on new tokens.
+        Only processes tokens since last_processed_len.
+        """
+        tokens = state.output_token_ids
+        current_len = len(tokens)
+
+        if current_len <= state.last_processed_len:
+            return  # No new tokens
+
+        # Process only new tokens
+        for i in range(state.last_processed_len, current_len):
+            token = tokens[i]
+
+            # STATE: Looking for <orders>
+            if state.orders_start_idx == -1:
+                # Check if this token continues or starts the <orders> tag
+                if token == state.start_tag_ids[state.tag_match_progress]:
+                    state.tag_match_progress += 1
+                    if state.tag_match_progress == len(state.start_tag_ids):
+                        # Found complete <orders> tag!
+                        state.orders_start_idx = i - len(state.start_tag_ids) + 1
+                        state.tag_match_progress = 0  # Reset for </orders> search
+                        state.current_node = state.root  # Ready for trie walk
+                else:
+                    # Reset progress (but check if current token starts the tag)
+                    state.tag_match_progress = 0
+                    if token == state.start_tag_ids[0]:
+                        state.tag_match_progress = 1
+
+            # STATE: Inside <orders>, looking for </orders>
+            elif not state.is_done:
+                # Check for </orders> closing tag
+                if token == state.end_tag_ids[state.tag_match_progress]:
+                    state.tag_match_progress += 1
+                    if state.tag_match_progress == len(state.end_tag_ids):
+                        state.is_done = True
+                else:
+                    # Reset progress (check if current token starts </orders>)
+                    state.tag_match_progress = 0
+                    if token == state.end_tag_ids[0]:
+                        state.tag_match_progress = 1
+
+                    # Update trie position for this token
+                    if token == state.newline_token_id:
+                        if state.current_node.is_end_of_move:
+                            state.current_node = state.root  # New line, reset trie
+                        # else: invalid state, but let trie handle it
+                    elif token in state.current_node.children:
+                        state.current_node = state.current_node.children[token]
+                    else:
+                        # Dead end - stay at current node (will mask in apply)
+                        pass
+
+        state.last_processed_len = current_len
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
-        """
-        Apply Diplomacy order constraints to a batch of logits.
-
-        Args:
-            logits: Tensor of shape (num_requests, vocab_size)
-
-        Returns:
-            Modified logits tensor with invalid tokens masked to -inf
-        """
         if not self.req_states:
             return logits
 
-        # Process each request that has Trie state
         for idx, state in self.req_states.items():
             if idx >= logits.shape[0]:
                 continue
 
-            valid_tokens, is_at_end = self._walk_trie(state)
+            # Incrementally update state based on new tokens
+            self._update_request_state(state)
 
-            # Build allowed token set
-            allowed_tokens = set(valid_tokens)
+            # DORMANT: No <orders> tag yet - allow free generation
+            if state.orders_start_idx == -1:
+                continue
+
+            # DONE: After </orders> - allow free generation
+            if state.is_done:
+                continue
+
+            # ACTIVE: Inside <orders> block - apply trie constraint
+            current_node = state.current_node
+
+            # Determine valid next tokens
+            valid_tokens = list(current_node.children.keys())
+            is_at_end = current_node.is_end_of_move
+
+            # Build allowed set
+            allowed = set(valid_tokens)
             if is_at_end:
-                allowed_tokens.add(state.newline_token_id)
-                allowed_tokens.add(state.eos_token_id)
+                allowed.add(state.newline_token_id)
+                allowed.add(state.eos_token_id)
+                # Allow start of closing tag
+                if state.end_tag_ids:
+                    allowed.add(state.end_tag_ids[0])
 
-            # Fallback: if no valid tokens, allow EOS to prevent infinite loops
-            if not allowed_tokens:
-                allowed_tokens.add(state.eos_token_id)
+            # Safety: If dead end, allow escape via EOS or closing tag
+            if not allowed:
+                allowed.add(state.eos_token_id)
+                if state.end_tag_ids:
+                    allowed.add(state.end_tag_ids[0])
 
-            # Create mask and apply
+            # Apply mask efficiently
             mask = torch.full((logits.shape[1],), float("-inf"), device=logits.device)
-            allowed_list = list(allowed_tokens)
-            mask[allowed_list] = 0
-
+            mask[list(allowed)] = 0
             logits[idx] = logits[idx] + mask
 
         return logits
-
-
-# =============================================================================
-# Legacy Per-Request Processor (for testing and non-vLLM usage)
-# =============================================================================
-
-
-class LegacyDiplomacyLogitsProcessor:
-    """
-    Legacy per-request LogitsProcessor for testing and non-vLLM usage.
-
-    This maintains the original callable interface:
-        processor(input_ids: list[int], scores: Tensor) -> Tensor
-    """
-
-    def __init__(
-        self,
-        tokenizer: Any,
-        valid_moves_dict: dict[str, list[str]],
-        device: str = "cuda",
-    ):
-        self.tokenizer = tokenizer
-        self.device = device
-
-        self.all_valid_orders: list[str] = []
-        for moves in valid_moves_dict.values():
-            self.all_valid_orders.extend(moves)
-
-        self.newline_token_id = tokenizer.encode("\n", add_special_tokens=False)[-1]
-        self.eos_token_id = tokenizer.eos_token_id
-
-        # Build the Trie
-        self.root = TokenTrieNode()
-        self._build_trie()
-
-    def _build_trie(self):
-        for order_str in self.all_valid_orders:
-            token_ids = self.tokenizer.encode(order_str, add_special_tokens=False)
-            self.root.add_sequence(token_ids)
-
-    def __call__(self, input_ids: list[int], scores: torch.Tensor) -> torch.Tensor:
-        """
-        Walks the Trie based on input_ids history to find valid next tokens.
-        """
-        current_node = self.root
-
-        for token_id in input_ids:
-            if token_id == self.newline_token_id and current_node.is_end_of_move:
-                current_node = self.root
-                continue
-
-            if token_id in current_node.children:
-                current_node = current_node.children[token_id]
-            else:
-                current_node = TokenTrieNode()  # Dead end
-                break
-
-        valid_next_tokens = list(current_node.children.keys())
-
-        if current_node.is_end_of_move:
-            valid_next_tokens.append(self.newline_token_id)
-            valid_next_tokens.append(self.eos_token_id)
-
-        mask = torch.full_like(scores, float("-inf"))
-
-        if valid_next_tokens:
-            mask[valid_next_tokens] = 0
-            scores = scores + mask
-        else:
-            scores = torch.full_like(scores, float("-inf"))
-            scores[self.eos_token_id] = 0
-
-        return scores

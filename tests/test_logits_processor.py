@@ -19,7 +19,6 @@ from transformers import AutoTokenizer
 
 from src.inference.logits import (
     DiplomacyLogitsProcessor,
-    LegacyDiplomacyLogitsProcessor,
     TokenTrieNode,
 )
 
@@ -33,13 +32,6 @@ def tokenizer():
     # We use GPT2 for testing because it's small and standard.
     # In prod, this would be Mistral/Llama.
     return AutoTokenizer.from_pretrained("gpt2")
-
-
-@pytest.fixture
-def processor(tokenizer):
-    return LegacyDiplomacyLogitsProcessor(
-        tokenizer=tokenizer, valid_moves_dict=SAMPLE_VALID_MOVES
-    )
 
 
 # =============================================================================
@@ -148,173 +140,6 @@ class TestValidateParams:
 
 
 # =============================================================================
-# LegacyDiplomacyLogitsProcessor Tests (Unit Tests)
-# =============================================================================
-
-
-class TestLegacyProcessor:
-    """Tests for the legacy per-request processor."""
-
-    def test_initial_masking(self, processor, tokenizer):
-        """Test that at the start, only the first tokens of valid orders are allowed."""
-        input_ids = []
-        scores = torch.zeros(tokenizer.vocab_size)
-
-        # Run processor
-        processed_scores = processor(input_ids, scores)
-
-        # Check valid start tokens
-        # "A" (from A PAR) and "F" (from F BRE) should be valid
-        token_a = tokenizer.encode("A PAR - BUR")[0]
-        token_f = tokenizer.encode("F BRE - MAO")[0]
-
-        assert processed_scores[token_a] > -float("inf"), (
-            "Starting with 'A' should be allowed"
-        )
-        assert processed_scores[token_f] > -float("inf"), (
-            "Starting with 'F' should be allowed"
-        )
-
-        # Check invalid token (e.g., "Pizza")
-        token_invalid = tokenizer.encode("Pizza")[0]
-        assert processed_scores[token_invalid] == -float("inf"), (
-            "Invalid start token should be masked"
-        )
-
-    def test_path_following(self, processor, tokenizer):
-        """Test that once we start a move, we must follow the valid path."""
-        # Simulate generating "A PAR -"
-        history_str = "A PAR -"
-        input_ids = tokenizer.encode(history_str)
-
-        scores = torch.zeros(tokenizer.vocab_size)
-        processed_scores = processor(input_ids, scores)
-
-        # Next valid tokens should be " BUR" or " MAR"
-        token_bur = tokenizer.encode(" BUR")[0]
-        token_bur_alt = tokenizer.encode("BUR")[0]
-
-        # Check if BUR (with or without space prefix) is unmasked
-        assert processed_scores[token_bur] > -float("inf") or processed_scores[
-            token_bur_alt
-        ] > -float("inf")
-
-    def test_dead_end_blocking(self, processor, tokenizer):
-        """Test that off-path tokens are strictly forbidden."""
-        # Simulate "A PAR - "
-        input_ids = tokenizer.encode("A PAR -")
-        scores = torch.zeros(tokenizer.vocab_size)
-        processed_scores = processor(input_ids, scores)
-
-        # "LON" is a valid game token, but NOT valid for A PAR
-        token_lon = tokenizer.encode(" LON")[0]
-
-        assert processed_scores[token_lon] == -float("inf"), (
-            "London is not adjacent to Paris; should be blocked."
-        )
-
-    def test_newline_reset(self, processor, tokenizer):
-        """Test that hitting \\n resets the Trie to allow a new order."""
-        # Simulate a full valid order "A PAR - BUR" followed by newline
-        full_order = "A PAR - BUR\n"
-        input_ids = tokenizer.encode(full_order)
-
-        # Step through tokens one by one (simulating generation)
-        for i in range(len(input_ids)):
-            current_history = input_ids[:i]
-            scores = torch.zeros(tokenizer.vocab_size)
-            processor(current_history, scores)
-
-        # Process the step *after* newline
-        final_scores = processor(input_ids, torch.zeros(tokenizer.vocab_size))
-
-        token_a = tokenizer.encode("A")[0]
-        token_f = tokenizer.encode("F")[0]
-
-        assert final_scores[token_a] > -float("inf"), (
-            "Should be able to start 'A' after newline"
-        )
-        assert final_scores[token_f] > -float("inf"), (
-            "Should be able to start 'F' after newline"
-        )
-
-    def test_token_boundary_stress(self, tokenizer):
-        """
-        Stress test for sub-word tokenization.
-        Example: 'BURGUNDY' is tokenized as [' BUR', 'G', 'UN', 'D', 'Y'].
-        The Trie must support multi-token moves.
-        """
-        long_move_processor = LegacyDiplomacyLogitsProcessor(
-            tokenizer,
-            {"A PAR": ["A PAR - BURGUNDY"]},
-        )
-
-        # Get the actual tokenization of the full move
-        full_tokens = tokenizer.encode("A PAR - BURGUNDY")
-        # GPT-2: [32, 29463, 532, 45604, 38, 4944, 35, 56]
-        # Which is: ['A', ' PAR', ' -', ' BUR', 'G', 'UN', 'D', 'Y']
-
-        # Walk step by step through the Trie
-        for i in range(len(full_tokens)):
-            input_ids = full_tokens[:i]
-            scores = torch.zeros(tokenizer.vocab_size)
-            processed_scores = long_move_processor(input_ids, scores)
-
-            # The next token should be allowed
-            next_token = full_tokens[i]
-            assert processed_scores[next_token] > -float("inf"), (
-                f"Token {next_token} ({repr(tokenizer.decode([next_token]))}) "
-                f"should be allowed at position {i}"
-            )
-
-        # After complete move, newline and EOS should be allowed
-        scores = torch.zeros(tokenizer.vocab_size)
-        final_scores = long_move_processor(full_tokens, scores)
-        assert final_scores[tokenizer.eos_token_id] > -float("inf"), (
-            "EOS should be allowed after complete multi-token move"
-        )
-
-    def test_eos_allowed_at_end_of_move(self, processor, tokenizer):
-        """Test that EOS token is allowed after completing a valid move."""
-        # Complete a valid move
-        input_ids = tokenizer.encode("A PAR - BUR")
-        scores = torch.zeros(tokenizer.vocab_size)
-
-        processed_scores = processor(input_ids, scores)
-
-        # EOS should be allowed
-        assert processed_scores[tokenizer.eos_token_id] > -float("inf"), (
-            "EOS should be allowed after completing a move"
-        )
-
-    def test_dead_end_allows_eos(self, processor, tokenizer):
-        """Test that EOS is allowed as fallback when in a dead end."""
-        # Force a dead end by providing invalid sequence
-        input_ids = tokenizer.encode("INVALID GARBAGE")
-        scores = torch.zeros(tokenizer.vocab_size)
-
-        processed_scores = processor(input_ids, scores)
-
-        # EOS should be allowed as fallback
-        assert processed_scores[tokenizer.eos_token_id] == 0, (
-            "EOS should be allowed in dead end"
-        )
-
-    def test_multiple_units_in_trie(self, processor, tokenizer):
-        """Test that all units' moves are in the trie."""
-        # Both "A PAR - BUR" and "F BRE - MAO" should be valid starting points
-        input_ids = []
-        scores = torch.zeros(tokenizer.vocab_size)
-        processed_scores = processor(input_ids, scores)
-
-        # Count how many tokens are valid at the start
-        valid_count = (processed_scores > -float("inf")).sum().item()
-
-        # Should have at least 2 valid starting tokens (A and F)
-        assert valid_count >= 1, "Should have valid starting tokens"
-
-
-# =============================================================================
 # DiplomacyLogitsProcessor (Batch-Level) Tests
 # =============================================================================
 
@@ -416,13 +241,15 @@ class TestBatchLevelProcessor:
         """
         Test that apply() walks the trie based on output_token_ids.
 
-        At the start of generation (empty output_token_ids), only the first
-        tokens of valid moves should be allowed.
+        CRITICAL: Masking only occurs INSIDE <orders> tags. Before that,
+        free generation is allowed for Chain-of-Thought reasoning.
         """
         valid_moves = {"A PAR": ["A PAR - BUR", "A PAR - MAR"]}
         params = MockSamplingParams(extra_args={"valid_moves_dict": valid_moves})
 
-        output_token_ids: list[int] = []
+        # Simulate that model has already generated <orders> tag
+        orders_tag_tokens = tokenizer.encode("<orders>", add_special_tokens=False)
+        output_token_ids: list[int] = list(orders_tag_tokens)
 
         batch_update = MockBatchUpdate(
             batch_size=1,
@@ -436,7 +263,7 @@ class TestBatchLevelProcessor:
         result = batch_processor.apply(logits)
 
         # First token of "A PAR - BUR" should be allowed
-        first_token = tokenizer.encode("A PAR - BUR")[0]
+        first_token = tokenizer.encode("A PAR - BUR", add_special_tokens=False)[0]
         assert result[0, first_token] > -float("inf"), (
             f"First token {first_token} should be allowed"
         )
@@ -452,12 +279,15 @@ class TestBatchLevelProcessor:
 
         This simulates the generation process where output_token_ids is a
         reference that gets appended to as tokens are generated.
+
+        CRITICAL: Masking only applies INSIDE <orders> tags.
         """
         valid_moves = {"A PAR": ["A PAR - BUR"]}
         params = MockSamplingParams(extra_args={"valid_moves_dict": valid_moves})
 
-        # This list will be mutated to simulate token generation
-        output_token_ids: list[int] = []
+        # Start with <orders> tag already generated (to trigger masking)
+        orders_tag_tokens = tokenizer.encode("<orders>", add_special_tokens=False)
+        output_token_ids: list[int] = list(orders_tag_tokens)
 
         batch_update = MockBatchUpdate(
             batch_size=1,
@@ -467,7 +297,7 @@ class TestBatchLevelProcessor:
         batch_processor.update_state(batch_update)  # type: ignore[arg-type]
 
         # Get the full tokenization of the valid move
-        full_tokens = tokenizer.encode("A PAR - BUR")
+        full_tokens = tokenizer.encode("A PAR - BUR", add_special_tokens=False)
 
         # Simulate generation: append tokens one by one
         for i, token in enumerate(full_tokens):
@@ -518,4 +348,448 @@ class TestBatchLevelProcessor:
         # Should be unchanged
         assert torch.allclose(result, logits), (
             "Logits should be unmodified when no requests tracked"
+        )
+
+
+# =============================================================================
+# Tag Detection (Context Awareness) Tests
+# =============================================================================
+
+
+class TestTagDetection:
+    """
+    Tests for the critical tag detection logic that enables Chain-of-Thought.
+
+    The processor must be "dormant" (allow free generation) until the model
+    outputs <orders>, then constrain tokens until </orders>.
+    """
+
+    @pytest.fixture
+    def batch_processor(self, tokenizer):
+        """Create a batch-level processor with mocked vllm_config."""
+        mock_config = MockVllmConfig(model_name="gpt2")
+        return DiplomacyLogitsProcessor(
+            vllm_config=mock_config,  # type: ignore[arg-type]
+            device=torch.device("cpu"),
+            is_pin_memory=False,
+        )
+
+    def test_free_generation_before_orders_tag(self, batch_processor, tokenizer):
+        """
+        CRITICAL: Before <orders> tag, model must be free to generate anything.
+
+        This is the "lobotomization" bug - if we mask during CoT, the model
+        cannot think and output quality collapses.
+        """
+        valid_moves = {"A PAR": ["A PAR - BUR"]}
+        params = MockSamplingParams(extra_args={"valid_moves_dict": valid_moves})
+
+        # Model is generating reasoning (no <orders> tag yet)
+        analysis_text = "<analysis>I think I should move to Burgundy because"
+        output_token_ids: list[int] = tokenizer.encode(
+            analysis_text, add_special_tokens=False
+        )
+
+        batch_update = MockBatchUpdate(
+            batch_size=1,
+            added=[(0, params, None, output_token_ids)],
+        )
+        batch_processor.update_state(batch_update)  # type: ignore[arg-type]
+
+        logits = torch.zeros(1, tokenizer.vocab_size)
+        result = batch_processor.apply(logits)
+
+        # ALL tokens should be allowed (no masking during CoT)
+        assert torch.all(result == 0), (
+            "All tokens should be allowed before <orders> tag (free CoT generation)"
+        )
+
+    def test_masking_activates_inside_orders_tag(self, batch_processor, tokenizer):
+        """
+        After <orders> tag, masking should activate and constrain to valid moves.
+        """
+        valid_moves = {"A PAR": ["A PAR - BUR"]}
+        params = MockSamplingParams(extra_args={"valid_moves_dict": valid_moves})
+
+        # Model has output reasoning and entered orders block
+        text_with_orders = "<analysis>Moving to Burgundy</analysis>\n<orders>"
+        output_token_ids: list[int] = tokenizer.encode(
+            text_with_orders, add_special_tokens=False
+        )
+
+        batch_update = MockBatchUpdate(
+            batch_size=1,
+            added=[(0, params, None, output_token_ids)],
+        )
+        batch_processor.update_state(batch_update)  # type: ignore[arg-type]
+
+        logits = torch.zeros(1, tokenizer.vocab_size)
+        result = batch_processor.apply(logits)
+
+        # Some tokens should now be masked
+        masked_count = (result == -float("inf")).sum().item()
+        assert masked_count > 0, "Tokens should be masked inside <orders> block"
+
+        # First token of valid move should be allowed
+        first_move_token = tokenizer.encode("A PAR - BUR", add_special_tokens=False)[0]
+        assert result[0, first_move_token] > -float("inf"), (
+            "First token of valid move should be allowed"
+        )
+
+    def test_free_generation_after_closing_tag(self, batch_processor, tokenizer):
+        """
+        After </orders> tag, masking should deactivate for any trailing content.
+        """
+        valid_moves = {"A PAR": ["A PAR - BUR"]}
+        params = MockSamplingParams(extra_args={"valid_moves_dict": valid_moves})
+
+        # Full generation with orders block completed
+        complete_text = "<analysis>Plan</analysis>\n<orders>A PAR - BUR\n</orders>"
+        output_token_ids: list[int] = tokenizer.encode(
+            complete_text, add_special_tokens=False
+        )
+
+        batch_update = MockBatchUpdate(
+            batch_size=1,
+            added=[(0, params, None, output_token_ids)],
+        )
+        batch_processor.update_state(batch_update)  # type: ignore[arg-type]
+
+        logits = torch.zeros(1, tokenizer.vocab_size)
+        result = batch_processor.apply(logits)
+
+        # All tokens should be allowed again (orders block is closed)
+        assert torch.all(result == 0), (
+            "All tokens should be allowed after </orders> tag"
+        )
+
+    def test_empty_output_allows_free_generation(self, batch_processor, tokenizer):
+        """
+        At the very start of generation (empty output), free generation is allowed.
+        """
+        valid_moves = {"A PAR": ["A PAR - BUR"]}
+        params = MockSamplingParams(extra_args={"valid_moves_dict": valid_moves})
+
+        output_token_ids: list[int] = []
+
+        batch_update = MockBatchUpdate(
+            batch_size=1,
+            added=[(0, params, None, output_token_ids)],
+        )
+        batch_processor.update_state(batch_update)  # type: ignore[arg-type]
+
+        logits = torch.zeros(1, tokenizer.vocab_size)
+        result = batch_processor.apply(logits)
+
+        # All tokens should be allowed
+        assert torch.all(result == 0), (
+            "All tokens should be allowed with empty output (no <orders> yet)"
+        )
+
+
+# =============================================================================
+# Performance Benchmark Tests
+# =============================================================================
+
+
+class TestPerformance:
+    """
+    Performance tests to ensure the logits processor is fast enough for
+    high-throughput inference.
+
+    Target: <1ms per apply() call for realistic batch sizes.
+    """
+
+    @pytest.fixture
+    def batch_processor(self, tokenizer):
+        """Create a batch-level processor with mocked vllm_config."""
+        mock_config = MockVllmConfig(model_name="gpt2")
+        return DiplomacyLogitsProcessor(
+            vllm_config=mock_config,  # type: ignore[arg-type]
+            device=torch.device("cpu"),
+            is_pin_memory=False,
+        )
+
+    def test_apply_performance_single_request(self, batch_processor, tokenizer):
+        """
+        Benchmark apply() with a single request mid-generation.
+
+        Target: <1ms per call on CPU.
+        """
+        import time
+
+        # Realistic valid moves (7 powers × ~5 units × ~10 moves each)
+        units = ["A PAR", "A MAR", "A BUR", "F BRE", "F MAO", "A MUN", "A BER"]
+        destinations = [
+            "PAR",
+            "MAR",
+            "BUR",
+            "BRE",
+            "MAO",
+            "MUN",
+            "BER",
+            "PIC",
+            "GAS",
+            "RUH",
+        ]
+        valid_moves = {
+            unit: [f"{unit} - {dest}" for dest in destinations[:8]] for unit in units
+        }
+
+        params = MockSamplingParams(extra_args={"valid_moves_dict": valid_moves})
+
+        # Simulate mid-generation inside <orders> block
+        text = "<analysis>Strategic analysis here.</analysis>\n<orders>A PAR - "
+        output_token_ids: list[int] = tokenizer.encode(text, add_special_tokens=False)
+
+        batch_update = MockBatchUpdate(
+            batch_size=1,
+            added=[(0, params, None, output_token_ids)],
+        )
+        batch_processor.update_state(batch_update)  # type: ignore[arg-type]
+
+        # Warm-up
+        logits = torch.zeros(1, tokenizer.vocab_size)
+        for _ in range(10):
+            batch_processor.apply(logits.clone())
+
+        # Benchmark
+        num_iterations = 100
+        start = time.perf_counter()
+        for _ in range(num_iterations):
+            batch_processor.apply(logits.clone())
+        elapsed = time.perf_counter() - start
+
+        avg_ms = (elapsed / num_iterations) * 1000
+        print(
+            f"\nSingle request apply(): {avg_ms:.3f}ms avg over {num_iterations} calls"
+        )
+
+        assert avg_ms < 5.0, f"apply() too slow: {avg_ms:.3f}ms (target <5ms on CPU)"
+
+    def test_apply_performance_batch(self, batch_processor, tokenizer):
+        """
+        Benchmark apply() with a batch of requests (simulating vLLM batching).
+
+        Target: <10ms per call for batch_size=8 on CPU.
+        """
+        import time
+
+        batch_size = 8
+
+        # Build valid moves for each request
+        units = ["A PAR", "A MAR", "F BRE", "A MUN"]
+        destinations = ["PAR", "MAR", "BUR", "BRE", "MAO", "MUN", "BER", "PIC"]
+        valid_moves = {
+            unit: [f"{unit} - {dest}" for dest in destinations] for unit in units
+        }
+
+        # Add multiple requests
+        added = []
+        for i in range(batch_size):
+            params = MockSamplingParams(extra_args={"valid_moves_dict": valid_moves})
+            text = f"<analysis>Reasoning {i}</analysis>\n<orders>A PAR - "
+            output_token_ids = tokenizer.encode(text, add_special_tokens=False)
+            added.append((i, params, None, output_token_ids))
+
+        batch_update = MockBatchUpdate(batch_size=batch_size, added=added)
+        batch_processor.update_state(batch_update)  # type: ignore[arg-type]
+
+        # Warm-up
+        logits = torch.zeros(batch_size, tokenizer.vocab_size)
+        for _ in range(5):
+            batch_processor.apply(logits.clone())
+
+        # Benchmark
+        num_iterations = 50
+        start = time.perf_counter()
+        for _ in range(num_iterations):
+            batch_processor.apply(logits.clone())
+        elapsed = time.perf_counter() - start
+
+        avg_ms = (elapsed / num_iterations) * 1000
+        print(
+            f"\nBatch ({batch_size}) apply(): {avg_ms:.3f}ms avg over {num_iterations} calls"
+        )
+
+        assert avg_ms < 20.0, (
+            f"Batch apply() too slow: {avg_ms:.3f}ms (target <20ms on CPU)"
+        )
+
+    def test_trie_build_performance(self, batch_processor, tokenizer):
+        """
+        Benchmark Trie construction with realistic move counts.
+
+        A complex Diplomacy position might have 100+ valid moves.
+        Target: <50ms to build Trie.
+        """
+        import time
+
+        # Generate many valid moves (worst case scenario)
+        units = [
+            f"A {loc}"
+            for loc in [
+                "PAR",
+                "MAR",
+                "BUR",
+                "MUN",
+                "BER",
+                "KIE",
+                "RUH",
+                "PIE",
+                "VEN",
+                "ROM",
+            ]
+        ]
+        units += [
+            f"F {loc}"
+            for loc in ["BRE", "MAO", "NAO", "ENG", "NTH", "BAL", "BOT", "SKA"]
+        ]
+        destinations = [
+            "PAR",
+            "MAR",
+            "BUR",
+            "MUN",
+            "BER",
+            "KIE",
+            "RUH",
+            "PIE",
+            "VEN",
+            "ROM",
+            "BRE",
+            "MAO",
+            "NAO",
+            "ENG",
+            "NTH",
+            "BAL",
+            "BOT",
+            "SKA",
+            "PIC",
+            "GAS",
+            "SPA",
+            "POR",
+            "TUN",
+            "NAF",
+            "TYS",
+            "GOL",
+            "WES",
+            "ION",
+            "ADR",
+            "AEG",
+        ]
+
+        valid_moves = {}
+        for unit in units:
+            valid_moves[unit] = [f"{unit} - {dest}" for dest in destinations[:15]]
+
+        total_moves = sum(len(m) for m in valid_moves.values())
+        print(f"\nBuilding Trie for {total_moves} moves from {len(units)} units...")
+
+        # Benchmark Trie construction
+        num_iterations = 20
+        start = time.perf_counter()
+        for _ in range(num_iterations):
+            batch_processor._build_trie(valid_moves)
+        elapsed = time.perf_counter() - start
+
+        avg_ms = (elapsed / num_iterations) * 1000
+        print(f"Trie build: {avg_ms:.3f}ms avg over {num_iterations} calls")
+
+        assert avg_ms < 100.0, f"Trie build too slow: {avg_ms:.3f}ms (target <100ms)"
+
+    def test_apply_performance_incremental_generation(self, batch_processor, tokenizer):
+        """
+        CRITICAL: Simulate realistic generation where apply() is called
+        once per token for 200 tokens.
+
+        This tests the O(1) vs O(n) per-token complexity.
+        Old implementation: O(n²) total (scanning entire history each call)
+        New implementation: O(n) total (incremental state tracking)
+
+        Target: <100ms for 200 token generation on CPU.
+        """
+        import time
+
+        valid_moves = {
+            "A PAR": ["A PAR - BUR", "A PAR - MAR"],
+            "F BRE": ["F BRE - MAO"],
+        }
+        params = MockSamplingParams(extra_args={"valid_moves_dict": valid_moves})
+
+        # Simulate the full generation pattern:
+        # 1. Generate <analysis>...</analysis>\n<orders>
+        # 2. Generate move tokens
+        # 3. Generate </orders>
+
+        prefix_text = "<analysis>I should secure Burgundy for strategic depth.</analysis>\n<orders>"
+        prefix_tokens = tokenizer.encode(prefix_text, add_special_tokens=False)
+
+        # Valid move + newline + closing tag
+        move_text = "A PAR - BUR\n</orders>"
+        move_tokens = tokenizer.encode(move_text, add_special_tokens=False)
+
+        # Simulate generating ~200 tokens total (realistic for our use case)
+        # We'll repeat the analysis part to pad to ~200 tokens
+        padding_text = "Considering the diplomatic situation with Germany and the potential for coordinated moves into the lowlands, I believe the best approach is to secure our eastern border while maintaining flexibility in the south."
+        padding_tokens = tokenizer.encode(padding_text, add_special_tokens=False)
+
+        # Build full sequence
+        full_tokens = padding_tokens + prefix_tokens + move_tokens
+        target_len = 200
+        if len(full_tokens) < target_len:
+            # Pad with more reasoning
+            extra = tokenizer.encode(
+                " " * (target_len - len(full_tokens)), add_special_tokens=False
+            )
+            full_tokens = extra + full_tokens
+
+        print(f"\nSimulating generation of {len(full_tokens)} tokens...")
+
+        # This list will be mutated to simulate token-by-token generation
+        output_token_ids: list[int] = []
+
+        batch_update = MockBatchUpdate(
+            batch_size=1,
+            added=[(0, params, None, output_token_ids)],
+        )
+        batch_processor.update_state(batch_update)  # type: ignore[arg-type]
+
+        # Warm-up
+        for _ in range(5):
+            output_token_ids.clear()
+            for token in full_tokens[:20]:
+                output_token_ids.append(token)
+                logits = torch.zeros(1, tokenizer.vocab_size)
+                batch_processor.apply(logits)
+
+        # Reset for actual benchmark
+        # Need to recreate state since we cleared tokens
+        batch_processor.req_states.clear()
+        output_token_ids.clear()
+        batch_update = MockBatchUpdate(
+            batch_size=1,
+            added=[(0, params, None, output_token_ids)],
+        )
+        batch_processor.update_state(batch_update)  # type: ignore[arg-type]
+
+        # Benchmark: Generate tokens one by one
+        start = time.perf_counter()
+        for token in full_tokens:
+            output_token_ids.append(token)
+            logits = torch.zeros(1, tokenizer.vocab_size)
+            batch_processor.apply(logits)
+        elapsed = time.perf_counter() - start
+
+        total_ms = elapsed * 1000
+        per_token_us = (elapsed / len(full_tokens)) * 1_000_000
+
+        print(f"Total time for {len(full_tokens)} tokens: {total_ms:.2f}ms")
+        print(f"Per-token latency: {per_token_us:.2f}µs")
+
+        # Target: <100ms total, <500µs per token
+        assert total_ms < 100.0, (
+            f"Incremental generation too slow: {total_ms:.2f}ms (target <100ms)"
+        )
+        assert per_token_us < 500.0, (
+            f"Per-token latency too high: {per_token_us:.2f}µs (target <500µs)"
         )
