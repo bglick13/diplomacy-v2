@@ -431,8 +431,134 @@ async def run_rollout(config_dict: dict, lora_path: str | None = None):
 
 
 @app.function(
-    image=gpu_image, gpu="H100", volumes={str(VOLUME_PATH): volume}, timeout=86400
+    image=gpu_image,
+    gpu="H100",  # Need high VRAM for Training + Reference Model
+    volumes={VOLUME_PATH: volume},
+    timeout=86400,
+    secrets=[modal.Secret.from_name("axiom-secrets")],
 )
 def train_grpo():
-    # ... (Trainer Logic Placeholder) ...
-    pass
+    import asyncio
+
+    import numpy as np
+    import torch
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from src.training.loss import GRPOLoss
+    from src.training.trainer import process_trajectories
+    from src.utils.config import ExperimentConfig
+    from src.utils.observability import axiom, stopwatch
+
+    cfg = ExperimentConfig()
+    print(f"🚀 Starting GRPO Loop: {cfg.run_name}")
+
+    # 1. Load Models
+    # We load the BASE model
+    model_id = "Qwen/Qwen2.5-7B-Instruct"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer.pad_token = tokenizer.eos_token  # Fix padding
+
+    print("Loading Base Model...")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        model_id, torch_dtype=torch.bfloat16, device_map="auto"
+    )
+
+    # Create LoRA Adapter (The Policy)
+    peft_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    policy_model = get_peft_model(base_model, peft_config)
+    policy_model.print_trainable_parameters()
+
+    # Reference Model: Just the base model (disable adapter)
+    # Optimized: We reuse the same base model weights, just don't pass through LoRA layers
+    # But for simplicity in custom loss, we can pass the same model and use a context manager
+    # to disable adapters if supported, or simpler: keep 'ref_model' as base_model.
+    # Actually, get_peft_model modifies in place.
+    # To get reference logits, we use: with policy_model.disable_adapter(): ...
+
+    optimizer = torch.optim.AdamW(policy_model.parameters(), lr=1e-5)
+    loss_fn = GRPOLoss(
+        policy_model, policy_model
+    )  # We handle disable_adapter inside loss logic ideally
+
+    # 2. Training Loop
+    for step in range(cfg.total_steps):
+        # A. Save Current Policy for Rollouts
+        # We save to a versioned path so vLLM reloads it
+        adapter_path = MODELS_PATH / cfg.run_name / f"adapter_v{step}"
+        policy_model.save_pretrained(str(adapter_path))
+        volume.commit()  # Sync to cloud storage
+
+        print(f"\n=== Step {step}: Version {adapter_path} ===")
+
+        # B. Launch Rollouts (The "E-Step")
+        # We pass the NEW adapter path to the workers
+        with stopwatch(f"Rollout_Step_{step}"):
+            rollout_futures = run_rollout.map(
+                [cfg.dict()] * cfg.num_groups_per_step,
+                kwargs={"lora_path": str(adapter_path)},
+            )
+
+            raw_trajectories = []
+            for res in rollout_futures:
+                raw_trajectories.extend(res)
+
+        print(f"Collected {len(raw_trajectories)} trajectories.")
+
+        # C. Update Policy (The "M-Step")
+        with stopwatch(f"Training_Step_{step}"):
+            # Format data
+            batch_data = process_trajectories(raw_trajectories, tokenizer)
+
+            # Simple Mini-batching (Gradient Accumulation)
+            # We just take one big step for simplicity, or chunk it
+            # For H100, we might fit all 64 sequences? Let's try chunks of 4.
+
+            chunk_size = 4
+            accum_loss = 0
+            optimizer.zero_grad()
+
+            for i in range(0, len(batch_data), chunk_size):
+                chunk = batch_data[i : i + chunk_size]
+                if not chunk:
+                    break
+
+                # Move tensors to GPU
+                for item in chunk:
+                    item["input_ids"] = item["input_ids"].to(policy_model.device)
+                    item["attention_mask"] = item["attention_mask"].to(
+                        policy_model.device
+                    )
+                    item["labels"] = item["labels"].to(policy_model.device)
+
+                # Compute Loss
+                # Note: We need to adapt GRPOLoss to handle the 'disable_adapter' context
+                # Update loss.py to use `with self.model.disable_adapter():` for ref pass
+                loss, pg, kl = loss_fn.compute_loss(chunk)
+
+                loss.backward()
+                accum_loss += loss.item()
+
+            optimizer.step()
+
+            # Logs
+            avg_loss = accum_loss / (len(batch_data) / chunk_size)
+            print(f"Loss: {avg_loss:.4f} | KL: {kl:.4f}")
+
+            # Send to Axiom/WandB
+            axiom.log(
+                {
+                    "step": step,
+                    "loss": avg_loss,
+                    "kl": kl,
+                    "reward_mean": np.mean([t["reward"] for t in raw_trajectories]),
+                }
+            )
+            asyncio.run(axiom.flush())

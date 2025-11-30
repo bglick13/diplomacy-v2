@@ -10,7 +10,7 @@ class DiplomacyWrapper:
     tokenization and state representation for LLMs.
     """
 
-    def __init__(self, game_id: str = None, horizon: int = 2):
+    def __init__(self, game_id: str | None = None, horizon: int = 2):
         self.game = diplomacy.Game(game_id=game_id)
         self.max_years = horizon
         self.start_year = self.get_year()
@@ -26,13 +26,13 @@ class DiplomacyWrapper:
     def get_current_phase(self) -> str:
         # Just return the standard phase string (e.g. "SPRING 1901 MOVEMENT")
         # The previous version prepended phase_type ('M'), which confused parsing.
-        return self.game.phase
+        return str(self.game.phase)
 
     def get_year(self) -> int:
         """Robustly extract year from the game state."""
         # The diplomacy package usually formats phase as "SEASON YEAR TYPE"
         try:
-            parts = self.game.phase.split()
+            parts = str(self.game.phase).split()
             for part in parts:
                 if part.isdigit():
                     return int(part)
@@ -42,7 +42,7 @@ class DiplomacyWrapper:
 
     def get_phase_type(self) -> str:
         """Get the phase type: M (Movement), R (Retreat), A (Adjustment)."""
-        return self.game.phase_type
+        return str(self.game.phase_type)
 
     def get_valid_moves(self, power_name: str) -> Dict[str, List[str]]:
         """
@@ -55,7 +55,7 @@ class DiplomacyWrapper:
         if power_name not in self.game.powers:
             return {}
 
-        phase_type = self.game.phase_type
+        phase_type = str(self.game.phase_type)
         possible_orders = self.game.get_all_possible_orders()
         power = self.game.powers[power_name]
 
@@ -258,7 +258,7 @@ class DiplomacyWrapper:
         return to_saved_game_format(self.game)
 
     def get_unit(self, power_name: str, unit_str: str) -> str | None:
-        units: list[str] = self.game.get_units(power_name)
+        units: list[str] = list(self.game.get_units(power_name))
         print(
             f"\nDEBUG get_unit: power={power_name}, location={unit_str}, units={units}"
         )
