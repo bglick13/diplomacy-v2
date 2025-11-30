@@ -1,8 +1,3 @@
-import os
-import sys
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from src.agents.baselines import ChaosBot, RandomBot
 from src.engine.wrapper import DiplomacyWrapper
 from src.utils.vis import GameVisualizer

@@ -6,7 +6,7 @@ app = modal.App("diplomacy-grpo")
 
 # Dummy Data
 VALID_MOVES = {"A PAR": ["A PAR - BUR", "A PAR - PIC"], "F BRE": ["F BRE - MAO"]}
-PROMPT = "You are France. <orders>"
+PROMPT = "<orders>"
 
 
 @pytest.mark.asyncio

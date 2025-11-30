@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "diplomacy-v2"
 version = "0.1.0"
@@ -13,6 +17,10 @@ dependencies = [
     "torch>=2.9.1",
     "transformers>=4.57.3",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

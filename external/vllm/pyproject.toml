@@ -45,7 +45,9 @@ vllm = "vllm.entrypoints.cli.main:main"
 lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
 
 [tool.setuptools_scm]
-# no extra settings needed, presence enables setuptools-scm
+# Configure to use this directory as root, not parent git repo
+root = "."
+relative_to = "setup.py"
 
 [tool.setuptools.packages.find]
 where = ["."]

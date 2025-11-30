@@ -1,0 +1,19 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": [
+    "external/vllm",
+    ".venv/lib/python3.12/site-packages"
+  ],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "pythonVersion": "3.12",
+      "pythonPlatform": "Darwin",
+      "extraPaths": [
+        "external/vllm",
+        ".venv/lib/python3.12/site-packages"
+      ]
+    }
+  ]
+}
