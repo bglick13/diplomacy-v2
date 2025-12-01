@@ -59,6 +59,14 @@ class EventType(str, Enum):
     # Health Checks
     HEALTH_CHECK = "health_check"
 
+    # Training Events
+    TRAINING_STEP = "training_step"
+    TRAINING_START = "training_start"
+    TRAINING_COMPLETE = "training_complete"
+    TRAINING_ERROR = "training_error"
+    CHECKPOINT_SAVED = "checkpoint_saved"
+    TRAJECTORY_PROCESSING = "trajectory_processing"
+
 
 # =============================================================================
 # Axiom Handler
@@ -347,6 +355,177 @@ def log_orders_invalid(
             "order": order,
             "error": error,
             "phase": phase,
+        }
+    )
+
+
+# =============================================================================
+# Training Events
+# =============================================================================
+
+
+def log_training_start(
+    run_name: str,
+    total_steps: int,
+    num_groups_per_step: int,
+    samples_per_group: int,
+    model_id: str,
+    lora_rank: int,
+    learning_rate: float,
+):
+    """Log the start of a training run."""
+    console_logger.info(
+        f"🚀 Training Started: {run_name} | {total_steps} steps | "
+        f"{num_groups_per_step}x{samples_per_group} samples"
+    )
+    axiom.log(
+        {
+            "event": EventType.TRAINING_START,
+            "run_name": run_name,
+            "total_steps": total_steps,
+            "num_groups_per_step": num_groups_per_step,
+            "samples_per_group": samples_per_group,
+            "model_id": model_id,
+            "lora_rank": lora_rank,
+            "learning_rate": learning_rate,
+        }
+    )
+
+
+def log_training_step(
+    step: int,
+    loss: float,
+    pg_loss: float,
+    kl: float,
+    grad_norm: float,
+    learning_rate: float,
+    # Reward stats
+    reward_mean: float,
+    reward_std: float,
+    reward_min: float,
+    reward_max: float,
+    # Trajectory stats
+    num_trajectories: int,
+    num_groups: int,
+    skipped_groups: int,
+    # Loss component details
+    mean_completion_logprob: float,
+    mean_ref_logprob: float,
+    mean_advantage: float,
+    advantage_std: float,
+    # Timing
+    rollout_duration_ms: int,
+    training_duration_ms: int,
+    total_tokens: int,
+):
+    """Log a training step with comprehensive metrics."""
+    console_logger.info(
+        f"📈 Step {step}: loss={loss:.4f} | pg={pg_loss:.4f} | kl={kl:.4f} | "
+        f"grad_norm={grad_norm:.4f} | reward_mean={reward_mean:.2f}"
+    )
+    axiom.log(
+        {
+            "event": EventType.TRAINING_STEP,
+            "step": step,
+            # Core losses
+            "loss": loss,
+            "pg_loss": pg_loss,
+            "kl": kl,
+            "grad_norm": grad_norm,
+            "learning_rate": learning_rate,
+            # Reward stats
+            "reward_mean": reward_mean,
+            "reward_std": reward_std,
+            "reward_min": reward_min,
+            "reward_max": reward_max,
+            # Trajectory stats
+            "num_trajectories": num_trajectories,
+            "num_groups": num_groups,
+            "skipped_groups": skipped_groups,
+            # LogProb details
+            "mean_completion_logprob": mean_completion_logprob,
+            "mean_ref_logprob": mean_ref_logprob,
+            "mean_advantage": mean_advantage,
+            "advantage_std": advantage_std,
+            # Timing & throughput
+            "rollout_duration_ms": rollout_duration_ms,
+            "training_duration_ms": training_duration_ms,
+            "total_tokens": total_tokens,
+            "tokens_per_second": (
+                total_tokens / (training_duration_ms / 1000)
+                if training_duration_ms > 0
+                else 0
+            ),
+        }
+    )
+
+
+def log_checkpoint_saved(step: int, adapter_path: str, run_name: str):
+    """Log when a model checkpoint is saved."""
+    console_logger.info(f"💾 Checkpoint saved: {adapter_path}")
+    axiom.log(
+        {
+            "event": EventType.CHECKPOINT_SAVED,
+            "step": step,
+            "adapter_path": adapter_path,
+            "run_name": run_name,
+        }
+    )
+
+
+def log_trajectory_processing(
+    step: int,
+    total_trajectories: int,
+    total_groups: int,
+    skipped_single_sample_groups: int,
+    reward_mean: float,
+    reward_std: float,
+    avg_completion_tokens: float,
+):
+    """Log trajectory processing results."""
+    if skipped_single_sample_groups > 0:
+        console_logger.warning(
+            f"⚠️ Skipped {skipped_single_sample_groups} single-sample groups"
+        )
+    axiom.log(
+        {
+            "event": EventType.TRAJECTORY_PROCESSING,
+            "step": step,
+            "total_trajectories": total_trajectories,
+            "total_groups": total_groups,
+            "skipped_single_sample_groups": skipped_single_sample_groups,
+            "reward_mean": reward_mean,
+            "reward_std": reward_std,
+            "avg_completion_tokens": avg_completion_tokens,
+        }
+    )
+
+
+def log_training_complete(run_name: str, total_steps: int, total_duration_ms: int):
+    """Log successful training completion."""
+    hours = total_duration_ms / (1000 * 60 * 60)
+    console_logger.info(
+        f"✅ Training Complete: {run_name} | {total_steps} steps | {hours:.2f}h"
+    )
+    axiom.log(
+        {
+            "event": EventType.TRAINING_COMPLETE,
+            "run_name": run_name,
+            "total_steps": total_steps,
+            "total_duration_ms": total_duration_ms,
+        }
+    )
+
+
+def log_training_error(run_name: str, step: int, error: str):
+    """Log training error."""
+    console_logger.error(f"❌ Training Error at step {step}: {error}")
+    axiom.log(
+        {
+            "event": EventType.TRAINING_ERROR,
+            "run_name": run_name,
+            "step": step,
+            "error": error,
         }
     )
 

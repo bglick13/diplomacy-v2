@@ -13,15 +13,15 @@ class ExperimentConfig(BaseModel):
     seed: int = 42
 
     # Model Settings
-    base_model_id: str = "mistralai/Mistral-7B-v0.1"
+    base_model_id: str = "Qwen/Qwen2.5-7B-Instruct"
     lora_rank: int = 16
 
     # Environment Settings
     rollout_horizon_years: int = 2
-    rollout_visualize_chance: float = 1.0
+    rollout_visualize_chance: float = 0.1
 
     # Training Loop
-    total_steps: int = 100
+    total_steps: int = 10
     num_groups_per_step: int = 8  # G in GRPO
     samples_per_group: int = 8  # N in GRPO
 

@@ -35,6 +35,15 @@
 - [ ] **Connect Components**: Wire the Trainer to trigger the Rollout Workers via `map()`.
 - [ ] **Dry Run**: Run a training loop for 5 steps with `batch_size=2` to verify the pipeline.
 
+### Optimizations:
+- [x] Pipeline Rollouts and Training
+Currently: Rollout → Train → Rollout → Train
+Better: Rollout[n+1] ↔ Train[n] (overlap them)
+✅ Implemented using Modal's `spawn()` for async rollouts
+- [ ] Async LoRA Loading
+Preload the next adapter while current step trains.
+- [ ] Gradient accumulation scaling issue → we divide by num_chunks but might need adjustment for larger batches
+
 ## Level 5: Evaluation & Polish
 - [ ] **Tactical Gym**: Implement `evals/scenarios/` with 5 simple tactical puzzles.
 - [ ] **League Eval**: Create a periodic job to play against `RandomBot`.
