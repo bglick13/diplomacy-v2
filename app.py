@@ -1073,39 +1073,56 @@ def train_grpo_benchmark(
         logger.info(f"✅ Model loaded in {model_load_time:.2f}s")
 
         # ==========================================================================
-        # 2. Training Loop (PIPELINED)
+        # 2. Training Loop (DOUBLE-BUFFERED PIPELINE)
         # ==========================================================================
-        # Pipeline strategy: Overlap rollout[n+1] with train[n]
-        # - Start rollouts BEFORE waiting for previous ones
-        # - While training on batch N, collect rollouts for batch N+1
-        # - This hides rollout latency behind training time
+        # Double buffering strategy: Keep TWO batches of rollouts in flight
+        # - This ensures we always have rollouts ready even when they take
+        #   longer than training (common with longer horizons)
         #
-        # Adapter versioning with pipelining:
-        # - Step 0: Uses base model (no adapter exists yet)
-        # - Step N: Uses adapter_v{N} (from training step N-1)
-        # - Rollout[N+1] starts with adapter_v{N} while Train[N] runs
+        # Timeline visualization:
+        #   Rollout[0] ──────────────────────►
+        #   Rollout[1] ──────────────────────────────────────►  (pre-launched)
+        #                                      Train[0] ────► Train[1] ────►
+        #                                                     ↑ No GPU idle!
+        #
+        # Adapter versioning:
+        # - Steps 0,1: Use base model (no adapter trained yet)
+        # - Step N (N>=2): Uses adapter_v{N-1}
         # ==========================================================================
         total_trajectories = 0
         all_rewards = []
 
-        # Start initial rollouts (base model, no LoRA)
-        logger.info("🚀 Starting pipelined training loop")
-        logger.info("Step 0: Launching initial rollouts with base model")
-        pending_rollout_handles = [
+        logger.info("🚀 Starting DOUBLE-BUFFERED pipelined training loop")
+
+        # Pre-launch TWO batches of rollouts for double buffering
+        # Both use base model initially (no adapter trained yet)
+        logger.info("Step 0: Pre-launching 2 batches of rollouts with base model")
+
+        # Batch 0: Will be consumed first
+        current_handles = [
             run_rollout.spawn(cfg.model_dump(), lora_name=None)
             for _ in range(cfg.num_groups_per_step)
         ]
-        current_lora_name = None  # Track which adapter rollouts are using
+        current_lora_name = None
+
+        # Batch 1: Pre-launched buffer (also base model for step 0)
+        next_handles = [
+            run_rollout.spawn(cfg.model_dump(), lora_name=None)
+            for _ in range(cfg.num_groups_per_step)
+        ]
+        next_lora_name = None
+
+        logger.info("📦 Double buffer initialized: 2 batches in flight")
 
         for step in range(cfg.total_steps):
             step_start = time.time()
             step_metrics = {"step": step}
 
-            # A. Wait for PENDING rollouts (launched in previous iteration or init)
+            # A. Wait for CURRENT rollouts (the earlier batch)
             rollout_start = time.time()
             with stopwatch(f"Benchmark_Rollout_{step}"):
                 raw_trajectories = []
-                for handle in pending_rollout_handles:
+                for handle in current_handles:
                     result = handle.get()  # Block until this rollout completes
                     raw_trajectories.extend(result)
 
@@ -1114,13 +1131,16 @@ def train_grpo_benchmark(
             step_metrics["raw_trajectories"] = len(raw_trajectories)
             step_metrics["rollout_lora"] = current_lora_name or "base_model"
 
-            # B. Start NEXT rollouts in background (if not last step)
-            # These will run IN PARALLEL with training below
-            if step < cfg.total_steps - 1:
-                # Determine which adapter next rollouts will use
-                # They use the adapter we're about to train (or base if step 0)
-                if step > 0:
-                    # Save current adapter for next rollouts
+            # B. Shift buffers: next becomes current
+            current_handles = next_handles
+            current_lora_name = next_lora_name
+
+            # C. Launch NEW next batch (if not near the end)
+            # This batch runs during BOTH the wait for current AND training
+            if step < cfg.total_steps - 2:
+                # Determine which adapter to use
+                # After step 0 training, we have adapter_v1
+                if step >= 1:
                     adapter_rel_path = f"{cfg.run_name}/adapter_v{step}"
                     adapter_full_path = MODELS_PATH / cfg.run_name / f"adapter_v{step}"
                     policy_model.save_pretrained(str(adapter_full_path))
@@ -1128,18 +1148,18 @@ def train_grpo_benchmark(
                     next_lora_name = adapter_rel_path
                     logger.info(f"Saved adapter to {adapter_full_path}")
                 else:
-                    next_lora_name = None  # Still use base model
+                    next_lora_name = None  # Still use base model for step 1's rollouts
 
                 logger.info(
-                    f"🔀 Launching rollouts for step {step + 1} "
-                    f"(using {'base model' if not next_lora_name else next_lora_name}) "
-                    "while training..."
+                    f"🔀 Launching rollouts for step {step + 2} "
+                    f"(using {'base model' if not next_lora_name else next_lora_name})"
                 )
-                pending_rollout_handles = [
+                next_handles = [
                     run_rollout.spawn(cfg.model_dump(), lora_name=next_lora_name)
                     for _ in range(cfg.num_groups_per_step)
                 ]
-                current_lora_name = next_lora_name
+            else:
+                next_handles = []  # No more batches to pre-launch
 
             if not raw_trajectories:
                 logger.warning(f"Step {step}: No trajectories, skipping")

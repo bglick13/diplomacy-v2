@@ -16,7 +16,10 @@ You are an Expert Machine Learning Engineer building a Reinforcement Learning sy
     * **InferenceEngine (`modal.Cls`):** GPU-backed, holds vLLM + Base Model.
     * **RolloutWorker (`modal.Function`):** CPU-backed, runs game simulation.
     * **Trainer (`modal.Function`):** GPU-backed, updates LoRA weights.
-
+* **Observability + logging:**: Modal (runtime logs), axiom (log sink + dashboards), wandb (training specific logging)
+    * Use each providers's CLI or MCP tools to retrieve logs and debug issues when working on new features
+    * Make sure we log all necessary data to each place to make future debugging easy
+    * Our goal should be to have a best in class dashboard with all the training insights we need
 ## 2. Directory Structure
 ```text
 diplomacy-grpo/
