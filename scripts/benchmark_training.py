@@ -27,6 +27,7 @@ import argparse
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 import modal
 
@@ -40,6 +41,8 @@ class BenchmarkResult:
     num_groups_per_step: int
     samples_per_group: int
     rollout_horizon_years: int
+    run_name: str | None = None
+    trace_dir: str | None = None
 
     # Timing
     total_duration_s: float
@@ -56,6 +59,29 @@ class BenchmarkResult:
     final_loss: float | None = None
     final_kl: float | None = None
     final_reward_mean: float | None = None
+    profile_snapshots: list[dict[str, Any]] | None = None
+
+    def to_profile_payload(self, mode: str | None) -> dict[str, Any]:
+        return {
+            "run_name": self.run_name or "unspecified",
+            "profiling_mode": mode,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "summary": {
+                "total_duration_s": self.total_duration_s,
+                "training_duration_s": self.training_duration_s,
+                "total_steps": self.total_steps,
+                "num_groups_per_step": self.num_groups_per_step,
+                "samples_per_group": self.samples_per_group,
+                "trace_dir": self.trace_dir,
+            },
+            "snapshots": self.profile_snapshots or [],
+        }
+
+
+def _persist_profile_snapshot(profile_name: str, payload: dict[str, Any]) -> None:
+    """Persist profiling payload to Modal volume via helper function."""
+    persist_fn = modal.Function.from_name("diplomacy-grpo", "persist_profile_snapshot")
+    persist_fn.call(profile_name, payload)
 
     def print_report(self):
         """Print a formatted benchmark report."""
@@ -120,6 +146,7 @@ def run_benchmark(
     rollout_horizon_years: int = 1,
     skip_warmup: bool = False,
     run_name: str | None = None,
+    profiling_mode: str | None = None,
 ) -> BenchmarkResult:
     """
     Run a benchmark training job on Modal.
@@ -144,6 +171,8 @@ def run_benchmark(
     )
 
     total_start = time.time()
+    profile_enabled = profiling_mode in {"rollout", "e2e"}
+    profile_snapshots: list[dict[str, Any]] = []
 
     # 1. Warmup
     warmup_duration = 0.0
@@ -165,6 +194,8 @@ def run_benchmark(
         samples_per_group=samples_per_group,
         rollout_horizon_years=rollout_horizon_years,
         rollout_visualize_chance=0.0,  # Disable visualization for benchmarks
+        profiling_mode=profiling_mode,
+        profile_run_name=run_name,
     )
 
     print(f"\n📦 Config: {cfg.model_dump()}")
@@ -208,6 +239,18 @@ def run_benchmark(
         )
         print(f"   (Rollout: {rollout_duration:.2f}s)")
 
+        if profile_enabled:
+            profile_snapshots.append(
+                {
+                    "step": step,
+                    "trajectories": len(step_trajectories),
+                    "rollout_duration_ms": int(rollout_duration * 1000),
+                    "step_duration_ms": int(step_duration * 1000),
+                    "groups": num_groups_per_step,
+                    "samples_per_group": samples_per_group,
+                }
+            )
+
     training_duration = time.time() - training_start
     total_duration = time.time() - total_start
 
@@ -222,6 +265,7 @@ def run_benchmark(
         num_groups_per_step=num_groups_per_step,
         samples_per_group=samples_per_group,
         rollout_horizon_years=rollout_horizon_years,
+        run_name=run_name,
         total_duration_s=total_duration,
         warmup_duration_s=warmup_duration,
         training_duration_s=training_duration,
@@ -230,6 +274,7 @@ def run_benchmark(
         trajectories_per_second=total_trajectories / max(0.001, training_duration),
         simulated_years_per_second=total_simulated_years
         / max(0.001, training_duration),
+        profile_snapshots=profile_snapshots if profile_enabled else None,
     )
 
     # 5. Validate data structure
@@ -259,6 +304,8 @@ def run_full_training_benchmark(
     rollout_horizon_years: int = 1,
     learning_rate: float = 1e-5,
     skip_warmup: bool = False,
+    profiling_mode: str | None = None,
+    profile_run_name: str | None = None,
 ) -> BenchmarkResult:
     """
     Run the FULL training pipeline including model updates.
@@ -297,17 +344,22 @@ def run_full_training_benchmark(
         samples_per_group=samples_per_group,
         rollout_horizon_years=rollout_horizon_years,
         learning_rate=learning_rate,
+        profiling_mode=profiling_mode,
+        profile_run_name=profile_run_name,
     )
 
     training_duration = time.time() - training_start
     total_duration = time.time() - total_start
 
     # Build result from returned metrics
+    result_run_name = result.get("run_name", profile_run_name)
     return BenchmarkResult(
         total_steps=total_steps,
         num_groups_per_step=num_groups_per_step,
         samples_per_group=samples_per_group,
         rollout_horizon_years=rollout_horizon_years,
+        run_name=result_run_name,
+        trace_dir=result.get("trace_dir"),
         total_duration_s=total_duration,
         warmup_duration_s=warmup_duration,
         training_duration_s=training_duration,
@@ -318,6 +370,7 @@ def run_full_training_benchmark(
         final_loss=result.get("final_loss"),
         final_kl=result.get("final_kl"),
         final_reward_mean=result.get("final_reward_mean"),
+        profile_snapshots=result.get("profile_snapshots"),
     )
 
 
@@ -376,6 +429,18 @@ def main():
         default=None,
         help="Run name (default: auto-generated timestamp)",
     )
+    parser.add_argument(
+        "--profile",
+        choices=["rollout", "trainer", "e2e"],
+        default=None,
+        help="Enable profiling and persist timing snapshots to /data/benchmarks",
+    )
+    parser.add_argument(
+        "--profile-name",
+        type=str,
+        default=None,
+        help="Optional name for saved profiling payload (defaults to autogenerated).",
+    )
 
     args = parser.parse_args()
 
@@ -387,6 +452,14 @@ def main():
         args.horizon = 1
         print("🔬 Running smoke test configuration")
 
+    profile_mode = args.profile
+    profile_name = args.profile_name
+    if profile_mode and not profile_name:
+        profile_name = (
+            args.name
+            or f"profile-{profile_mode}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        )
+
     if args.full:
         result = run_full_training_benchmark(
             total_steps=args.steps,
@@ -395,6 +468,8 @@ def main():
             rollout_horizon_years=args.horizon,
             learning_rate=args.lr,
             skip_warmup=args.no_warmup,
+            profiling_mode=profile_mode,
+            profile_run_name=profile_name,
         )
     else:
         result = run_benchmark(
@@ -404,6 +479,14 @@ def main():
             rollout_horizon_years=args.horizon,
             skip_warmup=args.no_warmup,
             run_name=args.name,
+            profiling_mode=profile_mode,
+        )
+
+    if profile_mode:
+        snapshot_name = profile_name or result.run_name or "profile-run"
+        _persist_profile_snapshot(
+            snapshot_name,
+            result.to_profile_payload(profile_mode),
         )
 
     result.print_report()

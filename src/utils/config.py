@@ -1,5 +1,10 @@
 # src/config.py
+from typing import Literal
+
 from pydantic import BaseModel
+
+
+ProfilingMode = Literal["rollout", "trainer", "e2e"]
 
 
 class ExperimentConfig(BaseModel):
@@ -28,6 +33,11 @@ class ExperimentConfig(BaseModel):
     # Inference Settings
     max_new_tokens: int = 256
     temperature: float = 0.8
+
+    # Profiling / instrumentation
+    profiling_mode: ProfilingMode | None = None
+    profile_run_name: str | None = None
+    profiling_trace_steps: int = 3
 
     @property
     def batch_size(self) -> int:

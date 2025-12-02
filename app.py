@@ -2,6 +2,8 @@ from pathlib import Path
 
 import modal
 
+from src.utils.observability import log_inference_request, log_inference_response
+
 # ==============================================================================
 # 1. IMAGE DEFINITIONS
 # ==============================================================================
@@ -46,6 +48,7 @@ gpu_image = (
         "accelerate",
         "huggingface_hub",
         "hf_transfer",
+        "pynvml",
     )
     .env(
         {
@@ -66,11 +69,14 @@ gpu_image = (
 app = modal.App("diplomacy-grpo")
 volume = modal.Volume.from_name("diplomacy-data", create_if_missing=True)
 hf_cache_volume = modal.Volume.from_name("hf-cache", create_if_missing=True)
+trace_volume = modal.Volume.from_name("diplomacy-traces", create_if_missing=True)
 
 VOLUME_PATH = Path("/data")
 MODELS_PATH = VOLUME_PATH / "models"
 REPLAYS_PATH = VOLUME_PATH / "replays"
+BENCHMARKS_PATH = VOLUME_PATH / "benchmarks"
 HF_CACHE_PATH = Path("/hf-cache")
+TRACE_PATH = Path("/traces")
 
 # ==============================================================================
 # 3. INFERENCE ENGINE (THE BRAIN)
@@ -172,10 +178,20 @@ class InferenceEngine:
         """
         import asyncio
         import os
+        import time
         import uuid
 
         from vllm.lora.request import LoRARequest
         from vllm.sampling_params import SamplingParams
+
+        batch_size = len(prompts)
+        request_start = time.time()
+        log_inference_request(
+            rollout_id="inference-engine",
+            batch_size=batch_size,
+            phase="engine",
+            step_type="engine",
+        )
 
         try:
             lora_req = None
@@ -219,7 +235,7 @@ class InferenceEngine:
                 lora_req = LoRARequest(lora_name, lora_int_id, full_path)
                 print(f"🔧 Created LoRARequest: name={lora_name}, id={lora_int_id}")
 
-            async def _generate_single(prompt: str, moves: dict) -> str:
+            async def _generate_single(prompt: str, moves: dict) -> dict[str, object]:
                 """Generate for a single prompt. Allows concurrent execution."""
                 request_id = str(uuid.uuid4())
                 sampling_params = SamplingParams(
@@ -238,7 +254,12 @@ class InferenceEngine:
                     final_output = None
                     async for output in generator:
                         final_output = output
-                    return final_output.outputs[0].text if final_output else ""
+                    text = ""
+                    token_count = 0
+                    if final_output and final_output.outputs:
+                        text = final_output.outputs[0].text
+                        token_count = len(final_output.outputs[0].token_ids)
+                    return {"text": text, "token_count": token_count}
                 except Exception as e:
                     # Log on GPU side for debugging
                     print(f"❌ Generation Error: {e}")
@@ -246,11 +267,24 @@ class InferenceEngine:
 
             # CRITICAL: Await all generators concurrently for proper batching
             # Old code awaited sequentially, killing vLLM's continuous batching
-            final_texts = await asyncio.gather(
+            responses = await asyncio.gather(
                 *[_generate_single(p, m) for p, m in zip(prompts, valid_moves)]
             )
 
-            return list(final_texts)
+            duration_ms = int((time.time() - request_start) * 1000)
+            total_tokens = sum(int(resp.get("token_count", 0)) for resp in responses)
+            tokens_per_second = (
+                total_tokens / (duration_ms / 1000) if duration_ms > 0 else None
+            )
+            log_inference_response(
+                rollout_id="inference-engine",
+                batch_size=batch_size,
+                duration_ms=duration_ms,
+                tokens_generated=total_tokens,
+                tokens_per_second=tokens_per_second,
+            )
+
+            return [str(resp.get("text", "")) for resp in responses]
         except Exception as e:
             error_msg = f"GPU Inference Failed: {type(e).__name__}: {str(e)}"
             print(error_msg)
@@ -569,7 +603,7 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
 @app.function(
     image=gpu_image,
     gpu="H100",  # Need high VRAM for Training + Reference Model
-    volumes={str(VOLUME_PATH): volume},
+    volumes={str(VOLUME_PATH): volume, str(TRACE_PATH): trace_volume},
     timeout=86400,
     secrets=[
         modal.Secret.from_name("axiom-secrets"),
@@ -602,6 +636,7 @@ def train_grpo():
     from src.utils.config import ExperimentConfig
     from src.utils.observability import (
         axiom,
+        GPUStatsLogger,
         log_checkpoint_saved,
         log_training_complete,
         log_training_error,
@@ -620,6 +655,9 @@ def train_grpo():
     learning_rate = 1e-5
     max_grad_norm = 1.0  # Gradient clipping threshold
     chunk_size = 4  # Mini-batch size for gradient accumulation
+
+    gpu_logger = GPUStatsLogger()
+    gpu_logger.start(context=f"train_grpo:{cfg.run_name}")
 
     training_start_time = time.time()
     current_step = 0
@@ -939,8 +977,36 @@ def train_grpo():
         raise
 
     finally:
+        gpu_logger.stop()
         asyncio.run(axiom.flush())
         wandb.finish()
+
+
+# ==============================================================================
+# 7. PROFILING HELPERS
+# ==============================================================================
+
+
+@app.function(
+    image=cpu_image,
+    volumes={str(VOLUME_PATH): volume},
+    timeout=120,
+    secrets=[modal.Secret.from_name("axiom-secrets")],
+)
+def persist_profile_snapshot(profile_name: str, payload: dict):
+    """Persist profiling payload to /data/benchmarks for later analysis."""
+    import json
+    from datetime import datetime
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    safe_name = profile_name.replace("/", "_")
+    output_dir = BENCHMARKS_PATH
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{safe_name}-{timestamp}.json"
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    volume.commit()
+    return {"path": str(output_path)}
 
 
 # ==============================================================================
@@ -951,7 +1017,7 @@ def train_grpo():
 @app.function(
     image=gpu_image,
     gpu="H100",
-    volumes={str(VOLUME_PATH): volume},
+    volumes={str(VOLUME_PATH): volume, str(TRACE_PATH): trace_volume},
     timeout=7200,  # 2 hours max for benchmarks
     secrets=[
         modal.Secret.from_name("axiom-secrets"),
@@ -964,6 +1030,8 @@ def train_grpo_benchmark(
     samples_per_group: int = 4,
     rollout_horizon_years: int = 1,
     learning_rate: float = 1e-5,
+    profiling_mode: str | None = None,
+    profile_run_name: str | None = None,
 ) -> dict:
     """
     Benchmark version of GRPO training with configurable parameters.
@@ -992,7 +1060,7 @@ def train_grpo_benchmark(
     from src.training.loss import GRPOLoss
     from src.training.trainer import process_trajectories
     from src.utils.config import ExperimentConfig
-    from src.utils.observability import axiom, logger, stopwatch
+    from src.utils.observability import GPUStatsLogger, axiom, logger, stopwatch
 
     # Build config with benchmark parameters
     run_name = f"benchmark-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -1003,6 +1071,8 @@ def train_grpo_benchmark(
         samples_per_group=samples_per_group,
         rollout_horizon_years=rollout_horizon_years,
         rollout_visualize_chance=0.0,  # Disable visualization for speed
+        profiling_mode=profiling_mode,
+        profile_run_name=profile_run_name or run_name,
     )
 
     model_id = "Qwen/Qwen2.5-7B-Instruct"
@@ -1011,6 +1081,29 @@ def train_grpo_benchmark(
     # chunk_size=8 balances GPU utilization vs memory
     # (each chunk does 2 forward passes: policy + reference)
     chunk_size = 8
+    profile_enabled = profiling_mode in {"trainer", "e2e"}
+    profile_snapshots: list[dict[str, float]] = []
+
+    from contextlib import contextmanager
+    from torch.profiler import (
+        ProfilerActivity,
+        profile as torch_profile,
+        schedule as profiler_schedule,
+        tensorboard_trace_handler,
+    )
+
+    @contextmanager
+    def profile_section(step_profile: dict[str, float], name: str):
+        if not profile_enabled:
+            yield
+            return
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            key = f"{name}_ms"
+            step_profile[key] = step_profile.get(key, 0.0) + elapsed_ms
 
     # Metrics collection
     metrics = {
@@ -1020,6 +1113,28 @@ def train_grpo_benchmark(
     }
 
     benchmark_start = time.time()
+    gpu_logger = GPUStatsLogger()
+    gpu_logger.start(context=f"train_grpo_benchmark:{cfg.run_name}")
+    profiler = None
+    trace_subdir = None
+    if profile_enabled:
+        traces_root = TRACE_PATH / "trainer"
+        trace_subdir = traces_root / (cfg.profile_run_name or cfg.run_name)
+        trace_subdir.mkdir(parents=True, exist_ok=True)
+        profiler = torch_profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=profiler_schedule(
+                wait=1,
+                warmup=1,
+                active=max(1, cfg.profiling_trace_steps - 2),
+                repeat=0,
+            ),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,
+            on_trace_ready=tensorboard_trace_handler(str(trace_subdir)),
+        )
+        profiler.__enter__()
 
     # Initialize WandB with benchmark tag
     wandb.init(
@@ -1117,6 +1232,7 @@ def train_grpo_benchmark(
         for step in range(cfg.total_steps):
             step_start = time.time()
             step_metrics = {"step": step}
+            step_profile: dict[str, float] | None = {"step": step} if profile_enabled else None
 
             # A. Wait for CURRENT rollouts (the earlier batch)
             rollout_start = time.time()
@@ -1130,6 +1246,8 @@ def train_grpo_benchmark(
             step_metrics["rollout_time_s"] = rollout_time
             step_metrics["raw_trajectories"] = len(raw_trajectories)
             step_metrics["rollout_lora"] = current_lora_name or "base_model"
+            if step_profile is not None:
+                step_profile["rollout_time_ms"] = rollout_time * 1000
 
             # B. Shift buffers: next becomes current
             current_handles = next_handles
@@ -1171,7 +1289,11 @@ def train_grpo_benchmark(
 
             # C. Process trajectories
             process_start = time.time()
-            batch_data, traj_stats = process_trajectories(raw_trajectories, tokenizer)
+            profile_target = step_profile if step_profile is not None else {}
+            with profile_section(profile_target, "tokenize"):
+                batch_data, traj_stats = process_trajectories(
+                    raw_trajectories, tokenizer
+                )
             process_time = time.time() - process_start
             step_metrics["process_time_s"] = process_time
             step_metrics["processed_trajectories"] = len(batch_data)
@@ -1194,18 +1316,23 @@ def train_grpo_benchmark(
                 if not chunk:
                     break
 
-                loss_output = loss_fn.compute_loss(chunk)
+                section_profile = step_profile if step_profile is not None else {}
+                with profile_section(section_profile, "loss_forward"):
+                    loss_output = loss_fn.compute_loss(chunk)
                 scaled_loss = loss_output.loss / max(1, len(batch_data) // chunk_size)
-                scaled_loss.backward()
+                with profile_section(section_profile, "backward"):
+                    scaled_loss.backward()
 
                 accum_loss += loss_output.loss.item()
                 accum_kl += loss_output.kl
                 num_chunks += 1
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                policy_model.parameters(), max_grad_norm
-            ).item()
-            optimizer.step()
+            section_profile = step_profile if step_profile is not None else {}
+            with profile_section(section_profile, "optimizer_step"):
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    policy_model.parameters(), max_grad_norm
+                ).item()
+                optimizer.step()
 
             training_time = time.time() - training_start
 
@@ -1220,6 +1347,11 @@ def train_grpo_benchmark(
             step_metrics["reward_mean"] = traj_stats.reward_mean
             step_metrics["reward_std"] = traj_stats.reward_std
             step_metrics["total_tokens"] = traj_stats.total_tokens
+            if step_profile is not None:
+                step_profile["training_time_ms"] = training_time * 1000
+                step_profile["process_time_ms"] = process_time * 1000
+                step_profile["trajectories"] = len(batch_data)
+                step_profile["tokens"] = traj_stats.total_tokens
 
             step_total = time.time() - step_start
             step_metrics["total_time_s"] = step_total
@@ -1236,6 +1368,9 @@ def train_grpo_benchmark(
             # If rollout_time < training_time, we got good overlap
             pipeline_overlap = max(0, training_time - rollout_time) if step > 0 else 0
             step_metrics["pipeline_overlap_s"] = pipeline_overlap
+            if step_profile is not None:
+                step_profile["pipeline_overlap_ms"] = pipeline_overlap * 1000
+                profile_snapshots.append(step_profile)
 
             wandb.log(
                 {
@@ -1251,6 +1386,8 @@ def train_grpo_benchmark(
                     "benchmark/pipeline_overlap_s": pipeline_overlap,
                 }
             )
+            if profiler is not None:
+                profiler.step()
 
         # Save final adapter
         final_adapter_path = MODELS_PATH / cfg.run_name / f"adapter_v{cfg.total_steps}"
@@ -1287,6 +1424,10 @@ def train_grpo_benchmark(
             "reward_min": min(all_rewards) if all_rewards else 0,
             "reward_max": max(all_rewards) if all_rewards else 0,
             "pipeline_overlap_total_s": total_pipeline_overlap,
+            "run_name": cfg.run_name,
+            "profiling_mode": profiling_mode,
+            "profile_snapshots": profile_snapshots if profile_enabled else None,
+            "trace_dir": str(trace_subdir) if trace_subdir else None,
         }
 
         # Get final step metrics
@@ -1316,5 +1457,8 @@ def train_grpo_benchmark(
         raise
 
     finally:
+        gpu_logger.stop()
+        if profiler is not None:
+            profiler.__exit__(None, None, None)
         asyncio.run(axiom.flush())
         wandb.finish()
