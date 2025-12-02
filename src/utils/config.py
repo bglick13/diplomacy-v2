@@ -32,6 +32,8 @@ class ExperimentConfig(BaseModel):
     total_steps: int = 10
     num_groups_per_step: int = 8  # G in GRPO
     samples_per_group: int = 8  # N in GRPO
+    buffer_depth: int = 2
+    max_policy_lag_steps: int = 1
 
     # Inference Settings
     max_new_tokens: int = 256
