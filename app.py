@@ -77,6 +77,7 @@ REPLAYS_PATH = VOLUME_PATH / "replays"
 BENCHMARKS_PATH = VOLUME_PATH / "benchmarks"
 HF_CACHE_PATH = Path("/hf-cache")
 TRACE_PATH = Path("/traces")
+STATE_CACHE_PATH = VOLUME_PATH / "state_cache"
 
 # ==============================================================================
 # 3. INFERENCE ENGINE (THE BRAIN)
@@ -296,6 +297,9 @@ class InferenceEngine:
 # ==============================================================================
 
 
+CURRENT_ROLLOUT_LORA: str | None = None
+
+
 @app.function(
     image=cpu_image,
     cpu=1.0,
@@ -342,14 +346,18 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
     # We just need to reload the volume to see newly committed adapter files
     if lora_name:
         logger.info(f"📂 Using LoRA adapter: {lora_name}")
-        volume.reload()  # Ensure we see the latest adapter files
-        # Verify the adapter exists
-        full_path = f"/data/models/{lora_name}"
-        if os.path.exists(full_path):
-            files = os.listdir(full_path)
-            logger.info(f"✅ LoRA adapter found at {full_path}. Files: {files}")
+        global CURRENT_ROLLOUT_LORA
+        if CURRENT_ROLLOUT_LORA != lora_name:
+            volume.reload()  # Ensure we see the latest adapter files
+            full_path = f"/data/models/{lora_name}"
+            if os.path.exists(full_path):
+                files = os.listdir(full_path)
+                logger.info(f"✅ LoRA adapter found at {full_path}. Files: {files}")
+                CURRENT_ROLLOUT_LORA = lora_name
+            else:
+                logger.error(f"❌ LoRA adapter NOT found at: {full_path}")
         else:
-            logger.error(f"❌ LoRA adapter NOT found at: {full_path}")
+            logger.info(f"📂 Adapter already cached locally: {lora_name}")
 
     rollout_start_time = time.time()
     rollout_id = ""
@@ -357,17 +365,45 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
 
     try:
         cfg = ExperimentConfig(**config_dict)
-        should_visualize = random.random() < cfg.rollout_visualize_chance
+        should_visualize = (
+            cfg.enable_rollout_replays
+            and random.random() < cfg.rollout_visualize_chance
+        )
+        cached_game: DiplomacyWrapper | None = None
+
+        def load_cached_state() -> DiplomacyWrapper | None:
+            try:
+                if not cfg.use_state_cache or not STATE_CACHE_PATH.exists():
+                    return None
+                candidates = [
+                    p for p in STATE_CACHE_PATH.glob("*.pkl") if p.is_file()
+                ]
+                if not candidates:
+                    return None
+                chosen = random.choice(candidates)
+                with chosen.open("rb") as f:
+                    state = cloudpickle.load(f)
+                logger.info(f"Loaded cached state from {chosen.name}")
+                return state
+            except Exception as cache_error:
+                logger.warning(f"State cache load failed: {cache_error}")
+                return None
+
+        if cfg.use_state_cache:
+            cached_game = load_cached_state()
 
         # Initialize the LLM agent for prompt generation
         agent = LLMAgent()
 
-        # 1. THE WARMUP (Generate a random state)
-        # ---------------------------------------
-        warmup_phases = random.randint(0, 8)
-
-        # Init main game
-        main_game = DiplomacyWrapper(horizon=99)
+        # 1. THE WARMUP (Generate or reuse a random state)
+        # -----------------------------------------------
+        warmup_phases = 0
+        if cached_game is not None:
+            main_game = cached_game
+            logger.info("♻️ Using cached Diplomacy state; skipping warmup.")
+        else:
+            warmup_phases = random.randint(0, 8)
+            main_game = DiplomacyWrapper(horizon=99)
         rollout_id = main_game.game.game_id
         metrics = RolloutMetrics(rollout_id=rollout_id)
 
@@ -384,54 +420,56 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
             logger.info("Visualizing game...")
             vis = GameVisualizer()
             vis.capture_turn(main_game.game, "Warmup Start")
-        logger.info(f"🔥 Starting Warmup: {warmup_phases} phases")
 
-        # Play through warmup
-        for i in range(warmup_phases):
-            if main_game.is_done():
-                break
+        if warmup_phases > 0:
+            logger.info(f"🔥 Starting Warmup: {warmup_phases} phases")
 
-            with stopwatch(f"Warmup Inference {i + 1}/{warmup_phases}"):
-                inputs = main_game.get_all_inputs(agent=agent)
-                metrics.inference_calls += 1
+            # Play through warmup
+            for i in range(warmup_phases):
+                if main_game.is_done():
+                    break
 
-                raw_responses = InferenceEngine().generate.remote(
-                    prompts=inputs["prompts"],
-                    valid_moves=inputs["valid_moves"],
-                    lora_name=lora_name,
-                )
+                with stopwatch(f"Warmup Inference {i + 1}/{warmup_phases}"):
+                    inputs = main_game.get_all_inputs(agent=agent)
+                    metrics.inference_calls += 1
 
-            # Parse & Execute with observability
-            all_orders = []
-            phase = main_game.get_current_phase()
+                    raw_responses = InferenceEngine().generate.remote(
+                        prompts=inputs["prompts"],
+                        valid_moves=inputs["valid_moves"],
+                        lora_name=lora_name,
+                    )
 
-            for idx, (response, power) in enumerate(
-                zip(raw_responses, inputs["power_names"])
-            ):
-                orders = extract_orders(response)
-                expected_count = len(inputs["valid_moves"][idx])
+                # Parse & Execute with observability
+                all_orders = []
+                phase = main_game.get_current_phase()
 
-                # Log extraction result
-                log_orders_extracted(
-                    rollout_id=rollout_id,
-                    power_name=power,
-                    orders_count=len(orders),
-                    expected_count=expected_count,
-                    raw_response_length=len(response),
-                    phase=phase,
-                    raw_response=response,
-                )
-                metrics.record_extraction(len(orders), expected_count)
+                for idx, (response, power) in enumerate(
+                    zip(raw_responses, inputs["power_names"])
+                ):
+                    orders = extract_orders(response)
+                    expected_count = len(inputs["valid_moves"][idx])
 
-                all_orders.extend(orders)
+                    # Log extraction result
+                    log_orders_extracted(
+                        rollout_id=rollout_id,
+                        power_name=power,
+                        orders_count=len(orders),
+                        expected_count=expected_count,
+                        raw_response_length=len(response),
+                        phase=phase,
+                        raw_response=response,
+                    )
+                    metrics.record_extraction(len(orders), expected_count)
 
-            main_game.step(all_orders)
+                    all_orders.extend(orders)
 
-            if should_visualize and vis:
-                vis.capture_turn(
-                    main_game.game,
-                    f"Warmup step {i + 1}/{warmup_phases}\n{chr(10).join(all_orders)}",
-                )
+                main_game.step(all_orders)
+
+                if should_visualize and vis:
+                    vis.capture_turn(
+                        main_game.game,
+                        f"Warmup step {i + 1}/{warmup_phases}\n{chr(10).join(all_orders)}",
+                    )
 
         if main_game.is_done():
             logger.info("Game ended during warmup, discarding.")
