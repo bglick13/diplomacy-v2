@@ -36,7 +36,8 @@ Training is too slow to run experiments and learn anything meaningful at a reaso
 1. Extend `scripts/benchmark_training.py` to optionally run `--profile {rollout|trainer|e2e}` which toggles targeted timers and writes JSON to `/data/benchmarks`.
 2. In `InferenceEngine.generate`, wrap each `AsyncLLM.generate` call with `log_inference_request/response`, including `tokens/sec` (vLLM exposes it via `output.metrics`).
 3. Add a lightweight NVML sampler coroutine inside `train_grpo[_benchmark]` that logs utilization every 5 s to Axiom.
-4. Build a one-off `scripts/profile_rollout.py` that runs `run_rollout` locally (vs Modal) for flamegraphing with `py-spy` before/after optimizations.
+4. Prefer Modal-native profiling: wrap `train_grpo`/`run_rollout` with Modal’s PyTorch profiler harness so traces land directly on a shared volume, and keep perfetto/TensorBoard viewers running in Modal (`torch_profiling.py` pattern). Locally run `py-spy` only when Modal tools cannot attach (rare).[[modal_torch_prof]](https://modal.com/docs/examples/torch_profiling)
+5. Learn and lean on Modal’s debugging shell + live profiling features instead of reproducing issues locally; open debug shells (`modal shell/exec`) against running rollout containers whenever they stall.[[modal_debug]](https://modal.com/docs/guide/developing-debugging#debugging-running-containers)
 
 ### 1. Rollout & environment throughput
 **Opportunities**
