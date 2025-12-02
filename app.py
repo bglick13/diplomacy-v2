@@ -1,4 +1,6 @@
+import os
 from pathlib import Path
+from typing import Any
 
 import modal
 
@@ -78,6 +80,18 @@ BENCHMARKS_PATH = VOLUME_PATH / "benchmarks"
 HF_CACHE_PATH = Path("/hf-cache")
 TRACE_PATH = Path("/traces")
 STATE_CACHE_PATH = VOLUME_PATH / "state_cache"
+ROLLOUT_TOKENIZERS: dict[str, Any] = {}
+
+
+def _get_rollout_tokenizer(model_id: str):
+    tokenizer = ROLLOUT_TOKENIZERS.get(model_id)
+    if tokenizer is None:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenizer.pad_token = tokenizer.eos_token
+        ROLLOUT_TOKENIZERS[model_id] = tokenizer
+    return tokenizer
 
 # ==============================================================================
 # 3. INFERENCE ENGINE (THE BRAIN)
@@ -178,11 +192,9 @@ class InferenceEngine:
                        /data/models/benchmark-20251130/adapter_v1
         """
         import asyncio
-        import os
         import time
         import uuid
 
-        from vllm.lora.request import LoRARequest
         from vllm.sampling_params import SamplingParams
 
         batch_size = len(prompts)
@@ -195,46 +207,7 @@ class InferenceEngine:
         )
 
         try:
-            lora_req = None
-            if lora_name:
-                full_path = f"/data/models/{lora_name}"
-
-                # Use lock to serialize volume reloads and prevent concurrent conflicts
-                # Only reload if we haven't seen this adapter before
-                if lora_name not in self._loaded_adapters:
-                    async with self._adapter_lock:
-                        # Double-check after acquiring lock (another request might have loaded it)
-                        if lora_name not in self._loaded_adapters:
-                            print(f"📂 Reloading volume for NEW adapter: {lora_name}")
-                            volume.reload()
-
-                            if not os.path.exists(full_path):
-                                # List what's in models dir for debugging
-                                models_dir = "/data/models"
-                                if os.path.exists(models_dir):
-                                    contents = os.listdir(models_dir)
-                                    print(f"📁 Contents of {models_dir}: {contents}")
-                                raise RuntimeError(
-                                    f"LoRA path does not exist: {full_path}"
-                                )
-
-                            # List adapter files for confirmation
-                            adapter_files = os.listdir(full_path)
-                            print(f"✅ LoRA adapter found. Files: {adapter_files}")
-
-                            # Mark as loaded so future requests skip the reload
-                            self._loaded_adapters.add(lora_name)
-                        else:
-                            print(
-                                f"📂 Adapter already loaded by another request: {lora_name}"
-                            )
-                else:
-                    print(f"📂 Using cached adapter: {lora_name}")
-
-                # Create LoRA request (safe to do concurrently)
-                lora_int_id = abs(hash(lora_name)) % (2**31)
-                lora_req = LoRARequest(lora_name, lora_int_id, full_path)
-                print(f"🔧 Created LoRARequest: name={lora_name}, id={lora_int_id}")
+            lora_req = await self._load_lora_request(lora_name)
 
             async def _generate_single(prompt: str, moves: dict) -> dict[str, object]:
                 """Generate for a single prompt. Allows concurrent execution."""
@@ -290,6 +263,109 @@ class InferenceEngine:
             error_msg = f"GPU Inference Failed: {type(e).__name__}: {str(e)}"
             print(error_msg)
             raise RuntimeError(error_msg) from None
+
+    async def _load_lora_request(self, lora_name: str | None):
+        from vllm.lora.request import LoRARequest
+
+        if not lora_name:
+            return None
+
+        full_path = f"/data/models/{lora_name}"
+
+        if lora_name not in self._loaded_adapters:
+            async with self._adapter_lock:
+                if lora_name not in self._loaded_adapters:
+                    print(f"📂 Reloading volume for NEW adapter: {lora_name}")
+                    volume.reload()
+
+                    if not os.path.exists(full_path):
+                        models_dir = "/data/models"
+                        if os.path.exists(models_dir):
+                            contents = os.listdir(models_dir)
+                            print(f"📁 Contents of {models_dir}: {contents}")
+                        raise RuntimeError(f"LoRA path does not exist: {full_path}")
+
+                    adapter_files = os.listdir(full_path)
+                    print(f"✅ LoRA adapter found. Files: {adapter_files}")
+
+                    self._loaded_adapters.add(lora_name)
+                else:
+                    print(f"📂 Adapter already loaded by another request: {lora_name}")
+        else:
+            print(f"📂 Using cached adapter: {lora_name}")
+
+        lora_int_id = abs(hash(lora_name)) % (2**31)
+        print(f"🔧 Created LoRARequest: name={lora_name}, id={lora_int_id}")
+        return LoRARequest(lora_name, lora_int_id, full_path)
+
+    @modal.method()
+    async def preload_lora(self, lora_name: str):
+        if not lora_name:
+            return
+        await self._load_lora_request(lora_name)
+
+    @modal.method()
+    async def score_completions(
+        self, prompts: list[str], completions: list[str], lora_name: str | None = None
+    ):
+        import asyncio
+        import uuid
+
+        from vllm.sampling_params import SamplingParams
+
+        if len(prompts) != len(completions):
+            raise ValueError("prompts and completions must have the same length")
+
+        lora_req = await self._load_lora_request(lora_name)
+
+        async def _score_single(prompt: str, completion: str) -> float:
+            request_id = str(uuid.uuid4())
+            sampling_params = SamplingParams(
+                temperature=0.0,
+                max_tokens=0,
+                prompt_logprobs=1,
+                detokenize=True,
+            )
+            full_prompt = prompt + completion
+            generator = self.engine.generate(
+                prompt=full_prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_req,
+            )
+            final_output = None
+            async for output in generator:
+                final_output = output
+            if final_output is None:
+                return 0.0
+            prompt_len = len(self.tokenizer.encode(prompt, add_special_tokens=False))
+            return self._sum_completion_logprob(final_output, prompt_len)
+
+        scores = await asyncio.gather(
+            *(_score_single(p, c) for p, c in zip(prompts, completions))
+        )
+        return [float(s) for s in scores]
+
+    def _sum_completion_logprob(self, request_output, prompt_token_count: int) -> float:
+        prompt_ids = request_output.prompt_token_ids or []
+        prompt_logprobs = request_output.prompt_logprobs
+        if not prompt_logprobs or not prompt_ids:
+            return 0.0
+
+        total = 0.0
+        total_tokens = len(prompt_ids)
+        for idx in range(prompt_token_count, total_tokens):
+            position = idx + 1
+            if position >= len(prompt_logprobs):
+                break
+            entry = prompt_logprobs[position]
+            if entry is None:
+                continue
+            token_id = prompt_ids[idx]
+            logprob_obj = entry.get(token_id)
+            if logprob_obj is not None:
+                total += float(logprob_obj.logprob)
+        return total
 
 
 # ==============================================================================
@@ -417,6 +493,34 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
 
         prompt_config = PromptConfig(compact_mode=cfg.compact_prompts)
         agent = LLMAgent(config=prompt_config)
+        tokenizer = _get_rollout_tokenizer(cfg.base_model_id)
+
+        def build_token_payload(prompt: str, completion: str) -> dict[str, Any]:
+            enc = tokenizer(
+                prompt + completion,
+                return_tensors="pt",
+                truncation=True,
+                max_length=2048,
+            )
+            input_ids = enc.input_ids[0]
+            attention_mask = enc.attention_mask[0]
+            prompt_tokens = tokenizer.encode(
+                prompt,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=1536,
+            )
+            prompt_len = len(prompt_tokens)
+            labels = input_ids.clone()
+            labels[:prompt_len] = -100
+            completion_tokens = (labels != -100).sum().item()
+            return {
+                "input_ids": input_ids.tolist(),
+                "attention_mask": attention_mask.tolist(),
+                "labels": labels.tolist(),
+                "prompt_len": prompt_len,
+                "completion_tokens": int(completion_tokens),
+            }
 
         # 1. THE WARMUP (Generate or reuse a random state)
         # -----------------------------------------------
@@ -554,6 +658,16 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
                     valid_moves=batch_valid_moves,
                     lora_name=lora_name,
                 )
+                completion_texts = list(responses)
+                reference_logprobs = None
+                if is_fork_step:
+                    reference_logprobs = list(
+                        InferenceEngine().score_completions.remote(
+                            batch_prompts,
+                            completion_texts,
+                            lora_name,
+                        )
+                    )
 
             # Distribute responses with observability
             game_orders = {g_idx: [] for g_idx in active_indices}
@@ -562,25 +676,32 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
             )
 
             for i, response in enumerate(responses):
+                response_text = (
+                    completion_texts[i] if i < len(completion_texts) else response
+                )
+                ref_logprob = None
+                if isinstance(reference_logprobs, list) and i < len(reference_logprobs):
+                    ref_logprob = reference_logprobs[i]
                 g_idx, power, expected_count = batch_meta[i]
-                orders = extract_orders(response)
+                orders = extract_orders(response_text)
 
                 # Log extraction result
-                log_orders_extracted(
-                    rollout_id=rollout_id,
-                    power_name=power,
-                    orders_count=len(orders),
-                    expected_count=expected_count,
-                    raw_response_length=len(response),
-                    phase=phase,
-                    raw_response=response,
-                )
+                    log_orders_extracted(
+                        rollout_id=rollout_id,
+                        power_name=power,
+                        orders_count=len(orders),
+                        expected_count=expected_count,
+                        raw_response_length=len(response_text),
+                        phase=phase,
+                        raw_response=response_text,
+                    )
                 metrics.record_extraction(len(orders), expected_count)
 
                 if is_fork_step:
                     fork_data[g_idx][power] = {
                         "prompt": batch_prompts[i],
-                        "completion": response,
+                        "completion": response_text,
+                        "reference_logprob": ref_logprob,
                     }
 
                 game_orders[g_idx].extend(orders)
@@ -612,14 +733,21 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
 
             for power, data in fork_data[g_idx].items():
                 if power in final_scores:
-                    trajectories.append(
-                        {
-                            "prompt": data["prompt"],
-                            "completion": data["completion"],
-                            "reward": final_scores[power],
-                            "group_id": f"{main_game.game.game_id}_{power}_{current_year}",
-                        }
+                    token_payload = build_token_payload(
+                        data["prompt"], data["completion"]
                     )
+                    trajectory = {
+                        "prompt": data["prompt"],
+                        "completion": data["completion"],
+                        "reward": final_scores[power],
+                        "group_id": f"{main_game.game.game_id}_{power}_{current_year}",
+                        **token_payload,
+                    }
+                    if data.get("reference_logprob") is not None:
+                        trajectory["reference_logprob"] = float(
+                            data["reference_logprob"]
+                        )
+                    trajectories.append(trajectory)
 
         # Save visualizations
         if should_visualize and vis and visualizers is not None:

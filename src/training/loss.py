@@ -96,20 +96,28 @@ class GRPOLoss:
         completion_log_probs = token_log_probs.sum(dim=1)
 
         # 5. Forward Pass (Reference Policy) for KL
-        # CRITICAL: Use disable_adapter() to get base model logprobs
-        with torch.no_grad():
-            with self.model.disable_adapter():
-                ref_outputs = self.model(
-                    input_ids=input_ids, attention_mask=attention_mask
-                )
-            ref_logits = ref_outputs.logits[:, :-1, :]
-
-            # Compute Reference LogProbs
-            ref_per_token_loss = F.cross_entropy(
-                ref_logits.transpose(1, 2), shifted_labels, reduction="none"
+        # CRITICAL: Use disable_adapter() to get base model logprobs unless provided
+        ref_completion_log_probs: torch.Tensor
+        if all("reference_logprob" in b for b in batch):
+            ref_completion_log_probs = torch.tensor(
+                [b["reference_logprob"] for b in batch],
+                dtype=torch.float32,
+                device=device,
             )
-            ref_token_log_probs = -ref_per_token_loss * token_mask
-            ref_completion_log_probs = ref_token_log_probs.sum(dim=1)
+        else:
+            with torch.no_grad():
+                with self.model.disable_adapter():
+                    ref_outputs = self.model(
+                        input_ids=input_ids, attention_mask=attention_mask
+                    )
+                ref_logits = ref_outputs.logits[:, :-1, :]
+
+                # Compute Reference LogProbs
+                ref_per_token_loss = F.cross_entropy(
+                    ref_logits.transpose(1, 2), shifted_labels, reduction="none"
+                )
+                ref_token_log_probs = -ref_per_token_loss * token_mask
+                ref_completion_log_probs = ref_token_log_probs.sum(dim=1)
 
         # 6. KL Divergence Approximation (Schulman's estimator)
         # http://joschu.net/blog/kl-approx.html
