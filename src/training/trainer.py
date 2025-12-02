@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+import torch
 
 
 @dataclass
@@ -127,24 +128,33 @@ def process_trajectories(
         for item in items:
             advantage = (item["reward"] - mean_r) / std_r
 
-            # Tokenize: Prompt + Completion together
-            text = item["prompt"] + item["completion"]
-            enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=2048)
-            input_ids = enc.input_ids[0]
-            attention_mask = enc.attention_mask[0]
+            if all(k in item for k in ("input_ids", "attention_mask", "labels")):
+                input_ids = torch.tensor(item["input_ids"], dtype=torch.long)
+                attention_mask = torch.tensor(
+                    item["attention_mask"], dtype=torch.long
+                )
+                labels = torch.tensor(item["labels"], dtype=torch.long)
+            else:
+                # Tokenize: Prompt + Completion together
+                text = item["prompt"] + item["completion"]
+                enc = tokenizer(
+                    text, return_tensors="pt", truncation=True, max_length=2048
+                )
+                input_ids = enc.input_ids[0]
+                attention_mask = enc.attention_mask[0]
 
-            # Create Labels (Mask the prompt tokens with -100)
-            # Encode prompt separately to find where completion starts
-            prompt_tokens = tokenizer.encode(
-                item["prompt"],
-                add_special_tokens=False,
-                truncation=True,
-                max_length=1536,
-            )
-            prompt_len = len(prompt_tokens)
+                # Create Labels (Mask the prompt tokens with -100)
+                # Encode prompt separately to find where completion starts
+                prompt_tokens = tokenizer.encode(
+                    item["prompt"],
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=1536,
+                )
+                prompt_len = len(prompt_tokens)
 
-            labels = input_ids.clone()
-            labels[:prompt_len] = -100  # Mask prompt
+                labels = input_ids.clone()
+                labels[:prompt_len] = -100  # Mask prompt
 
             # Count completion tokens (non-masked labels)
             completion_tokens = (labels != -100).sum().item()
@@ -160,6 +170,10 @@ def process_trajectories(
                     "reward": item["reward"],  # Keep for debugging
                 }
             )
+            if "reference_logprob" in item:
+                processed_batch[-1]["reference_logprob"] = float(
+                    item["reference_logprob"]
+                )
 
     stats.total_trajectories = len(processed_batch)
     stats.total_tokens = total_completion_tokens
