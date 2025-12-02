@@ -26,6 +26,8 @@ Training is too slow to run experiments and learn anything meaningful at a reaso
 
 ## Optimization program
 
+> Detailed validation commands for every phase live in `docs/testing_plan.md`. Each section below references the relevant entries in that document.
+
 ### 0. Measurement & profiling
 **Opportunities**
 - Build deterministic micro-benchmarks for (a) rollout-only, (b) trainer-only, (c) end-to-end pipeline to break down wall time.
@@ -127,4 +129,13 @@ Training is too slow to run experiments and learn anything meaningful at a reaso
 6. Explore helion/custom kernels once the macro architecture is stable.
 
 With this plan we can move from ~20 steps/hour to a target of ≥60 steps/hour (3× throughput) before scaling out hardware. The key is to first remove wasted work (duplicate tokenization, redundant inference warmups) and only then consider larger models or GPU counts.
+
+## Implementation status (Dec 2025)
+- Measurement layer shipped: Modal-first profiler harness (`scripts/profile_rollout.py`), NVML GPU sampling, inference TPS logging, and `/docs/axiom_dashboard_queries.md` updated with GPU/tokens/policy lag panels.
+- Testing infra live: `docs/testing_plan.md` enumerates per-phase validation steps and `.github/workflows/ci.yml` runs `uv run pytest -q` plus a Modal-backed profiling smoke test on every push/PR.
+- Rollout throughput optimizations live: state cache gated via `use_state_cache`, LoRA adapter caching + preloading, memoized diplomacy orders, and configurable compact prompts to reduce tokens.
+- Trainer compute optimizations active: rollouts now return tokenized tensors + reference logprobs, `GRPOLoss` consumes them without extra reference forward passes.
+- Scheduling upgrades: `buffer_depth` + `max_policy_lag_steps` keep a double-buffered rollout queue fed via Modal spawn handles, enforcing a policy lag budget and exposing metrics.
+- Inference tuning: vLLM prefix caching enabled, concurrency/env knobs exposed, adapters pre-registered on the GPU, and compact prompt mode available per experiment config.
+- Observability: policy lag, buffer depth, pending batches, tokens/sec, and GPU utilization now flow to Axiom so the dashboard reflects rollout/trainer health in real time.
 
