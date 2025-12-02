@@ -46,5 +46,9 @@ Preload the next adapter while current step trains.
 
 ## Level 5: Evaluation & Polish
 - [ ] **Tactical Gym**: Implement `evals/scenarios/` with 5 simple tactical puzzles.
-- [ ] **League Eval**: Create a periodic job to play against `RandomBot`.
+- [ ] **League Eval**: Create a periodic job to play against `RandomBot`, `ChaosBot`, previous checkpoints
 - [ ] **Visualization**: Add HTML export of game logs to Weights & Biases.
+- [ ] **Tracing**: Integrate with @weave for model input/output tracing in Weights & Biases
+
+## Level 6: Full press
+- [ ] Add support for messaging phase in engine and training

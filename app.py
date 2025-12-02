@@ -30,6 +30,8 @@ flavor = "devel"  # includes full CUDA toolkit
 operating_sys = "ubuntu24.04"
 tag = f"{cuda_version}-{flavor}-{operating_sys}"
 
+MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+
 gpu_image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
     .run_commands(start_cmd)
@@ -42,6 +44,8 @@ gpu_image = (
         "trl",
         "wandb",
         "accelerate",
+        "huggingface_hub",
+        "hf_transfer",
     )
     .env(
         {
@@ -49,6 +53,7 @@ gpu_image = (
             "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",  # Allow dynamic LoRA loading
             "VLLM_PLUGINS": "lora_filesystem_resolver",  # Use built-in resolver
             "VLLM_LORA_RESOLVER_CACHE_DIR": "/data/models",  # Where adapters are stored
+            "HF_HUB_ENABLE_HF_TRANSFER": "1",  # Use faster hf-transfer for downloads (if available)
         }
     )
     .add_local_python_source("src")
@@ -60,22 +65,26 @@ gpu_image = (
 
 app = modal.App("diplomacy-grpo")
 volume = modal.Volume.from_name("diplomacy-data", create_if_missing=True)
+hf_cache_volume = modal.Volume.from_name("hf-cache", create_if_missing=True)
 
 VOLUME_PATH = Path("/data")
 MODELS_PATH = VOLUME_PATH / "models"
 REPLAYS_PATH = VOLUME_PATH / "replays"
+HF_CACHE_PATH = Path("/hf-cache")
 
 # ==============================================================================
 # 3. INFERENCE ENGINE (THE BRAIN)
 # ==============================================================================
 
 
-# TODO: Add hf cache volume
 @app.cls(
     image=gpu_image,
     gpu="A100",
-    volumes={str(VOLUME_PATH): volume},
-    container_idle_timeout=300,
+    volumes={
+        str(VOLUME_PATH): volume,
+        str(HF_CACHE_PATH): hf_cache_volume,  # Cache HuggingFace models
+    },
+    container_idle_timeout=300,  # 5 minutes
     # Use single container to maximize batching efficiency
     # vLLM batches concurrent requests together for better GPU utilization
     concurrency_limit=1,
@@ -85,6 +94,7 @@ class InferenceEngine:
     @modal.enter()
     def setup(self):
         import asyncio
+        import os
 
         from transformers import AutoTokenizer
         from vllm import AsyncEngineArgs
@@ -95,8 +105,27 @@ class InferenceEngine:
 
         print("🥶 Initializing vLLM v1 Engine...")
 
-        model_id = "Qwen/Qwen2.5-7B-Instruct"
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model_id = MODEL_ID
+
+        # Set HuggingFace cache to use volume for persistence across cold starts
+        # This allows model files to persist even if container restarts
+        # First run will download (~2-3min), subsequent runs use cache (~instant)
+        os.environ["HF_HOME"] = str(HF_CACHE_PATH)
+        os.environ["TRANSFORMERS_CACHE"] = str(HF_CACHE_PATH / "transformers")
+        os.environ["HF_HUB_CACHE"] = str(HF_CACHE_PATH / "hub")
+
+        # Ensure cache directories exist
+        for cache_dir in [
+            HF_CACHE_PATH / "transformers",
+            HF_CACHE_PATH / "hub",
+        ]:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use cached tokenizer (faster than downloading)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            cache_dir=str(HF_CACHE_PATH / "transformers"),
+        )
 
         # Track loaded adapters to avoid redundant volume reloads
         # This prevents concurrent reload conflicts
@@ -115,6 +144,13 @@ class InferenceEngine:
             max_num_seqs=256,  # Allow more concurrent sequences for better batching
             disable_log_stats=False,
             logits_processors=[DiplomacyLogitsProcessor],
+            # Optimization: Use cached model location
+            download_dir=str(HF_CACHE_PATH / "hub"),
+            # Optimization: Prefer safetensors (faster loading than pickle)
+            load_format="auto",  # Auto-detects best format (safetensors preferred)
+            # Optimization: Skip warmup if not needed (set to False for production stability)
+            # Note: Warmup helps with first-request latency but adds to startup time
+            # disable_log_requests=True,  # Reduces logging overhead during startup
         )
         self.engine = AsyncLLM.from_engine_args(engine_args)
 
@@ -618,7 +654,10 @@ def train_grpo():
 
         logger.info("Loading Base Model...")
         base_model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16, device_map="auto"
+            model_id,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation="sdpa",  # PyTorch native scaled dot product attention
         )
 
         # Create LoRA Adapter (The Policy)
@@ -632,6 +671,14 @@ def train_grpo():
         )
         policy_model = get_peft_model(base_model, peft_config)
         policy_model.print_trainable_parameters()
+
+        # Enable gradient checkpointing to reduce memory (trades compute for memory)
+        policy_model.gradient_checkpointing_enable()
+        logger.info("✅ Gradient checkpointing enabled")
+
+        # NOTE: torch.compile() with reduce-overhead mode uses CUDA graphs which
+        # conflict with LoRA's dynamic tensor operations. Disabling for now.
+        # See: https://github.com/huggingface/peft/issues/1043
 
         # Initialize optimizer and loss
         optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate)
@@ -961,7 +1008,9 @@ def train_grpo_benchmark(
     model_id = "Qwen/Qwen2.5-7B-Instruct"
     # learning_rate is now a parameter
     max_grad_norm = 1.0
-    chunk_size = 4
+    # chunk_size=8 balances GPU utilization vs memory
+    # (each chunk does 2 forward passes: policy + reference)
+    chunk_size = 8
 
     # Metrics collection
     metrics = {
@@ -992,7 +1041,10 @@ def train_grpo_benchmark(
         tokenizer.pad_token = tokenizer.eos_token
 
         base_model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16, device_map="auto"
+            model_id,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation="sdpa",  # PyTorch native scaled dot product attention
         )
 
         peft_config = LoraConfig(
@@ -1004,6 +1056,14 @@ def train_grpo_benchmark(
             task_type="CAUSAL_LM",
         )
         policy_model = get_peft_model(base_model, peft_config)
+
+        # Enable gradient checkpointing to reduce memory (trades compute for memory)
+        policy_model.gradient_checkpointing_enable()
+        logger.info("✅ Gradient checkpointing enabled")
+
+        # NOTE: torch.compile() with reduce-overhead mode uses CUDA graphs which
+        # conflict with LoRA's dynamic tensor operations. Disabling for now.
+        # See: https://github.com/huggingface/peft/issues/1043
 
         optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate)
         loss_fn = GRPOLoss(policy_model, beta=0.04)

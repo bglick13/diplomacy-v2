@@ -351,7 +351,7 @@ def main():
     parser.add_argument(
         "--horizon",
         type=int,
-        default=1,
+        default=2,
         help="Rollout horizon in years (default: 1)",
     )
     parser.add_argument(
