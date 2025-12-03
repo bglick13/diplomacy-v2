@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v2
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Run ruff lint
+        run: uv run ruff check .
+      - name: Run ruff format check
+        run: uv run ruff format --check .
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v2
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install pyright
+        run: npm install -g pyright
+      - name: Run type check
+        run: pyright --pythonversion 3.12 --exclude external
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v2
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync
+      - name: Run unit tests
+        run: uv run pytest -q
+
+  # benchmarks:
+  #   needs: tests
+  #   if: ${{ secrets.MODAL_TOKEN_ID != '' && secrets.MODAL_TOKEN_SECRET != '' }}
+  #   runs-on: ubuntu-latest
+  #   env:
+  #     MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+  #     MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+  #     AXIOM_TOKEN: ${{ secrets.AXIOM_TOKEN }}
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: astral-sh/setup-uv@v2
+  #       with:
+  #         python-version: "3.12"
+  #     - name: Install dependencies
+  #       run: uv sync
+  #     - name: Run rollout/trainer profiling smoke test
+  #       run: >
+  #         uv run python scripts/profile_rollout.py
+  #         --target trainer
+  #         --steps 1
+  #         --groups 1
+  #         --samples 1
+  #         --horizon 1
+  #         --no-warmup
+  #         --compact-prompts
+  #         --profile-name ci-trainer-profile

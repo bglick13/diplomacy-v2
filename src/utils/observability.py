@@ -11,6 +11,7 @@ Events are logged to both console and Axiom for dashboarding.
 
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -66,6 +67,7 @@ class EventType(str, Enum):
     TRAINING_ERROR = "training_error"
     CHECKPOINT_SAVED = "checkpoint_saved"
     TRAJECTORY_PROCESSING = "trajectory_processing"
+    GPU_STATS = "gpu_stats"
 
 
 # =============================================================================
@@ -171,6 +173,62 @@ class stopwatch:
         )
 
 
+class GPUStatsLogger:
+    """Background sampler that logs GPU utilization to Axiom."""
+
+    def __init__(self, interval_s: float = 5.0, device_index: int = 0):
+        self.interval_s = interval_s
+        self.device_index = device_index
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._context = ""
+
+    def start(self, context: str):
+        if self._thread and self._thread.is_alive():
+            return
+        self._context = context
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+
+    def _run(self):
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(self.device_index)
+            while not self._stop_event.wait(self.interval_s):
+                try:
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    axiom.log(
+                        {
+                            "event": EventType.GPU_STATS,
+                            "context": self._context,
+                            "gpu_utilization": util.gpu,
+                            "memory_utilization": util.memory,
+                            "memory_used": mem_info.used,
+                            "memory_total": mem_info.total,
+                        }
+                    )
+                except Exception as stats_error:
+                    console_logger.debug(f"GPU stats logging error: {stats_error}")
+        except Exception as e:
+            console_logger.debug(f"Unable to initialize GPU stats logger: {e}")
+        finally:
+            try:
+                import pynvml
+
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+
+
 # =============================================================================
 # Rollout Events
 # =============================================================================
@@ -259,6 +317,7 @@ def log_inference_response(
     batch_size: int,
     duration_ms: int,
     tokens_generated: int | None = None,
+    tokens_per_second: float | None = None,
 ):
     """Log inference response received."""
     axiom.log(
@@ -268,6 +327,7 @@ def log_inference_response(
             "batch_size": batch_size,
             "duration_ms": duration_ms,
             "tokens_generated": tokens_generated,
+            "tokens_per_second": tokens_per_second,
         }
     )
 
