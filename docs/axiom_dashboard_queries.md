@@ -124,7 +124,49 @@ Some powers may have more complex positions leading to worse extraction:
 
 ## Error Analysis
 
-### 9. Recent Errors (Last 24h)
+### 9. GPU Utilization & Memory Headroom
+
+```apl
+['diplomacy']
+| where event == "gpu_stats"
+| summarize
+    p50_gpu = percentile(gpu_utilization, 50),
+    p95_gpu = percentile(gpu_utilization, 95),
+    p50_mem = percentile(memory_utilization, 50),
+    mem_used_mb = avg(memory_used) / 1e6
+  by bin(_time, 5m), context
+```
+
+### 10. Inference Throughput (Tokens/sec)
+
+```apl
+['diplomacy']
+| where event == "inference_response"
+| summarize
+    total_tokens = sum(tokens_generated),
+    avg_tokens_per_sec = avg(tokens_per_second),
+    requests = count()
+  by bin(_time, 5m)
+```
+
+### 11. Policy Lag & Buffer Depth
+
+```apl
+['diplomacy']
+| where event == "training_step"
+| summarize
+    avg_policy_lag = avg(policy_lag_steps),
+    max_policy_lag = max(policy_lag_steps),
+    avg_buffer_depth = avg(buffer_depth),
+    avg_pending_batches = avg(pending_rollout_batches)
+  by bin(_time, 15m)
+```
+
+---
+
+## Error Analysis
+
+### 12. Recent Errors (Last 24h)
 
 ```apl
 ['diplomacy']
@@ -134,7 +176,7 @@ Some powers may have more complex positions leading to worse extraction:
 | take 50
 ```
 
-### 10. Empty Orders Details (Debugging)
+### 13. Empty Orders Details (Debugging)
 
 ```apl
 ['diplomacy']
@@ -144,7 +186,7 @@ Some powers may have more complex positions leading to worse extraction:
 | take 100
 ```
 
-### 10b. Empty Orders by Phase Type
+### 13b. Empty Orders by Phase Type
 
 ```apl
 ['diplomacy']
@@ -162,7 +204,7 @@ Some powers may have more complex positions leading to worse extraction:
 
 ## Summary Dashboard Metrics
 
-### 11. Overall Health Score (Last Hour)
+### 14. Overall Health Score (Last Hour)
 
 ```apl
 ['diplomacy']
