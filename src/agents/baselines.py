@@ -1,5 +1,5 @@
 import random
-from typing import Any, Dict, List
+from typing import Any
 
 from src.agents.base import DiplomacyAgent
 from src.engine.wrapper import DiplomacyWrapper
@@ -11,19 +11,17 @@ class RandomBot(DiplomacyAgent):
     Usually results in lots of Holds due to Support dominance.
     """
 
-    def get_orders(self, game: DiplomacyWrapper, power_name: str) -> List[str]:
+    def get_orders(self, game: DiplomacyWrapper, power_name: str) -> list[str]:
         valid_moves = game.get_valid_moves(power_name)
         orders = []
 
-        for unit, move_options in valid_moves.items():
+        for _unit, move_options in valid_moves.items():
             if move_options:
                 orders.append(random.choice(move_options))
 
         return orders
 
-    def get_press(
-        self, game: DiplomacyWrapper, power_name: str
-    ) -> List[Dict[str, Any]]:
+    def get_press(self, game: DiplomacyWrapper, power_name: str) -> list[dict[str, Any]]:
         return []
 
 
@@ -34,11 +32,11 @@ class ChaosBot(DiplomacyAgent):
     Useful for visual debugging to ensure the engine is processing movement.
     """
 
-    def get_orders(self, game: DiplomacyWrapper, power_name: str) -> List[str]:
+    def get_orders(self, game: DiplomacyWrapper, power_name: str) -> list[str]:
         valid_moves = game.get_valid_moves(power_name)
         orders = []
 
-        for unit, move_options in valid_moves.items():
+        for _unit, move_options in valid_moves.items():
             if not move_options:
                 continue
 
@@ -54,7 +52,5 @@ class ChaosBot(DiplomacyAgent):
 
         return orders
 
-    def get_press(
-        self, game: DiplomacyWrapper, power_name: str
-    ) -> List[Dict[str, Any]]:
+    def get_press(self, game: DiplomacyWrapper, power_name: str) -> list[dict[str, Any]]:
         return []

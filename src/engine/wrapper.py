@@ -1,4 +1,4 @@
-from typing import Any, Dict, List
+from typing import Any
 
 import diplomacy
 from diplomacy.utils.export import to_saved_game_format
@@ -37,14 +37,14 @@ class DiplomacyWrapper:
                 if part.isdigit():
                     return int(part)
             return 1900
-        except:
+        except Exception:  # noqa: BLE001
             return 1900
 
     def get_phase_type(self) -> str:
         """Get the phase type: M (Movement), R (Retreat), A (Adjustment)."""
         return str(self.game.phase_type)
 
-    def get_valid_moves(self, power_name: str) -> Dict[str, List[str]]:
+    def get_valid_moves(self, power_name: str) -> dict[str, list[str]]:
         """
         Get valid moves for a power based on the current phase type.
 
@@ -57,16 +57,13 @@ class DiplomacyWrapper:
 
         phase_type = str(self.game.phase_type)
         possible_orders = self.game.get_all_possible_orders()
-        power = self.game.powers[power_name]
 
         if phase_type == "A":  # Adjustment phase (builds/disbands)
             return self._get_adjustment_moves(power_name, possible_orders)
         else:  # Movement or Retreat phase
             return self._get_movement_moves(power_name, possible_orders)
 
-    def _get_movement_moves(
-        self, power_name: str, possible_orders: Dict
-    ) -> Dict[str, List[str]]:
+    def _get_movement_moves(self, power_name: str, possible_orders: dict) -> dict[str, list[str]]:
         """Get valid moves for movement/retreat phases."""
         current_units = self.game.powers[power_name].units
         normalized_moves = {}
@@ -84,9 +81,7 @@ class DiplomacyWrapper:
 
         return normalized_moves
 
-    def _get_adjustment_moves(
-        self, power_name: str, possible_orders: Dict
-    ) -> Dict[str, List[str]]:
+    def _get_adjustment_moves(self, power_name: str, possible_orders: dict) -> dict[str, list[str]]:
         """
         Get valid moves for adjustment phases (builds/disbands).
 
@@ -116,7 +111,7 @@ class DiplomacyWrapper:
         power = self.game.powers[power_name]
         return len(power.centers) - len(power.units)
 
-    def get_all_inputs(self, agent=None) -> Dict[str, List]:
+    def get_all_inputs(self, agent=None) -> dict[str, list]:
         """
         Prepares the batch of inputs for all 7 powers to send to the GPU.
 
@@ -154,7 +149,7 @@ class DiplomacyWrapper:
             "power_names": power_names,
         }
 
-    def step(self, orders: List[str]):
+    def step(self, orders: list[str]):
         """
         Executes orders for the current phase.
 
@@ -170,7 +165,7 @@ class DiplomacyWrapper:
 
         self.game.process()
 
-    def _step_movement(self, orders: List[str]):
+    def _step_movement(self, orders: list[str]):
         """Handle movement/retreat phase orders."""
         # Map units to their Power
         unit_owner_map = {}
@@ -201,7 +196,7 @@ class DiplomacyWrapper:
                 except Exception as e:
                     print(f"❌ Engine rejected orders for {power}: {e}")
 
-    def _step_adjustment(self, orders: List[str]):
+    def _step_adjustment(self, orders: list[str]):
         """
         Handle adjustment phase orders (builds/disbands).
 
@@ -254,14 +249,12 @@ class DiplomacyWrapper:
                 except Exception as e:
                     print(f"❌ Engine rejected adjustment order for {power}: {e}")
 
-    def get_state_json(self) -> Dict[str, Any]:
+    def get_state_json(self) -> dict[str, Any]:
         return to_saved_game_format(self.game)
 
     def get_unit(self, power_name: str, unit_str: str) -> str | None:
         units: list[str] = list(self.game.get_units(power_name))
-        print(
-            f"\nDEBUG get_unit: power={power_name}, location={unit_str}, units={units}"
-        )
+        print(f"\nDEBUG get_unit: power={power_name}, location={unit_str}, units={units}")
         try:
             # Find the unit string in the list (e.g., "A PAR" in ["A PAR", "F BRE"])
             # We need to match the full unit string format

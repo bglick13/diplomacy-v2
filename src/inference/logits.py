@@ -12,7 +12,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.v1.sample.logits_processor import LogitsProcessor
+
+try:
+    from vllm.v1.sample.logits_processor import LogitsProcessor
+except ImportError:
+    # vLLM not available (e.g., in CI test environment)
+    LogitsProcessor = object  # type: ignore[assignment, misc]
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -85,9 +90,9 @@ class RequestState:
         self.tag_match_progress = 0  # For incremental tag matching
 
 
-class DiplomacyLogitsProcessor(LogitsProcessor):
+class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
     @classmethod
-    def validate_params(cls, sampling_params: "SamplingParams") -> None:
+    def validate_params(cls, sampling_params: SamplingParams) -> None:
         if sampling_params.extra_args is None:
             return
         valid_moves_dict = sampling_params.extra_args.get("valid_moves_dict")
@@ -103,25 +108,19 @@ class DiplomacyLogitsProcessor(LogitsProcessor):
                 raise ValueError(f"Moves must be list, got {type(moves).__name__}")
             for move in moves:
                 if not isinstance(move, str):
-                    raise ValueError(
-                        f"Each move must be str, got {type(move).__name__}"
-                    )
+                    raise ValueError(f"Each move must be str, got {type(move).__name__}")
 
-    def __init__(
-        self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
-    ):
+    def __init__(self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool):
         from transformers import AutoTokenizer
 
         self.device = device
         self.is_pin_memory = is_pin_memory
 
-        model_name = vllm_config.model_config.model
+        model_name = vllm_config.model_config.model  # type: ignore[attr-defined]
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         # Cache Special Tokens
-        self.newline_token_id = self.tokenizer.encode("\n", add_special_tokens=False)[
-            -1
-        ]
+        self.newline_token_id = self.tokenizer.encode("\n", add_special_tokens=False)[-1]
         self.eos_token_id = self.tokenizer.eos_token_id
 
         # Cache Tag Sequences for Fast Matching
@@ -141,9 +140,7 @@ class DiplomacyLogitsProcessor(LogitsProcessor):
                 root.add_sequence(token_ids)
         return root
 
-    def _find_sequence_at(
-        self, tokens: list[int], needle: list[int], start: int
-    ) -> int:
+    def _find_sequence_at(self, tokens: list[int], needle: list[int], start: int) -> int:
         """Check if needle appears at exactly position start in tokens."""
         if start < 0 or start + len(needle) > len(tokens):
             return -1
@@ -152,7 +149,7 @@ class DiplomacyLogitsProcessor(LogitsProcessor):
                 return -1
         return start
 
-    def update_state(self, batch_update: "BatchUpdate | None") -> None:
+    def update_state(self, batch_update: BatchUpdate | None) -> None:
         from vllm.v1.sample.logits_processor import MoveDirectionality
 
         if batch_update is None:

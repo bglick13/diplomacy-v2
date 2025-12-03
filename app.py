@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 import modal
 
@@ -213,9 +214,7 @@ class InferenceEngine:
                                 if os.path.exists(models_dir):
                                     contents = os.listdir(models_dir)
                                     print(f"📁 Contents of {models_dir}: {contents}")
-                                raise RuntimeError(
-                                    f"LoRA path does not exist: {full_path}"
-                                )
+                                raise RuntimeError(f"LoRA path does not exist: {full_path}")
 
                             # List adapter files for confirmation
                             adapter_files = os.listdir(full_path)
@@ -224,9 +223,7 @@ class InferenceEngine:
                             # Mark as loaded so future requests skip the reload
                             self._loaded_adapters.add(lora_name)
                         else:
-                            print(
-                                f"📂 Adapter already loaded by another request: {lora_name}"
-                            )
+                            print(f"📂 Adapter already loaded by another request: {lora_name}")
                 else:
                     print(f"📂 Using cached adapter: {lora_name}")
 
@@ -238,11 +235,12 @@ class InferenceEngine:
             async def _generate_single(prompt: str, moves: dict) -> dict[str, object]:
                 """Generate for a single prompt. Allows concurrent execution."""
                 request_id = str(uuid.uuid4())
-                sampling_params = SamplingParams(
-                    temperature=0.7,
-                    max_tokens=200,
-                    extra_args={"valid_moves_dict": moves},
-                    stop=["</orders>", "</Orders>"],
+                # vLLM SamplingParams accepts these at runtime but type stubs may be incomplete
+                sampling_params = SamplingParams(  # type: ignore[call-arg, misc]
+                    temperature=0.7,  # type: ignore[arg-type]
+                    max_tokens=200,  # type: ignore[arg-type]
+                    extra_args={"valid_moves_dict": moves},  # type: ignore[arg-type]
+                    stop=["</orders>", "</Orders>"],  # type: ignore[arg-type]
                 )
                 try:
                     generator = self.engine.generate(
@@ -268,14 +266,17 @@ class InferenceEngine:
             # CRITICAL: Await all generators concurrently for proper batching
             # Old code awaited sequentially, killing vLLM's continuous batching
             responses = await asyncio.gather(
-                *[_generate_single(p, m) for p, m in zip(prompts, valid_moves)]
+                *[_generate_single(p, m) for p, m in zip(prompts, valid_moves, strict=True)]
             )
 
             duration_ms = int((time.time() - request_start) * 1000)
-            total_tokens = sum(int(resp.get("token_count", 0)) for resp in responses)
-            tokens_per_second = (
-                total_tokens / (duration_ms / 1000) if duration_ms > 0 else None
+            total_tokens = sum(
+                int(token_count)
+                if isinstance(token_count := resp.get("token_count"), int | str)
+                else 0
+                for resp in responses
             )
+            tokens_per_second = total_tokens / (duration_ms / 1000) if duration_ms > 0 else None
             log_inference_response(
                 rollout_id="inference-engine",
                 batch_size=batch_size,
@@ -406,7 +407,7 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
             phase = main_game.get_current_phase()
 
             for idx, (response, power) in enumerate(
-                zip(raw_responses, inputs["power_names"])
+                zip(raw_responses, inputs["power_names"], strict=True)
             ):
                 orders = extract_orders(response)
                 expected_count = len(inputs["valid_moves"][idx])
@@ -444,9 +445,7 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
         if should_visualize and vis:
             # IMPORTANT: Create SEPARATE visualizer objects for each game
             # Using [obj] * n would create n references to the SAME object!
-            visualizers = [
-                cloudpickle.loads(frozen_vis) for _ in range(cfg.samples_per_group)
-            ]
+            visualizers = [cloudpickle.loads(frozen_vis) for _ in range(cfg.samples_per_group)]
         else:
             visualizers = None
 
@@ -484,9 +483,7 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
                 break
 
             # Inference call
-            with stopwatch(
-                f"Rollout Step {step_count} (Batch Size: {len(batch_prompts)})"
-            ):
+            with stopwatch(f"Rollout Step {step_count} (Batch Size: {len(batch_prompts)})"):
                 metrics.inference_calls += 1
                 responses = InferenceEngine().generate.remote(
                     prompts=batch_prompts,
@@ -496,9 +493,7 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
 
             # Distribute responses with observability
             game_orders = {g_idx: [] for g_idx in active_indices}
-            phase = (
-                games[active_indices[0]].get_current_phase() if active_indices else ""
-            )
+            phase = games[active_indices[0]].get_current_phase() if active_indices else ""
 
             for i, response in enumerate(responses):
                 g_idx, power, expected_count = batch_meta[i]
@@ -534,9 +529,7 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
                             games[g_idx].game,
                             f"Rollout step {step_count}\n{chr(10).join(game_orders[g_idx])}",
                         )
-                    if not (
-                        games[g_idx].get_year() >= target_year or games[g_idx].is_done()
-                    ):
+                    if not (games[g_idx].get_year() >= target_year or games[g_idx].is_done()):
                         next_active.append(g_idx)
 
             active_indices = next_active
@@ -567,9 +560,7 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
             logger.info(f"✅ Saved replay to {output_file}")
 
             for g_idx, game in enumerate(games):
-                output_file = str(
-                    REPLAYS_PATH / f"rollout_{game.game.game_id}_{g_idx}.html"
-                )
+                output_file = str(REPLAYS_PATH / f"rollout_{game.game.game_id}_{g_idx}.html")
                 visualizers[g_idx].save_html(output_file)
                 logger.info(f"✅ Saved group replay {g_idx} to {output_file}")
 
@@ -711,7 +702,7 @@ def train_grpo():
         policy_model.print_trainable_parameters()
 
         # Enable gradient checkpointing to reduce memory (trades compute for memory)
-        policy_model.gradient_checkpointing_enable()
+        policy_model.gradient_checkpointing_enable()  # type: ignore[attr-defined]
         logger.info("✅ Gradient checkpointing enabled")
 
         # NOTE: torch.compile() with reduce-overhead mode uses CUDA graphs which
@@ -720,7 +711,7 @@ def train_grpo():
 
         # Initialize optimizer and loss
         optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate)
-        loss_fn = GRPOLoss(policy_model, beta=0.04)
+        loss_fn = GRPOLoss(policy_model, beta=0.04)  # type: ignore[arg-type]
 
         # Log training start
         log_training_start(
@@ -787,9 +778,7 @@ def train_grpo():
 
             # Skip step if no trajectories (all rollouts failed)
             if not raw_trajectories:
-                logger.warning(
-                    f"⚠️ Step {step}: No trajectories collected, skipping update"
-                )
+                logger.warning(f"⚠️ Step {step}: No trajectories collected, skipping update")
                 wandb.log({"step": step, "skipped": True, "reason": "no_trajectories"})
                 continue
 
@@ -841,9 +830,7 @@ def train_grpo():
                     loss_output = loss_fn.compute_loss(chunk)
 
                     # Scale loss for gradient accumulation
-                    scaled_loss = loss_output.loss / max(
-                        1, len(batch_data) // chunk_size
-                    )
+                    scaled_loss = loss_output.loss / max(1, len(batch_data) // chunk_size)
                     scaled_loss.backward()
 
                     # Accumulate metrics
@@ -1064,6 +1051,8 @@ def train_grpo_benchmark(
 
     # Build config with benchmark parameters
     run_name = f"benchmark-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    from src.utils.config import ProfilingMode
+
     cfg = ExperimentConfig(
         run_name=run_name,
         total_steps=total_steps,
@@ -1071,7 +1060,7 @@ def train_grpo_benchmark(
         samples_per_group=samples_per_group,
         rollout_horizon_years=rollout_horizon_years,
         rollout_visualize_chance=0.0,  # Disable visualization for speed
-        profiling_mode=profiling_mode,
+        profiling_mode=profiling_mode if profiling_mode is None else ProfilingMode(profiling_mode),  # type: ignore[arg-type]
         profile_run_name=profile_run_name or run_name,
     )
 
@@ -1098,7 +1087,7 @@ def train_grpo_benchmark(
     )
 
     @contextmanager
-    def profile_section(step_profile: dict[str, float], name: str):
+    def profile_section(step_profile: dict[str, Any], name: str):
         if not profile_enabled:
             yield
             return
@@ -1178,7 +1167,7 @@ def train_grpo_benchmark(
         policy_model = get_peft_model(base_model, peft_config)
 
         # Enable gradient checkpointing to reduce memory (trades compute for memory)
-        policy_model.gradient_checkpointing_enable()
+        policy_model.gradient_checkpointing_enable()  # type: ignore[attr-defined]
         logger.info("✅ Gradient checkpointing enabled")
 
         # NOTE: torch.compile() with reduce-overhead mode uses CUDA graphs which
@@ -1186,7 +1175,7 @@ def train_grpo_benchmark(
         # See: https://github.com/huggingface/peft/issues/1043
 
         optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate)
-        loss_fn = GRPOLoss(policy_model, beta=0.04)
+        loss_fn = GRPOLoss(policy_model, beta=0.04)  # type: ignore[arg-type]
 
         model_load_time = time.time() - model_load_start
         metrics["timing"]["model_load_s"] = model_load_time
@@ -1236,10 +1225,8 @@ def train_grpo_benchmark(
 
         for step in range(cfg.total_steps):
             step_start = time.time()
-            step_metrics = {"step": step}
-            step_profile: dict[str, float] | None = (
-                {"step": step} if profile_enabled else None
-            )
+            step_metrics: dict[str, Any] = {"step": step}
+            step_profile: dict[str, Any] | None = {"step": step} if profile_enabled else None
 
             # A. Wait for CURRENT rollouts (the earlier batch)
             rollout_start = time.time()
@@ -1298,9 +1285,7 @@ def train_grpo_benchmark(
             process_start = time.time()
             profile_target = step_profile if step_profile is not None else {}
             with profile_section(profile_target, "tokenize"):
-                batch_data, traj_stats = process_trajectories(
-                    raw_trajectories, tokenizer
-                )
+                batch_data, traj_stats = process_trajectories(raw_trajectories, tokenizer)
             process_time = time.time() - process_start
             step_metrics["process_time_s"] = process_time
             step_metrics["processed_trajectories"] = len(batch_data)
@@ -1425,8 +1410,7 @@ def train_grpo_benchmark(
             "total_trajectories": total_trajectories,
             "total_simulated_years": total_simulated_years,
             "trajectories_per_second": total_trajectories / max(0.001, total_time),
-            "simulated_years_per_second": total_simulated_years
-            / max(0.001, total_time),
+            "simulated_years_per_second": total_simulated_years / max(0.001, total_time),
             "reward_mean": sum(all_rewards) / len(all_rewards) if all_rewards else 0,
             "reward_min": min(all_rewards) if all_rewards else 0,
             "reward_max": max(all_rewards) if all_rewards else 0,
@@ -1448,9 +1432,7 @@ def train_grpo_benchmark(
         logger.info("🏁 BENCHMARK COMPLETE")
         logger.info(f"Total time: {total_time:.2f}s")
         logger.info(f"Trajectories: {total_trajectories}")
-        logger.info(
-            f"Throughput: {metrics['summary']['trajectories_per_second']:.2f} traj/s"
-        )
+        logger.info(f"Throughput: {metrics['summary']['trajectories_per_second']:.2f} traj/s")
         logger.info(f"Pipeline overlap (time saved): {total_pipeline_overlap:.2f}s")
         logger.info(f"{'=' * 60}")
 

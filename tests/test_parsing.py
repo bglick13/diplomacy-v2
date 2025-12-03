@@ -18,9 +18,9 @@ F BRE - MAO
 """
 
 MESSY_OUTPUT = """
-<orders>  
-   A PAR - BUR   
-   
+<orders>
+   A PAR - BUR
+
    F BRE H
 </orders>
 <analysis>Thinking...</analysis>

@@ -119,7 +119,7 @@ class LLMAgent:
 
     def _get_example_move(self, valid_moves: dict[str, list[str]]) -> str:
         """Get an example move from the valid moves for the prompt."""
-        for unit, moves in valid_moves.items():
+        for _unit, moves in valid_moves.items():
             if moves:
                 return moves[0]
         return "A PAR - BUR"  # Fallback
@@ -291,9 +291,7 @@ Example:
             "LLMAgent requires async inference. Use build_prompt() and parse_response() instead."
         )
 
-    def get_press(
-        self, game: DiplomacyWrapper, power_name: str
-    ) -> list[dict[str, Any]]:
+    def get_press(self, game: DiplomacyWrapper, power_name: str) -> list[dict[str, Any]]:
         """Return empty press (no diplomacy messages)."""
         return []
 
@@ -330,9 +328,7 @@ class LLMAgentWithFallback(LLMAgent):
         """
         Parse response, falling back to baseline agent if no orders extracted.
         """
-        response = self.parse_response(
-            raw_text, valid_moves, power_name, game.get_current_phase()
-        )
+        response = self.parse_response(raw_text, valid_moves, power_name, game.get_current_phase())
 
         # If no orders extracted, use fallback
         if not response.orders:

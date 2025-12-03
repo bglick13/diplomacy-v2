@@ -20,9 +20,7 @@ from enum import Enum
 import aiohttp
 
 # Configure logging to show up clearly in Modal logs
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("diplomacy")
 console_logger = logging.getLogger("diplomacy")
 
@@ -121,9 +119,7 @@ class AxiomHandler:
                     if resp.status != 200:
                         console_logger.error(f"Axiom Flush Failed: {resp.status}")
                     else:
-                        console_logger.debug(
-                            f"Axiom Flush Success: {len(payload)} events"
-                        )
+                        console_logger.debug(f"Axiom Flush Success: {len(payload)} events")
         except Exception as e:
             console_logger.error(f"Axiom Error: {e}")
 
@@ -198,7 +194,7 @@ class GPUStatsLogger:
 
     def _run(self):
         try:
-            import pynvml
+            import pynvml  # type: ignore[import-untyped]
 
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(self.device_index)
@@ -222,7 +218,7 @@ class GPUStatsLogger:
             console_logger.debug(f"Unable to initialize GPU stats logger: {e}")
         finally:
             try:
-                import pynvml
+                import pynvml  # type: ignore[import-untyped]
 
                 pynvml.nvmlShutdown()
             except Exception:
@@ -512,9 +508,7 @@ def log_training_step(
             "training_duration_ms": training_duration_ms,
             "total_tokens": total_tokens,
             "tokens_per_second": (
-                total_tokens / (training_duration_ms / 1000)
-                if training_duration_ms > 0
-                else 0
+                total_tokens / (training_duration_ms / 1000) if training_duration_ms > 0 else 0
             ),
         }
     )
@@ -544,9 +538,7 @@ def log_trajectory_processing(
 ):
     """Log trajectory processing results."""
     if skipped_single_sample_groups > 0:
-        console_logger.warning(
-            f"⚠️ Skipped {skipped_single_sample_groups} single-sample groups"
-        )
+        console_logger.warning(f"⚠️ Skipped {skipped_single_sample_groups} single-sample groups")
     axiom.log(
         {
             "event": EventType.TRAJECTORY_PROCESSING,
@@ -564,9 +556,7 @@ def log_trajectory_processing(
 def log_training_complete(run_name: str, total_steps: int, total_duration_ms: int):
     """Log successful training completion."""
     hours = total_duration_ms / (1000 * 60 * 60)
-    console_logger.info(
-        f"✅ Training Complete: {run_name} | {total_steps} steps | {hours:.2f}h"
-    )
+    console_logger.info(f"✅ Training Complete: {run_name} | {total_steps} steps | {hours:.2f}h")
     axiom.log(
         {
             "event": EventType.TRAINING_COMPLETE,

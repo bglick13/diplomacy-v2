@@ -32,9 +32,7 @@ class MockTokenizer:
         self.pad_token_id = 0
         self.eos_token_id = 1
 
-    def __call__(
-        self, text: str, return_tensors: str = "pt", **kwargs
-    ) -> TokenizerOutput:
+    def __call__(self, text: str, return_tensors: str = "pt", **kwargs) -> TokenizerOutput:
         """Simulate tokenization - return fixed length based on text length."""
         # Simple heuristic: ~4 chars per token
         num_tokens = max(1, len(text) // 4)
@@ -303,17 +301,13 @@ class TestGRPOLoss:
             {
                 "input_ids": torch.randint(0, 100, (20,)),
                 "attention_mask": torch.ones(20),
-                "labels": torch.cat(
-                    [torch.full((10,), -100), torch.randint(0, 100, (10,))]
-                ),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
                 "advantages": 0.5,
             },
             {
                 "input_ids": torch.randint(0, 100, (20,)),
                 "attention_mask": torch.ones(20),
-                "labels": torch.cat(
-                    [torch.full((10,), -100), torch.randint(0, 100, (10,))]
-                ),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
                 "advantages": -0.5,
             },
         ]
@@ -340,9 +334,7 @@ class TestGRPOLoss:
             {
                 "input_ids": torch.randint(0, 100, (15,)),
                 "attention_mask": torch.ones(15),
-                "labels": torch.cat(
-                    [torch.full((5,), -100), torch.randint(0, 100, (10,))]
-                ),
+                "labels": torch.cat([torch.full((5,), -100), torch.randint(0, 100, (10,))]),
                 "advantages": 1.0,
             },
         ]
@@ -366,9 +358,7 @@ class TestGRPOLoss:
             {
                 "input_ids": torch.randint(0, 100, (20,)),
                 "attention_mask": torch.ones(20),
-                "labels": torch.cat(
-                    [torch.full((10,), -100), torch.randint(0, 100, (10,))]
-                ),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
                 "advantages": 0.0,
             },
         ]
@@ -399,15 +389,13 @@ class TestGRPOLoss:
             {
                 "input_ids": torch.randint(0, 100, (20,)),
                 "attention_mask": torch.ones(20),
-                "labels": torch.cat(
-                    [torch.full((10,), -100), torch.randint(0, 100, (10,))]
-                ),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
                 "advantages": 1.0,
             },
         ]
 
-        loss_fn_low_beta = GRPOLoss(model, beta=0.01)
-        loss_fn_high_beta = GRPOLoss(model, beta=10.0)
+        loss_fn_low_beta = GRPOLoss(model, beta=0.01)  # type: ignore[arg-type]
+        loss_fn_high_beta = GRPOLoss(model, beta=10.0)  # type: ignore[arg-type]
 
         # Reset model state
         model.zero_grad()
@@ -437,9 +425,7 @@ class TestGRPOLoss:
         base_batch = {
             "input_ids": torch.randint(0, 100, (20,)),
             "attention_mask": torch.ones(20),
-            "labels": torch.cat(
-                [torch.full((10,), -100), torch.randint(0, 100, (10,))]
-            ),
+            "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
         }
 
         batch_positive = [{**base_batch, "advantages": 2.0}]
@@ -466,9 +452,7 @@ class TestGRPOLoss:
             {
                 "input_ids": torch.randint(0, 100, (20,)),
                 "attention_mask": torch.ones(20),
-                "labels": torch.cat(
-                    [torch.full((10,), -100), torch.randint(0, 100, (10,))]
-                ),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
                 "advantages": 0.5,
             },
         ]
@@ -485,9 +469,7 @@ class TestGRPOLoss:
 
         loss_fn.compute_loss(batch)
 
-        assert call_count[0] == 1, (
-            "disable_adapter should be called once per loss computation"
-        )
+        assert call_count[0] == 1, "disable_adapter should be called once per loss computation"
 
 
 # =============================================================================

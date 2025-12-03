@@ -1,9 +1,7 @@
-from typing import Dict
-
 from src.engine.wrapper import DiplomacyWrapper
 
 
-def calculate_final_scores(game: DiplomacyWrapper) -> Dict[str, float]:
+def calculate_final_scores(game: DiplomacyWrapper) -> dict[str, float]:
     """
     Computes a heuristic score for every power at the end of a rollout.
 

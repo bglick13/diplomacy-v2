@@ -1,5 +1,4 @@
 import re
-from typing import Dict, List
 
 # Regex patterns for our specific XML tags
 # DOTALL means . matches newlines, enabling multi-line extraction
@@ -7,9 +6,7 @@ RE_ORDERS = re.compile(r"<orders>(.*?)</orders>", re.DOTALL | re.IGNORECASE)
 # Fallback: Match <orders> without closing tag (when stop token truncates)
 RE_ORDERS_OPEN = re.compile(r"<orders>(.*?)$", re.DOTALL | re.IGNORECASE)
 RE_THOUGHT = re.compile(r"<analysis>(.*?)</analysis>", re.DOTALL | re.IGNORECASE)
-RE_PRESS = re.compile(
-    r"<communication>(.*?)</communication>", re.DOTALL | re.IGNORECASE
-)
+RE_PRESS = re.compile(r"<communication>(.*?)</communication>", re.DOTALL | re.IGNORECASE)
 RE_TRUTH = re.compile(r"<truth_status>(.*?)</truth_status>", re.DOTALL | re.IGNORECASE)
 
 # Pattern to detect if text looks like Diplomacy orders (starts with unit type)
@@ -17,7 +14,7 @@ RE_TRUTH = re.compile(r"<truth_status>(.*?)</truth_status>", re.DOTALL | re.IGNO
 RE_ORDER_LINE = re.compile(r"^[AFBD]\s+[A-Z]{3}", re.MULTILINE)
 
 
-def extract_orders(llm_output: str) -> List[str]:
+def extract_orders(llm_output: str) -> list[str]:
     """
     Extracts orders from the <orders> block OR directly from output.
 
@@ -64,7 +61,7 @@ def extract_orders(llm_output: str) -> List[str]:
     return valid_orders
 
 
-def extract_metadata(llm_output: str) -> Dict[str, str]:
+def extract_metadata(llm_output: str) -> dict[str, str]:
     """
     Extracts structured intent tags.
     """

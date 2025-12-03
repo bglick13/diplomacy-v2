@@ -17,6 +17,13 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 
+try:
+    import vllm  # noqa: F401
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+
 from src.inference.logits import (
     DiplomacyLogitsProcessor,
     TokenTrieNode,
@@ -87,6 +94,7 @@ class MockSamplingParams:
         self.extra_args = extra_args
 
 
+@pytest.mark.skipif(not VLLM_AVAILABLE, reason="vLLM not available")
 class TestValidateParams:
     """Tests for the vLLM v1 parameter validation."""
 
@@ -118,17 +126,13 @@ class TestValidateParams:
 
     def test_validate_params_invalid_unit_key(self):
         """Test that non-string unit key fails validation."""
-        params = MockSamplingParams(
-            extra_args={"valid_moves_dict": {123: ["A PAR - BUR"]}}
-        )
+        params = MockSamplingParams(extra_args={"valid_moves_dict": {123: ["A PAR - BUR"]}})
         with pytest.raises(ValueError, match="Unit key must be str"):
             DiplomacyLogitsProcessor.validate_params(params)  # type: ignore[arg-type]
 
     def test_validate_params_invalid_moves_list(self):
         """Test that non-list moves fails validation."""
-        params = MockSamplingParams(
-            extra_args={"valid_moves_dict": {"A PAR": "not a list"}}
-        )
+        params = MockSamplingParams(extra_args={"valid_moves_dict": {"A PAR": "not a list"}})
         with pytest.raises(ValueError, match="Moves must be list"):
             DiplomacyLogitsProcessor.validate_params(params)  # type: ignore[arg-type]
 
@@ -174,6 +178,7 @@ class MockBatchUpdate:
         self.moved = moved or []
 
 
+@pytest.mark.skipif(not VLLM_AVAILABLE, reason="vLLM not available")
 class TestBatchLevelProcessor:
     """
     Tests for the batch-level DiplomacyLogitsProcessor.
@@ -193,9 +198,7 @@ class TestBatchLevelProcessor:
             is_pin_memory=False,
         )
 
-    def test_update_state_uses_output_tokens_not_prompt_tokens(
-        self, batch_processor, tokenizer
-    ):
+    def test_update_state_uses_output_tokens_not_prompt_tokens(self, batch_processor, tokenizer):
         """
         CRITICAL: Verify that update_state uses output_token_ids (element 3)
         not prompt_token_ids (element 2) from the AddedRequest tuple.
@@ -269,9 +272,7 @@ class TestBatchLevelProcessor:
         )
 
         # Random invalid token should be masked
-        assert result[0, 12345] == -float("inf"), (
-            "Invalid token should be masked to -inf"
-        )
+        assert result[0, 12345] == -float("inf"), "Invalid token should be masked to -inf"
 
     def test_apply_advances_trie_with_output_tokens(self, batch_processor, tokenizer):
         """
@@ -356,6 +357,7 @@ class TestBatchLevelProcessor:
 # =============================================================================
 
 
+@pytest.mark.skipif(not VLLM_AVAILABLE, reason="vLLM not available")
 class TestTagDetection:
     """
     Tests for the critical tag detection logic that enables Chain-of-Thought.
@@ -386,9 +388,7 @@ class TestTagDetection:
 
         # Model is generating reasoning (no <orders> tag yet)
         analysis_text = "<analysis>I think I should move to Burgundy because"
-        output_token_ids: list[int] = tokenizer.encode(
-            analysis_text, add_special_tokens=False
-        )
+        output_token_ids: list[int] = tokenizer.encode(analysis_text, add_special_tokens=False)
 
         batch_update = MockBatchUpdate(
             batch_size=1,
@@ -413,9 +413,7 @@ class TestTagDetection:
 
         # Model has output reasoning and entered orders block
         text_with_orders = "<analysis>Moving to Burgundy</analysis>\n<orders>"
-        output_token_ids: list[int] = tokenizer.encode(
-            text_with_orders, add_special_tokens=False
-        )
+        output_token_ids: list[int] = tokenizer.encode(text_with_orders, add_special_tokens=False)
 
         batch_update = MockBatchUpdate(
             batch_size=1,
@@ -445,9 +443,7 @@ class TestTagDetection:
 
         # Full generation with orders block completed
         complete_text = "<analysis>Plan</analysis>\n<orders>A PAR - BUR\n</orders>"
-        output_token_ids: list[int] = tokenizer.encode(
-            complete_text, add_special_tokens=False
-        )
+        output_token_ids: list[int] = tokenizer.encode(complete_text, add_special_tokens=False)
 
         batch_update = MockBatchUpdate(
             batch_size=1,
@@ -459,9 +455,7 @@ class TestTagDetection:
         result = batch_processor.apply(logits)
 
         # All tokens should be allowed again (orders block is closed)
-        assert torch.all(result == 0), (
-            "All tokens should be allowed after </orders> tag"
-        )
+        assert torch.all(result == 0), "All tokens should be allowed after </orders> tag"
 
     def test_empty_output_allows_free_generation(self, batch_processor, tokenizer):
         """
@@ -502,9 +496,7 @@ class TestTagDetection:
 
         # Model has just output <orders> tag
         orders_tag = "<orders>"
-        output_token_ids: list[int] = tokenizer.encode(
-            orders_tag, add_special_tokens=False
-        )
+        output_token_ids: list[int] = tokenizer.encode(orders_tag, add_special_tokens=False)
 
         batch_update = MockBatchUpdate(
             batch_size=1,
@@ -539,6 +531,7 @@ class TestTagDetection:
 # =============================================================================
 
 
+@pytest.mark.skipif(not VLLM_AVAILABLE, reason="vLLM not available")
 class TestPerformance:
     """
     Performance tests to ensure the logits processor is fast enough for
@@ -579,9 +572,7 @@ class TestPerformance:
             "GAS",
             "RUH",
         ]
-        valid_moves = {
-            unit: [f"{unit} - {dest}" for dest in destinations[:8]] for unit in units
-        }
+        valid_moves = {unit: [f"{unit} - {dest}" for dest in destinations[:8]] for unit in units}
 
         params = MockSamplingParams(extra_args={"valid_moves_dict": valid_moves})
 
@@ -608,9 +599,7 @@ class TestPerformance:
         elapsed = time.perf_counter() - start
 
         avg_ms = (elapsed / num_iterations) * 1000
-        print(
-            f"\nSingle request apply(): {avg_ms:.3f}ms avg over {num_iterations} calls"
-        )
+        print(f"\nSingle request apply(): {avg_ms:.3f}ms avg over {num_iterations} calls")
 
         assert avg_ms < 5.0, f"apply() too slow: {avg_ms:.3f}ms (target <5ms on CPU)"
 
@@ -627,9 +616,7 @@ class TestPerformance:
         # Build valid moves for each request
         units = ["A PAR", "A MAR", "F BRE", "A MUN"]
         destinations = ["PAR", "MAR", "BUR", "BRE", "MAO", "MUN", "BER", "PIC"]
-        valid_moves = {
-            unit: [f"{unit} - {dest}" for dest in destinations] for unit in units
-        }
+        valid_moves = {unit: [f"{unit} - {dest}" for dest in destinations] for unit in units}
 
         # Add multiple requests
         added = []
@@ -655,13 +642,9 @@ class TestPerformance:
         elapsed = time.perf_counter() - start
 
         avg_ms = (elapsed / num_iterations) * 1000
-        print(
-            f"\nBatch ({batch_size}) apply(): {avg_ms:.3f}ms avg over {num_iterations} calls"
-        )
+        print(f"\nBatch ({batch_size}) apply(): {avg_ms:.3f}ms avg over {num_iterations} calls")
 
-        assert avg_ms < 20.0, (
-            f"Batch apply() too slow: {avg_ms:.3f}ms (target <20ms on CPU)"
-        )
+        assert avg_ms < 20.0, f"Batch apply() too slow: {avg_ms:.3f}ms (target <20ms on CPU)"
 
     def test_trie_build_performance(self, batch_processor, tokenizer):
         """
@@ -688,10 +671,7 @@ class TestPerformance:
                 "ROM",
             ]
         ]
-        units += [
-            f"F {loc}"
-            for loc in ["BRE", "MAO", "NAO", "ENG", "NTH", "BAL", "BOT", "SKA"]
-        ]
+        units += [f"F {loc}" for loc in ["BRE", "MAO", "NAO", "ENG", "NTH", "BAL", "BOT", "SKA"]]
         destinations = [
             "PAR",
             "MAR",

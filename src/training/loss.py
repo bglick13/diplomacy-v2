@@ -83,9 +83,7 @@ class GRPOLoss:
         shifted_labels = labels[:, 1:]  # Shift right to align with predictions
 
         # 3. Compute Token LogProbs (negative cross-entropy)
-        per_token_loss = F.cross_entropy(
-            logits.transpose(1, 2), shifted_labels, reduction="none"
-        )
+        per_token_loss = F.cross_entropy(logits.transpose(1, 2), shifted_labels, reduction="none")
 
         # 4. Mask out prompt tokens (where labels == -100)
         token_mask = (shifted_labels != -100).float()
@@ -99,9 +97,7 @@ class GRPOLoss:
         # CRITICAL: Use disable_adapter() to get base model logprobs
         with torch.no_grad():
             with self.model.disable_adapter():
-                ref_outputs = self.model(
-                    input_ids=input_ids, attention_mask=attention_mask
-                )
+                ref_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
             ref_logits = ref_outputs.logits[:, :-1, :]
 
             # Compute Reference LogProbs

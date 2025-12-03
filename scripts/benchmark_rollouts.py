@@ -19,9 +19,7 @@ def benchmark():
     InferenceEngine = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
     engine = InferenceEngine()
     # Make a minimal call to trigger container startup and wait for @modal.enter() to complete
-    _ = engine.generate.remote(
-        prompts=["<orders>"], valid_moves=[{"A PAR": ["A PAR - BUR"]}]
-    )
+    _ = engine.generate.remote(prompts=["<orders>"], valid_moves=[{"A PAR": ["A PAR - BUR"]}])
     print("✅ InferenceEngine ready!")
 
     # Ensure this matches your app.py defaults (8 samples usually)
@@ -34,9 +32,7 @@ def benchmark():
         # We iterate as they complete to see progress
         for i, res in enumerate(run_rollout.map([cfg.dict()] * N_GAMES)):
             results.append(res)
-            print(
-                f"[{i + 1}/{N_GAMES}] ✅ Game finished. Trajectories collected: {len(res)}"
-            )
+            print(f"[{i + 1}/{N_GAMES}] ✅ Game finished. Trajectories collected: {len(res)}")
 
     except Exception as e:
         print(f"❌ Critical Failure: {e}")

@@ -1,6 +1,18 @@
 {
   "venvPath": ".",
   "venv": ".venv",
+  "include": [
+    "src",
+    "app.py",
+    "scripts",
+    "tests"
+  ],
+  "exclude": [
+    "**/external/**",
+    "**/__pycache__/**",
+    "**/node_modules/**",
+    "**/.*"
+  ],
   "extraPaths": [
     "external/vllm",
     ".venv/lib/python3.12/site-packages"
