@@ -66,8 +66,7 @@ class DiplomacyWrapper:
             return self._get_movement_moves(power_name, possible_orders)
 
     def _get_possible_orders(self) -> Dict:
-        if not hasattr(self, "_orders_cache"):
-            self._orders_cache = None
+        """Get all possible orders, cached per phase to avoid redundant engine calls."""
         phase_key = f"{self.game.phase}"
         if not self._orders_cache or self._orders_cache[0] != phase_key:
             self._orders_cache = (phase_key, self.game.get_all_possible_orders())

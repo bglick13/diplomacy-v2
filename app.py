@@ -300,6 +300,45 @@ class InferenceEngine:
 CURRENT_ROLLOUT_LORA: str | None = None
 
 
+def load_cached_state(use_cache: bool, cache_path: Path):
+    """
+    Load a random cached game state from the state cache directory.
+
+    Args:
+        use_cache: Whether to attempt loading from cache
+        cache_path: Path to the state cache directory
+
+    Returns:
+        DiplomacyWrapper if cache hit, None otherwise
+    """
+    import random
+
+    import cloudpickle
+
+    from src.engine.wrapper import DiplomacyWrapper
+    from src.utils.observability import logger
+
+    if not use_cache or not cache_path.exists():
+        return None
+
+    try:
+        candidates = [p for p in cache_path.glob("*.pkl") if p.is_file()]
+        if not candidates:
+            return None
+
+        chosen = random.choice(candidates)
+        with chosen.open("rb") as f:
+            state: DiplomacyWrapper = cloudpickle.load(f)
+
+        # Clear any stale cache from serialization
+        state._orders_cache = None
+        logger.info(f"Loaded cached state from {chosen.name}")
+        return state
+    except Exception as cache_error:
+        logger.warning(f"State cache load failed: {cache_error}")
+        return None
+
+
 @app.function(
     image=cpu_image,
     cpu=1.0,
@@ -369,31 +408,15 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
             cfg.enable_rollout_replays
             and random.random() < cfg.rollout_visualize_chance
         )
-        cached_game: DiplomacyWrapper | None = None
 
-        def load_cached_state() -> DiplomacyWrapper | None:
-            try:
-                if not cfg.use_state_cache or not STATE_CACHE_PATH.exists():
-                    return None
-                candidates = [
-                    p for p in STATE_CACHE_PATH.glob("*.pkl") if p.is_file()
-                ]
-                if not candidates:
-                    return None
-                chosen = random.choice(candidates)
-                with chosen.open("rb") as f:
-                    state = cloudpickle.load(f)
-                logger.info(f"Loaded cached state from {chosen.name}")
-                return state
-            except Exception as cache_error:
-                logger.warning(f"State cache load failed: {cache_error}")
-                return None
-
-        if cfg.use_state_cache:
-            cached_game = load_cached_state()
+        # Try to load a cached game state for warm-starting
+        cached_game = load_cached_state(cfg.use_state_cache, STATE_CACHE_PATH)
 
         # Initialize the LLM agent for prompt generation
-        agent = LLMAgent()
+        from src.agents.llm_agent import PromptConfig
+
+        prompt_config = PromptConfig(compact_mode=cfg.compact_prompts)
+        agent = LLMAgent(config=prompt_config)
 
         # 1. THE WARMUP (Generate or reuse a random state)
         # -----------------------------------------------
