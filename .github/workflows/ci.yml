@@ -34,7 +34,7 @@ jobs:
       - name: Install pyright
         run: npm install -g pyright
       - name: Run type check
-        run: pyright --pythonversion 3.12 --exclude external
+        run: pyright --pythonversion 3.12
   tests:
     runs-on: ubuntu-latest
     steps:

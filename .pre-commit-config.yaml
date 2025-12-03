@@ -1,0 +1,11 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.7  # Match ruff version installed via uv
+    hooks:
+      # Run the linter
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        exclude: ^external/
+      # Run the formatter
+      - id: ruff-format
+        exclude: ^external/

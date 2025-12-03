@@ -24,9 +24,7 @@ def test_get_valid_moves_format(game):
     # DEBUG: Print keys if empty
     if not moves:
         print(f"\nDEBUG: Power units: {game.game.powers['FRANCE'].units}")
-        print(
-            f"DEBUG: All Possible Orders Keys: {game.game.get_all_possible_orders().keys()}"
-        )
+        print(f"DEBUG: All Possible Orders Keys: {game.game.get_all_possible_orders().keys()}")
 
     # Check structure
     assert isinstance(moves, dict)

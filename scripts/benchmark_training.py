@@ -96,9 +96,7 @@ class BenchmarkResult:
         print(f"   Total wall time:    {self.total_duration_s:.2f}s")
         print(f"   Warmup time:        {self.warmup_duration_s:.2f}s")
         print(f"   Training time:      {self.training_duration_s:.2f}s")
-        print(
-            f"   Avg step time:      {self.training_duration_s / max(1, self.total_steps):.2f}s"
-        )
+        print(f"   Avg step time:      {self.training_duration_s / max(1, self.total_steps):.2f}s")
 
         print("\n📊 Throughput:")
         print(f"   Total trajectories: {self.total_trajectories}")
@@ -221,13 +219,9 @@ def run_benchmark(
         rollout_start = time.time()
 
         step_trajectories = []
-        for i, res in enumerate(
-            run_rollout.map([cfg.model_dump()] * num_groups_per_step)
-        ):
+        for i, res in enumerate(run_rollout.map([cfg.model_dump()] * num_groups_per_step)):
             step_trajectories.extend(res)
-            print(
-                f"   [{i + 1}/{num_groups_per_step}] Rollout complete: {len(res)} trajectories"
-            )
+            print(f"   [{i + 1}/{num_groups_per_step}] Rollout complete: {len(res)} trajectories")
 
         rollout_duration = time.time() - rollout_start
         all_trajectories.extend(step_trajectories)
@@ -273,8 +267,7 @@ def run_benchmark(
         total_trajectories=total_trajectories,
         total_simulated_years=total_simulated_years,
         trajectories_per_second=total_trajectories / max(0.001, training_duration),
-        simulated_years_per_second=total_simulated_years
-        / max(0.001, training_duration),
+        simulated_years_per_second=total_simulated_years / max(0.001, training_duration),
         profile_snapshots=profile_snapshots if profile_enabled else None,
     )
 
@@ -320,9 +313,7 @@ def run_full_training_benchmark(
 
     Note: Requires the train_grpo_benchmark function to be deployed.
     """
-    print(
-        f"\n🚀 Starting FULL Training Benchmark (with model updates, lr={learning_rate})"
-    )
+    print(f"\n🚀 Starting FULL Training Benchmark (with model updates, lr={learning_rate})")
 
     total_start = time.time()
 
@@ -332,9 +323,7 @@ def run_full_training_benchmark(
         warmup_duration = warmup_inference_engine()
 
     # Launch the benchmark training function
-    train_grpo_benchmark = modal.Function.from_name(
-        "diplomacy-grpo", "train_grpo_benchmark"
-    )
+    train_grpo_benchmark = modal.Function.from_name("diplomacy-grpo", "train_grpo_benchmark")
 
     training_start = time.time()
 
@@ -376,9 +365,7 @@ def run_full_training_benchmark(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Benchmark the GRPO training pipeline on Modal"
-    )
+    parser = argparse.ArgumentParser(description="Benchmark the GRPO training pipeline on Modal")
     parser.add_argument(
         "--smoke",
         action="store_true",
@@ -457,8 +444,7 @@ def main():
     profile_name = args.profile_name
     if profile_mode and not profile_name:
         profile_name = (
-            args.name
-            or f"profile-{profile_mode}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            args.name or f"profile-{profile_mode}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         )
 
     if args.full:

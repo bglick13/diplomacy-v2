@@ -19,7 +19,7 @@ def _build_orders(valid_moves: dict[str, list[str]] | None) -> str:
 class _LocalInferenceEngineHandle:
     """Minimal synchronous stub used during local pytest runs."""
 
-    def __call__(self) -> "_LocalInferenceEngineHandle":
+    def __call__(self) -> _LocalInferenceEngineHandle:
         return self
 
     class _GenerateMethod:
@@ -44,4 +44,4 @@ def pytest_configure():
             return _LocalInferenceEngineHandle()
         return original_from_name(app_name, cls_name)
 
-    modal.Cls.from_name = _from_name
+    modal.Cls.from_name = _from_name  # type: ignore[assignment]

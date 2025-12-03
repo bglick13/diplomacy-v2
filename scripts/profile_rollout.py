@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+
 from scripts.benchmark_training import (
     _persist_profile_snapshot,
     run_benchmark,
@@ -75,15 +76,9 @@ def main():
         help="Which pipeline stage to profile (default: trainer).",
     )
     parser.add_argument("--steps", type=int, default=2, help="Number of steps to run.")
-    parser.add_argument(
-        "--groups", type=int, default=2, help="Rollout groups per step (G)."
-    )
-    parser.add_argument(
-        "--samples", type=int, default=2, help="Samples per group (N)."
-    )
-    parser.add_argument(
-        "--horizon", type=int, default=1, help="Rollout horizon in years."
-    )
+    parser.add_argument("--groups", type=int, default=2, help="Rollout groups per step (G).")
+    parser.add_argument("--samples", type=int, default=2, help="Samples per group (N).")
+    parser.add_argument("--horizon", type=int, default=1, help="Rollout horizon in years.")
     parser.add_argument(
         "--lr", type=float, default=1e-5, help="Learning rate for trainer profiling."
     )
