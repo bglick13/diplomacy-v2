@@ -23,7 +23,10 @@ class ExperimentConfig(BaseModel):
 
     # Environment Settings
     rollout_horizon_years: int = 2
-    rollout_visualize_chance: float = 0.1
+    rollout_visualize_chance: float = 0.0
+    enable_rollout_replays: bool = False
+    use_state_cache: bool = False
+    compact_prompts: bool = False  # Minify prompts to reduce token count ~30-40%
 
     # Training Loop
     total_steps: int = 10
