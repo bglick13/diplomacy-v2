@@ -324,7 +324,7 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
 
     import cloudpickle
 
-    from src.agents import LLMAgent
+    from src.agents import LLMAgent, PromptConfig
     from src.engine.wrapper import DiplomacyWrapper
     from src.utils.config import ExperimentConfig
     from src.utils.observability import (
@@ -368,7 +368,8 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
         should_visualize = random.random() < cfg.rollout_visualize_chance
 
         # Initialize the LLM agent for prompt generation
-        agent = LLMAgent()
+        prompt_config = PromptConfig(compact_mode=cfg.compact_prompts)
+        agent = LLMAgent(config=prompt_config)
 
         # 1. THE WARMUP (Generate a random state)
         # ---------------------------------------
@@ -1026,6 +1027,7 @@ def train_grpo_benchmark(
     learning_rate: float = 1e-5,
     profiling_mode: str | None = None,
     profile_run_name: str | None = None,
+    compact_prompts: bool = False,
 ) -> dict:
     """
     Benchmark version of GRPO training with configurable parameters.
@@ -1069,6 +1071,7 @@ def train_grpo_benchmark(
         rollout_visualize_chance=0.0,  # Disable visualization for speed
         profiling_mode=profiling_mode if profiling_mode is None else ProfilingMode(profiling_mode),  # type: ignore[arg-type]
         profile_run_name=profile_run_name or run_name,
+        compact_prompts=compact_prompts,
     )
 
     model_id = "Qwen/Qwen2.5-7B-Instruct"
