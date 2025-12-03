@@ -41,8 +41,6 @@ class BenchmarkResult:
     num_groups_per_step: int
     samples_per_group: int
     rollout_horizon_years: int
-    run_name: str | None = None
-    trace_dir: str | None = None
 
     # Timing
     total_duration_s: float
@@ -54,6 +52,9 @@ class BenchmarkResult:
     total_simulated_years: int
     trajectories_per_second: float
     simulated_years_per_second: float
+
+    run_name: str | None = None
+    trace_dir: str | None = None
 
     # Training metrics (from final step)
     final_loss: float | None = None
@@ -76,12 +77,6 @@ class BenchmarkResult:
             },
             "snapshots": self.profile_snapshots or [],
         }
-
-
-def _persist_profile_snapshot(profile_name: str, payload: dict[str, Any]) -> None:
-    """Persist profiling payload to Modal volume via helper function."""
-    persist_fn = modal.Function.from_name("diplomacy-grpo", "persist_profile_snapshot")
-    persist_fn.call(profile_name, payload)
 
     def print_report(self):
         """Print a formatted benchmark report."""
@@ -118,6 +113,12 @@ def _persist_profile_snapshot(profile_name: str, payload: dict[str, Any]) -> Non
             print(f"   Reward Mean:        {self.final_reward_mean:.2f}")
 
         print("\n" + "=" * 60)
+
+
+def _persist_profile_snapshot(profile_name: str, payload: dict[str, Any]) -> None:
+    """Persist profiling payload to Modal volume via helper function."""
+    persist_fn = modal.Function.from_name("diplomacy-grpo", "persist_profile_snapshot")
+    persist_fn.remote(profile_name, payload)
 
 
 def warmup_inference_engine() -> float:
@@ -194,7 +195,7 @@ def run_benchmark(
         samples_per_group=samples_per_group,
         rollout_horizon_years=rollout_horizon_years,
         rollout_visualize_chance=0.0,  # Disable visualization for benchmarks
-        profiling_mode=profiling_mode,
+        profiling_mode=profiling_mode,  # pyright: ignore[reportArgumentType]
         profile_run_name=run_name,
     )
 

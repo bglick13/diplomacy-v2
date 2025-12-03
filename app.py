@@ -635,8 +635,8 @@ def train_grpo():
     from src.training.trainer import process_trajectories
     from src.utils.config import ExperimentConfig
     from src.utils.observability import (
-        axiom,
         GPUStatsLogger,
+        axiom,
         log_checkpoint_saved,
         log_training_complete,
         log_training_error,
@@ -1085,11 +1085,16 @@ def train_grpo_benchmark(
     profile_snapshots: list[dict[str, float]] = []
 
     from contextlib import contextmanager
+
     from torch.profiler import (
         ProfilerActivity,
-        profile as torch_profile,
-        schedule as profiler_schedule,
         tensorboard_trace_handler,
+    )
+    from torch.profiler import (
+        profile as torch_profile,
+    )
+    from torch.profiler import (
+        schedule as profiler_schedule,
     )
 
     @contextmanager
@@ -1232,7 +1237,9 @@ def train_grpo_benchmark(
         for step in range(cfg.total_steps):
             step_start = time.time()
             step_metrics = {"step": step}
-            step_profile: dict[str, float] | None = {"step": step} if profile_enabled else None
+            step_profile: dict[str, float] | None = (
+                {"step": step} if profile_enabled else None
+            )
 
             # A. Wait for CURRENT rollouts (the earlier batch)
             rollout_start = time.time()
