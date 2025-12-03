@@ -297,6 +297,9 @@ class InferenceEngine:
 # ==============================================================================
 
 
+CURRENT_ROLLOUT_LORA: str | None = None
+
+
 @app.function(
     image=cpu_image,
     cpu=1.0,
@@ -343,14 +346,18 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
     # We just need to reload the volume to see newly committed adapter files
     if lora_name:
         logger.info(f"📂 Using LoRA adapter: {lora_name}")
-        volume.reload()  # Ensure we see the latest adapter files
-        # Verify the adapter exists
-        full_path = f"/data/models/{lora_name}"
-        if os.path.exists(full_path):
-            files = os.listdir(full_path)
-            logger.info(f"✅ LoRA adapter found at {full_path}. Files: {files}")
+        global CURRENT_ROLLOUT_LORA
+        if CURRENT_ROLLOUT_LORA != lora_name:
+            volume.reload()  # Ensure we see the latest adapter files
+            full_path = f"/data/models/{lora_name}"
+            if os.path.exists(full_path):
+                files = os.listdir(full_path)
+                logger.info(f"✅ LoRA adapter found at {full_path}. Files: {files}")
+                CURRENT_ROLLOUT_LORA = lora_name
+            else:
+                logger.error(f"❌ LoRA adapter NOT found at: {full_path}")
         else:
-            logger.error(f"❌ LoRA adapter NOT found at: {full_path}")
+            logger.info(f"📂 Adapter already cached locally: {lora_name}")
 
     rollout_start_time = time.time()
     rollout_id = ""

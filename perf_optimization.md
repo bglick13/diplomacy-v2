@@ -44,6 +44,7 @@ Training is too slow to run experiments and learn anything meaningful at a reaso
 ### 1. Rollout & environment throughput
 **Opportunities**
 - Warm start reuse: instead of random warmup each rollout, maintain a library of frozen game states sampled offline and store them in `diplomacy-data`. Each worker loads a seed state via `cloudpickle`—skip 30‑60 s of inference before the fork.
+    - This is on hold until we figure out how to keep the cache somewhat up to date. It's important the warmup phase leaves us in a game state reachable by the latest policy model
 - Persistent LoRA cache: keep the latest adapter mounted inside the worker between rollouts. Only call `volume.reload()` when the adapter version changes.
 - Async fork pipeline: convert `run_rollout` to `asyncio` tasks per cloned game. Today we iterate `active_indices` serially; we can schedule inference + parsing concurrently to hide CPU work.
 - Batch prompts more aggressively: combine prompts across *multiple rollout workers* (Modal map) by introducing a rollout broker that aggregates `prompts/valid_moves` before calling vLLM, keeping GPU micro-batches near 128 sequences.
