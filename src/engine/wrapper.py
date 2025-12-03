@@ -17,6 +17,7 @@ class DiplomacyWrapper:
         self.game = diplomacy.Game(game_id=game_id)
         self.max_years = horizon
         self.start_year = self.get_year()
+        self._orders_cache: tuple[str, dict] | None = None
 
     def is_done(self) -> bool:
         if self.game.is_game_done:
@@ -25,6 +26,13 @@ class DiplomacyWrapper:
         if self.get_year() >= self.start_year + self.max_years:
             return True
         return False
+
+    def _get_possible_orders(self) -> dict[str, list[str]]:
+        """Get all possible orders, cached per phase to avoid redundant engine calls."""
+        phase_key = f"{self.game.phase}"
+        if not self._orders_cache or self._orders_cache[0] != phase_key:
+            self._orders_cache = (phase_key, self.game.get_all_possible_orders())
+        return self._orders_cache[1]
 
     def get_current_phase(self) -> str:
         # Just return the standard phase string (e.g. "SPRING 1901 MOVEMENT")
@@ -59,7 +67,7 @@ class DiplomacyWrapper:
             return {}
 
         phase_type = str(self.game.phase_type)
-        possible_orders = self.game.get_all_possible_orders()
+        possible_orders = self._get_possible_orders()
 
         if phase_type == "A":  # Adjustment phase (builds/disbands)
             return self._get_adjustment_moves(power_name, possible_orders)
@@ -162,6 +170,7 @@ class DiplomacyWrapper:
             self._step_movement(orders)
 
         self.game.process()
+        self._orders_cache = None
 
     def _step_movement(self, orders: list[str]):
         """Handle movement/retreat phase orders."""
