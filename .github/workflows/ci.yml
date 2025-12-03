@@ -13,9 +13,28 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: uv sync
-      - name: Run lint
+        run: uv sync --extra dev
+      - name: Run ruff lint
         run: uv run ruff check .
+      - name: Run ruff format check
+        run: uv run ruff format --check .
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v2
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install pyright
+        run: npm install -g pyright
+      - name: Run type check
+        run: pyright --pythonversion 3.12 --exclude external
   tests:
     runs-on: ubuntu-latest
     steps:
