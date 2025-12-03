@@ -1,4 +1,5 @@
 import os
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -922,6 +923,30 @@ def train_grpo():
             learning_rate=learning_rate,
         )
 
+        buffer_depth = max(1, min(cfg.buffer_depth, cfg.max_policy_lag_steps + 1))
+        rollout_queue: deque[dict[str, Any]] = deque()
+        lora_versions: dict[int, str | None] = {0: None}
+        latest_policy_version = 0
+        launched_batches = 0
+
+        def enqueue_rollout_batch(policy_version: int):
+            lora_name = lora_versions.get(policy_version)
+            handles = [
+                run_rollout.spawn(cfg.model_dump(), kwargs={"lora_name": lora_name})
+                for _ in range(cfg.num_groups_per_step)
+            ]
+            rollout_queue.append(
+                {
+                    "handles": handles,
+                    "policy_version": policy_version,
+                    "lora_name": lora_name,
+                }
+            )
+
+        while len(rollout_queue) < min(buffer_depth, cfg.total_steps):
+            enqueue_rollout_batch(latest_policy_version)
+            launched_batches += 1
+
         # ======================================================================
         # 2. Training Loop
         # ======================================================================
@@ -931,17 +956,14 @@ def train_grpo():
             # ==================================================================
             # A. Save Current Policy for Rollout Workers
             # ==================================================================
-            # On step 0, we haven't trained yet so use base model (no LoRA)
-            # On subsequent steps, use the trained adapter
-            lora_name_for_rollout = None
             if step > 0:
-                # Save adapter to volume
                 adapter_rel_path = f"{cfg.run_name}/adapter_v{step}"
                 adapter_full_path = MODELS_PATH / cfg.run_name / f"adapter_v{step}"
                 policy_model.save_pretrained(str(adapter_full_path))
                 volume.commit()
-                # Pass relative name for vLLM's filesystem resolver
-                lora_name_for_rollout = adapter_rel_path
+                lora_versions[step] = adapter_rel_path
+                latest_policy_version = step
+                InferenceEngine().preload_lora.remote(adapter_rel_path)
 
                 log_checkpoint_saved(
                     step=step,
@@ -956,23 +978,40 @@ def train_grpo():
                     f"\n{'=' * 60}\n Step {step}/{cfg.total_steps}: Using base model (no LoRA)\n{'=' * 60}"
                 )
 
+            if not rollout_queue:
+                enqueue_rollout_batch(latest_policy_version)
+                launched_batches += 1
+
+            batch_metadata = rollout_queue.popleft()
+
             # ==================================================================
             # B. Launch Rollouts (E-Step: Expectation/Sampling)
             # ==================================================================
             rollout_start = time.time()
 
-            with stopwatch(f"Rollout_Step_{step}"):
-                rollout_futures = run_rollout.map(
-                    [cfg.model_dump()] * cfg.num_groups_per_step,
-                    kwargs={"lora_name": lora_name_for_rollout},
-                )
-
+            with stopwatch(
+                f"Rollout_Step_{step} (policy_v={batch_metadata['policy_version']})"
+            ):
                 raw_trajectories = []
-                for res in rollout_futures:
-                    raw_trajectories.extend(res)
+                for handle in batch_metadata["handles"]:
+                    raw_trajectories.extend(handle.get())
 
             rollout_duration_ms = int((time.time() - rollout_start) * 1000)
-            logger.info(f"Collected {len(raw_trajectories)} trajectories")
+            policy_lag_steps = max(
+                0, latest_policy_version - batch_metadata["policy_version"]
+            )
+            if policy_lag_steps > cfg.max_policy_lag_steps:
+                logger.warning(
+                    "⚠️ Policy lag %s exceeds budget %s",
+                    policy_lag_steps,
+                    cfg.max_policy_lag_steps,
+                )
+            logger.info(
+                "Collected %s trajectories (policy_version=%s, lag=%s)",
+                len(raw_trajectories),
+                batch_metadata["policy_version"],
+                policy_lag_steps,
+            )
 
             # Skip step if no trajectories (all rollouts failed)
             if not raw_trajectories:
@@ -1088,6 +1127,9 @@ def train_grpo():
                 rollout_duration_ms=rollout_duration_ms,
                 training_duration_ms=training_duration_ms,
                 total_tokens=traj_stats.total_tokens,
+                policy_lag_steps=policy_lag_steps,
+                buffer_depth=buffer_depth,
+                pending_batches=len(rollout_queue),
             )
 
             # Log to WandB (rich visualizations)
@@ -1126,8 +1168,18 @@ def train_grpo():
                         if training_duration_ms > 0
                         else 0
                     ),
+                "policy/lag_steps": policy_lag_steps,
+                "buffer/depth": buffer_depth,
+                "buffer/pending_batches": len(rollout_queue),
                 }
             )
+
+            while (
+                launched_batches < cfg.total_steps
+                and len(rollout_queue) < buffer_depth
+            ):
+                enqueue_rollout_batch(latest_policy_version)
+                launched_batches += 1
 
             # Flush Axiom events periodically
             if step % 5 == 0:
@@ -1219,8 +1271,11 @@ def train_grpo_benchmark(
     samples_per_group: int = 4,
     rollout_horizon_years: int = 1,
     learning_rate: float = 1e-5,
-    profiling_mode: str | None = None,
+    profiling_mode: ProfilingMode | None = None,
     profile_run_name: str | None = None,
+    buffer_depth: int = 2,
+    max_policy_lag_steps: int = 1,
+    compact_prompts: bool = False,
 ) -> dict:
     """
     Benchmark version of GRPO training with configurable parameters.
@@ -1262,6 +1317,9 @@ def train_grpo_benchmark(
         rollout_visualize_chance=0.0,  # Disable visualization for speed
         profiling_mode=profiling_mode,
         profile_run_name=profile_run_name or run_name,
+        buffer_depth=buffer_depth,
+        max_policy_lag_steps=max_policy_lag_steps,
+        compact_prompts=compact_prompts,
     )
 
     model_id = "Qwen/Qwen2.5-7B-Instruct"
