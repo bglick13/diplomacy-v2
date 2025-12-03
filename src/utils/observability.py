@@ -477,47 +477,55 @@ def log_training_step(
     rollout_duration_ms: int,
     training_duration_ms: int,
     total_tokens: int,
+    policy_lag_steps: int | None = None,
+    buffer_depth: int | None = None,
+    pending_batches: int | None = None,
 ):
     """Log a training step with comprehensive metrics."""
     console_logger.info(
         f"📈 Step {step}: loss={loss:.4f} | pg={pg_loss:.4f} | kl={kl:.4f} | "
         f"grad_norm={grad_norm:.4f} | reward_mean={reward_mean:.2f}"
     )
-    axiom.log(
-        {
-            "event": EventType.TRAINING_STEP,
-            "step": step,
-            # Core losses
-            "loss": loss,
-            "pg_loss": pg_loss,
-            "kl": kl,
-            "grad_norm": grad_norm,
-            "learning_rate": learning_rate,
-            # Reward stats
-            "reward_mean": reward_mean,
-            "reward_std": reward_std,
-            "reward_min": reward_min,
-            "reward_max": reward_max,
-            # Trajectory stats
-            "num_trajectories": num_trajectories,
-            "num_groups": num_groups,
-            "skipped_groups": skipped_groups,
-            # LogProb details
-            "mean_completion_logprob": mean_completion_logprob,
-            "mean_ref_logprob": mean_ref_logprob,
-            "mean_advantage": mean_advantage,
-            "advantage_std": advantage_std,
-            # Timing & throughput
-            "rollout_duration_ms": rollout_duration_ms,
-            "training_duration_ms": training_duration_ms,
-            "total_tokens": total_tokens,
-            "tokens_per_second": (
-                total_tokens / (training_duration_ms / 1000)
-                if training_duration_ms > 0
-                else 0
-            ),
-        }
-    )
+    event_payload = {
+        "event": EventType.TRAINING_STEP,
+        "step": step,
+        # Core losses
+        "loss": loss,
+        "pg_loss": pg_loss,
+        "kl": kl,
+        "grad_norm": grad_norm,
+        "learning_rate": learning_rate,
+        # Reward stats
+        "reward_mean": reward_mean,
+        "reward_std": reward_std,
+        "reward_min": reward_min,
+        "reward_max": reward_max,
+        # Trajectory stats
+        "num_trajectories": num_trajectories,
+        "num_groups": num_groups,
+        "skipped_groups": skipped_groups,
+        # LogProb details
+        "mean_completion_logprob": mean_completion_logprob,
+        "mean_ref_logprob": mean_ref_logprob,
+        "mean_advantage": mean_advantage,
+        "advantage_std": advantage_std,
+        # Timing & throughput
+        "rollout_duration_ms": rollout_duration_ms,
+        "training_duration_ms": training_duration_ms,
+        "total_tokens": total_tokens,
+        "tokens_per_second": (
+            total_tokens / (training_duration_ms / 1000)
+            if training_duration_ms > 0
+            else 0
+        ),
+    }
+    if policy_lag_steps is not None:
+        event_payload["policy_lag_steps"] = policy_lag_steps
+    if buffer_depth is not None:
+        event_payload["buffer_depth"] = buffer_depth
+    if pending_batches is not None:
+        event_payload["pending_rollout_batches"] = pending_batches
+    axiom.log(event_payload)
 
 
 def log_checkpoint_saved(step: int, adapter_path: str, run_name: str):

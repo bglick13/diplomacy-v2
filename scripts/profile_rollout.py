@@ -29,6 +29,9 @@ def profile_trainer(args: argparse.Namespace):
         skip_warmup=args.no_warmup,
         profiling_mode="trainer",
         profile_run_name=profile_name,
+        buffer_depth=args.buffer_depth,
+        max_policy_lag_steps=args.policy_lag,
+        compact_prompts=args.compact_prompts,
     )
     payload = result.to_profile_payload("trainer")
     _persist_profile_snapshot(profile_name, payload)
@@ -53,6 +56,9 @@ def profile_rollouts(args: argparse.Namespace):
         skip_warmup=args.no_warmup,
         run_name=args.name,
         profiling_mode="rollout",
+        buffer_depth=args.buffer_depth,
+        max_policy_lag_steps=args.policy_lag,
+        compact_prompts=args.compact_prompts,
     )
     payload = result.to_profile_payload("rollout")
     _persist_profile_snapshot(profile_name, payload)
@@ -103,6 +109,23 @@ def main():
         type=str,
         default=None,
         help="Custom identifier for persisted profiling payloads.",
+    )
+    parser.add_argument(
+        "--buffer-depth",
+        type=int,
+        default=2,
+        help="Rollout queue depth when profiling.",
+    )
+    parser.add_argument(
+        "--policy-lag",
+        type=int,
+        default=1,
+        help="Maximum allowed policy lag when profiling.",
+    )
+    parser.add_argument(
+        "--compact-prompts",
+        action="store_true",
+        help="Use compact prompt template during profiling runs.",
     )
 
     args = parser.parse_args()

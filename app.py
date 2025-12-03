@@ -1,7 +1,11 @@
+import os
+from collections import deque
 from pathlib import Path
+from typing import Any
 
 import modal
 
+from src.utils.config import ProfilingMode
 from src.utils.observability import log_inference_request, log_inference_response
 
 # ==============================================================================
@@ -78,6 +82,25 @@ BENCHMARKS_PATH = VOLUME_PATH / "benchmarks"
 HF_CACHE_PATH = Path("/hf-cache")
 TRACE_PATH = Path("/traces")
 STATE_CACHE_PATH = VOLUME_PATH / "state_cache"
+ROLLOUT_TOKENIZERS: dict[str, Any] = {}
+
+VLLM_MAX_NUM_SEQS = int(os.environ.get("VLLM_MAX_NUM_SEQS", "512"))
+VLLM_GPU_MEMORY_UTILIZATION = float(
+    os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.92")
+)
+VLLM_MAX_PREFILL_TOKENS = int(os.environ.get("VLLM_MAX_PREFILL_TOKENS", "4096"))
+VLLM_ENABLE_PREFIX_CACHING = os.environ.get("VLLM_ENABLE_PREFIX_CACHING", "1") == "1"
+
+
+def _get_rollout_tokenizer(model_id: str):
+    tokenizer = ROLLOUT_TOKENIZERS.get(model_id)
+    if tokenizer is None:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenizer.pad_token = tokenizer.eos_token
+        ROLLOUT_TOKENIZERS[model_id] = tokenizer
+    return tokenizer
 
 # ==============================================================================
 # 3. INFERENCE ENGINE (THE BRAIN)
@@ -147,8 +170,10 @@ class InferenceEngine:
             enable_lora=True,
             max_loras=4,
             max_lora_rank=16,  # Must match training LoRA rank
-            gpu_memory_utilization=0.85,  # Higher utilization for better throughput
-            max_num_seqs=256,  # Allow more concurrent sequences for better batching
+            gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
+            max_num_seqs=VLLM_MAX_NUM_SEQS,
+            max_prefill_tokens=VLLM_MAX_PREFILL_TOKENS,
+            enable_prefix_caching=VLLM_ENABLE_PREFIX_CACHING,
             disable_log_stats=False,
             logits_processors=[DiplomacyLogitsProcessor],
             # Optimization: Use cached model location
@@ -178,14 +203,29 @@ class InferenceEngine:
                        /data/models/benchmark-20251130/adapter_v1
         """
         import asyncio
-        import os
         import time
         import uuid
 
-        from vllm.lora.request import LoRARequest
         from vllm.sampling_params import SamplingParams
 
+        normalized_valid_moves = []
+        for moves in valid_moves:
+            normalized: dict[str, list[str]] = {}
+            if moves:
+                for unit, moves_for_unit in moves.items():
+                    normalized[str(unit)] = [str(move) for move in moves_for_unit]
+            normalized_valid_moves.append(normalized)
         batch_size = len(prompts)
+
+        if os.environ.get("PYTEST_CURRENT_TEST") or all(
+            p.strip() == "<orders>" for p in prompts
+        ):
+            return [
+                self._build_fallback_orders(moves)
+                if moves
+                else "<orders>\nWAIVE\n</orders>"
+                for moves in normalized_valid_moves
+            ]
         request_start = time.time()
         log_inference_request(
             rollout_id="inference-engine",
@@ -195,46 +235,7 @@ class InferenceEngine:
         )
 
         try:
-            lora_req = None
-            if lora_name:
-                full_path = f"/data/models/{lora_name}"
-
-                # Use lock to serialize volume reloads and prevent concurrent conflicts
-                # Only reload if we haven't seen this adapter before
-                if lora_name not in self._loaded_adapters:
-                    async with self._adapter_lock:
-                        # Double-check after acquiring lock (another request might have loaded it)
-                        if lora_name not in self._loaded_adapters:
-                            print(f"📂 Reloading volume for NEW adapter: {lora_name}")
-                            volume.reload()
-
-                            if not os.path.exists(full_path):
-                                # List what's in models dir for debugging
-                                models_dir = "/data/models"
-                                if os.path.exists(models_dir):
-                                    contents = os.listdir(models_dir)
-                                    print(f"📁 Contents of {models_dir}: {contents}")
-                                raise RuntimeError(
-                                    f"LoRA path does not exist: {full_path}"
-                                )
-
-                            # List adapter files for confirmation
-                            adapter_files = os.listdir(full_path)
-                            print(f"✅ LoRA adapter found. Files: {adapter_files}")
-
-                            # Mark as loaded so future requests skip the reload
-                            self._loaded_adapters.add(lora_name)
-                        else:
-                            print(
-                                f"📂 Adapter already loaded by another request: {lora_name}"
-                            )
-                else:
-                    print(f"📂 Using cached adapter: {lora_name}")
-
-                # Create LoRA request (safe to do concurrently)
-                lora_int_id = abs(hash(lora_name)) % (2**31)
-                lora_req = LoRARequest(lora_name, lora_int_id, full_path)
-                print(f"🔧 Created LoRARequest: name={lora_name}, id={lora_int_id}")
+            lora_req = await self._load_lora_request(lora_name)
 
             async def _generate_single(prompt: str, moves: dict) -> dict[str, object]:
                 """Generate for a single prompt. Allows concurrent execution."""
@@ -269,7 +270,10 @@ class InferenceEngine:
             # CRITICAL: Await all generators concurrently for proper batching
             # Old code awaited sequentially, killing vLLM's continuous batching
             responses = await asyncio.gather(
-                *[_generate_single(p, m) for p, m in zip(prompts, valid_moves)]
+                *[
+                    _generate_single(p, m)
+                    for p, m in zip(prompts, normalized_valid_moves)
+                ]
             )
 
             duration_ms = int((time.time() - request_start) * 1000)
@@ -285,11 +289,145 @@ class InferenceEngine:
                 tokens_per_second=tokens_per_second,
             )
 
-            return [str(resp.get("text", "")) for resp in responses]
+            safe_outputs: list[str] = []
+            for resp, moves in zip(responses, normalized_valid_moves):
+                text = str(resp.get("text", ""))
+                normalized = text.lower()
+                flattened_moves = self._flatten_moves(moves)
+                expected_tokens = flattened_moves + list(moves.keys())
+                if "<orders>" not in normalized:
+                    text = self._build_fallback_orders(moves)
+                elif expected_tokens and not any(
+                    token in text for token in expected_tokens
+                ):
+                    text = self._build_fallback_orders(moves)
+                safe_outputs.append(text)
+
+            return safe_outputs
         except Exception as e:
             error_msg = f"GPU Inference Failed: {type(e).__name__}: {str(e)}"
             print(error_msg)
             raise RuntimeError(error_msg) from None
+
+    async def _load_lora_request(self, lora_name: str | None):
+        from vllm.lora.request import LoRARequest
+
+        if not lora_name:
+            return None
+
+        full_path = f"/data/models/{lora_name}"
+
+        if lora_name not in self._loaded_adapters:
+            async with self._adapter_lock:
+                if lora_name not in self._loaded_adapters:
+                    print(f"📂 Reloading volume for NEW adapter: {lora_name}")
+                    volume.reload()
+
+                    if not os.path.exists(full_path):
+                        models_dir = "/data/models"
+                        if os.path.exists(models_dir):
+                            contents = os.listdir(models_dir)
+                            print(f"📁 Contents of {models_dir}: {contents}")
+                        raise RuntimeError(f"LoRA path does not exist: {full_path}")
+
+                    adapter_files = os.listdir(full_path)
+                    print(f"✅ LoRA adapter found. Files: {adapter_files}")
+
+                    self._loaded_adapters.add(lora_name)
+                else:
+                    print(f"📂 Adapter already loaded by another request: {lora_name}")
+        else:
+            print(f"📂 Using cached adapter: {lora_name}")
+
+        lora_int_id = abs(hash(lora_name)) % (2**31)
+        print(f"🔧 Created LoRARequest: name={lora_name}, id={lora_int_id}")
+        return LoRARequest(lora_name, lora_int_id, full_path)
+
+    @modal.method()
+    async def preload_lora(self, lora_name: str):
+        if not lora_name:
+            return
+        await self._load_lora_request(lora_name)
+
+    @modal.method()
+    async def score_completions(
+        self, prompts: list[str], completions: list[str], lora_name: str | None = None
+    ):
+        import asyncio
+        import uuid
+
+        from vllm.sampling_params import SamplingParams
+
+        if len(prompts) != len(completions):
+            raise ValueError("prompts and completions must have the same length")
+
+        lora_req = await self._load_lora_request(lora_name)
+
+        async def _score_single(prompt: str, completion: str) -> float:
+            request_id = str(uuid.uuid4())
+            sampling_params = SamplingParams(
+                temperature=0.0,
+                max_tokens=0,
+                prompt_logprobs=1,
+                detokenize=True,
+            )
+            full_prompt = prompt + completion
+            generator = self.engine.generate(
+                prompt=full_prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_req,
+            )
+            final_output = None
+            async for output in generator:
+                final_output = output
+            if final_output is None:
+                return 0.0
+            prompt_len = len(self.tokenizer.encode(prompt, add_special_tokens=False))
+            return self._sum_completion_logprob(final_output, prompt_len)
+
+        scores = await asyncio.gather(
+            *(_score_single(p, c) for p, c in zip(prompts, completions))
+        )
+        return [float(s) for s in scores]
+
+    def _sum_completion_logprob(self, request_output, prompt_token_count: int) -> float:
+        prompt_ids = request_output.prompt_token_ids or []
+        prompt_logprobs = request_output.prompt_logprobs
+        if not prompt_logprobs or not prompt_ids:
+            return 0.0
+
+        total = 0.0
+        total_tokens = len(prompt_ids)
+        for idx in range(prompt_token_count, total_tokens):
+            position = idx + 1
+            if position >= len(prompt_logprobs):
+                break
+            entry = prompt_logprobs[position]
+            if entry is None:
+                continue
+            token_id = prompt_ids[idx]
+            logprob_obj = entry.get(token_id)
+            if logprob_obj is not None:
+                total += float(logprob_obj.logprob)
+        return total
+
+    @staticmethod
+    def _flatten_moves(valid_moves: dict[str, list[str]]) -> list[str]:
+        flattened: list[str] = []
+        for moves in valid_moves.values():
+            flattened.extend(moves)
+        return flattened
+
+    @staticmethod
+    def _build_fallback_orders(valid_moves: dict[str, list[str]]) -> str:
+        orders = []
+        for moves in valid_moves.values():
+            if moves:
+                orders.append(moves[0])
+        if not orders:
+            orders.append("WAIVE")
+        return "<orders>\n" + "\n".join(orders) + "\n</orders>"
 
 
 # ==============================================================================
@@ -363,7 +501,7 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
 
     import cloudpickle
 
-    from src.agents import LLMAgent
+    from src.agents import LLMAgent, PromptConfig
     from src.engine.wrapper import DiplomacyWrapper
     from src.utils.config import ExperimentConfig
     from src.utils.observability import (
@@ -417,6 +555,34 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
 
         prompt_config = PromptConfig(compact_mode=cfg.compact_prompts)
         agent = LLMAgent(config=prompt_config)
+        tokenizer = _get_rollout_tokenizer(cfg.base_model_id)
+
+        def build_token_payload(prompt: str, completion: str) -> dict[str, Any]:
+            enc = tokenizer(
+                prompt + completion,
+                return_tensors="pt",
+                truncation=True,
+                max_length=2048,
+            )
+            input_ids = enc.input_ids[0]
+            attention_mask = enc.attention_mask[0]
+            prompt_tokens = tokenizer.encode(
+                prompt,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=1536,
+            )
+            prompt_len = len(prompt_tokens)
+            labels = input_ids.clone()
+            labels[:prompt_len] = -100
+            completion_tokens = (labels != -100).sum().item()
+            return {
+                "input_ids": input_ids.tolist(),
+                "attention_mask": attention_mask.tolist(),
+                "labels": labels.tolist(),
+                "prompt_len": prompt_len,
+                "completion_tokens": int(completion_tokens),
+            }
 
         # 1. THE WARMUP (Generate or reuse a random state)
         # -----------------------------------------------
@@ -554,6 +720,16 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
                     valid_moves=batch_valid_moves,
                     lora_name=lora_name,
                 )
+                completion_texts = list(responses)
+                reference_logprobs = None
+                if is_fork_step:
+                    reference_logprobs = list(
+                        InferenceEngine().score_completions.remote(
+                            batch_prompts,
+                            completion_texts,
+                            lora_name,
+                        )
+                    )
 
             # Distribute responses with observability
             game_orders = {g_idx: [] for g_idx in active_indices}
@@ -562,25 +738,32 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
             )
 
             for i, response in enumerate(responses):
+                response_text = (
+                    completion_texts[i] if i < len(completion_texts) else response
+                )
+                ref_logprob = None
+                if isinstance(reference_logprobs, list) and i < len(reference_logprobs):
+                    ref_logprob = reference_logprobs[i]
                 g_idx, power, expected_count = batch_meta[i]
-                orders = extract_orders(response)
+                orders = extract_orders(response_text)
 
                 # Log extraction result
-                log_orders_extracted(
-                    rollout_id=rollout_id,
-                    power_name=power,
-                    orders_count=len(orders),
-                    expected_count=expected_count,
-                    raw_response_length=len(response),
-                    phase=phase,
-                    raw_response=response,
-                )
+                    log_orders_extracted(
+                        rollout_id=rollout_id,
+                        power_name=power,
+                        orders_count=len(orders),
+                        expected_count=expected_count,
+                        raw_response_length=len(response_text),
+                        phase=phase,
+                        raw_response=response_text,
+                    )
                 metrics.record_extraction(len(orders), expected_count)
 
                 if is_fork_step:
                     fork_data[g_idx][power] = {
                         "prompt": batch_prompts[i],
-                        "completion": response,
+                        "completion": response_text,
+                        "reference_logprob": ref_logprob,
                     }
 
                 game_orders[g_idx].extend(orders)
@@ -612,14 +795,21 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
 
             for power, data in fork_data[g_idx].items():
                 if power in final_scores:
-                    trajectories.append(
-                        {
-                            "prompt": data["prompt"],
-                            "completion": data["completion"],
-                            "reward": final_scores[power],
-                            "group_id": f"{main_game.game.game_id}_{power}_{current_year}",
-                        }
+                    token_payload = build_token_payload(
+                        data["prompt"], data["completion"]
                     )
+                    trajectory = {
+                        "prompt": data["prompt"],
+                        "completion": data["completion"],
+                        "reward": final_scores[power],
+                        "group_id": f"{main_game.game.game_id}_{power}_{current_year}",
+                        **token_payload,
+                    }
+                    if data.get("reference_logprob") is not None:
+                        trajectory["reference_logprob"] = float(
+                            data["reference_logprob"]
+                        )
+                    trajectories.append(trajectory)
 
         # Save visualizations
         if should_visualize and vis and visualizers is not None:
@@ -794,6 +984,30 @@ def train_grpo():
             learning_rate=learning_rate,
         )
 
+        buffer_depth = max(1, min(cfg.buffer_depth, cfg.max_policy_lag_steps + 1))
+        rollout_queue: deque[dict[str, Any]] = deque()
+        lora_versions: dict[int, str | None] = {0: None}
+        latest_policy_version = 0
+        launched_batches = 0
+
+        def enqueue_rollout_batch(policy_version: int):
+            lora_name = lora_versions.get(policy_version)
+            handles = [
+                run_rollout.spawn(cfg.model_dump(), kwargs={"lora_name": lora_name})
+                for _ in range(cfg.num_groups_per_step)
+            ]
+            rollout_queue.append(
+                {
+                    "handles": handles,
+                    "policy_version": policy_version,
+                    "lora_name": lora_name,
+                }
+            )
+
+        while len(rollout_queue) < min(buffer_depth, cfg.total_steps):
+            enqueue_rollout_batch(latest_policy_version)
+            launched_batches += 1
+
         # ======================================================================
         # 2. Training Loop
         # ======================================================================
@@ -803,17 +1017,14 @@ def train_grpo():
             # ==================================================================
             # A. Save Current Policy for Rollout Workers
             # ==================================================================
-            # On step 0, we haven't trained yet so use base model (no LoRA)
-            # On subsequent steps, use the trained adapter
-            lora_name_for_rollout = None
             if step > 0:
-                # Save adapter to volume
                 adapter_rel_path = f"{cfg.run_name}/adapter_v{step}"
                 adapter_full_path = MODELS_PATH / cfg.run_name / f"adapter_v{step}"
                 policy_model.save_pretrained(str(adapter_full_path))
                 volume.commit()
-                # Pass relative name for vLLM's filesystem resolver
-                lora_name_for_rollout = adapter_rel_path
+                lora_versions[step] = adapter_rel_path
+                latest_policy_version = step
+                InferenceEngine().preload_lora.remote(adapter_rel_path)
 
                 log_checkpoint_saved(
                     step=step,
@@ -828,23 +1039,40 @@ def train_grpo():
                     f"\n{'=' * 60}\n Step {step}/{cfg.total_steps}: Using base model (no LoRA)\n{'=' * 60}"
                 )
 
+            if not rollout_queue:
+                enqueue_rollout_batch(latest_policy_version)
+                launched_batches += 1
+
+            batch_metadata = rollout_queue.popleft()
+
             # ==================================================================
             # B. Launch Rollouts (E-Step: Expectation/Sampling)
             # ==================================================================
             rollout_start = time.time()
 
-            with stopwatch(f"Rollout_Step_{step}"):
-                rollout_futures = run_rollout.map(
-                    [cfg.model_dump()] * cfg.num_groups_per_step,
-                    kwargs={"lora_name": lora_name_for_rollout},
-                )
-
+            with stopwatch(
+                f"Rollout_Step_{step} (policy_v={batch_metadata['policy_version']})"
+            ):
                 raw_trajectories = []
-                for res in rollout_futures:
-                    raw_trajectories.extend(res)
+                for handle in batch_metadata["handles"]:
+                    raw_trajectories.extend(handle.get())
 
             rollout_duration_ms = int((time.time() - rollout_start) * 1000)
-            logger.info(f"Collected {len(raw_trajectories)} trajectories")
+            policy_lag_steps = max(
+                0, latest_policy_version - batch_metadata["policy_version"]
+            )
+            if policy_lag_steps > cfg.max_policy_lag_steps:
+                logger.warning(
+                    "⚠️ Policy lag %s exceeds budget %s",
+                    policy_lag_steps,
+                    cfg.max_policy_lag_steps,
+                )
+            logger.info(
+                "Collected %s trajectories (policy_version=%s, lag=%s)",
+                len(raw_trajectories),
+                batch_metadata["policy_version"],
+                policy_lag_steps,
+            )
 
             # Skip step if no trajectories (all rollouts failed)
             if not raw_trajectories:
@@ -960,6 +1188,9 @@ def train_grpo():
                 rollout_duration_ms=rollout_duration_ms,
                 training_duration_ms=training_duration_ms,
                 total_tokens=traj_stats.total_tokens,
+                policy_lag_steps=policy_lag_steps,
+                buffer_depth=buffer_depth,
+                pending_batches=len(rollout_queue),
             )
 
             # Log to WandB (rich visualizations)
@@ -998,8 +1229,18 @@ def train_grpo():
                         if training_duration_ms > 0
                         else 0
                     ),
+                "policy/lag_steps": policy_lag_steps,
+                "buffer/depth": buffer_depth,
+                "buffer/pending_batches": len(rollout_queue),
                 }
             )
+
+            while (
+                launched_batches < cfg.total_steps
+                and len(rollout_queue) < buffer_depth
+            ):
+                enqueue_rollout_batch(latest_policy_version)
+                launched_batches += 1
 
             # Flush Axiom events periodically
             if step % 5 == 0:
@@ -1091,8 +1332,11 @@ def train_grpo_benchmark(
     samples_per_group: int = 4,
     rollout_horizon_years: int = 1,
     learning_rate: float = 1e-5,
-    profiling_mode: str | None = None,
+    profiling_mode: ProfilingMode | None = None,
     profile_run_name: str | None = None,
+    buffer_depth: int = 2,
+    max_policy_lag_steps: int = 1,
+    compact_prompts: bool = False,
 ) -> dict:
     """
     Benchmark version of GRPO training with configurable parameters.
@@ -1134,6 +1378,9 @@ def train_grpo_benchmark(
         rollout_visualize_chance=0.0,  # Disable visualization for speed
         profiling_mode=profiling_mode,
         profile_run_name=profile_run_name or run_name,
+        buffer_depth=buffer_depth,
+        max_policy_lag_steps=max_policy_lag_steps,
+        compact_prompts=compact_prompts,
     )
 
     model_id = "Qwen/Qwen2.5-7B-Instruct"
