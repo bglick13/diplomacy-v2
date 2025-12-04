@@ -119,13 +119,13 @@ def _persist_profile_snapshot(profile_name: str, payload: dict[str, Any]) -> Non
     persist_fn.remote(profile_name, payload)
 
 
-def warmup_inference_engine() -> float:
+def warmup_inference_engine(model_id: str = "Qwen/Qwen2.5-7B-Instruct") -> float:
     """Warm up the InferenceEngine and return warmup duration."""
     print("🔥 Warming up InferenceEngine...")
     start = time.time()
 
     InferenceEngine = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
-    engine = InferenceEngine()
+    engine = InferenceEngine(model_id=model_id)
 
     # Make a minimal call to trigger container startup
     _ = engine.generate.remote(
@@ -301,6 +301,8 @@ def run_full_training_benchmark(
     profiling_mode: str | None = None,
     profile_run_name: str | None = None,
     compact_prompts: bool = False,
+    rollout_visualize_chance: float = 0.01,
+    model_id: str = "Qwen/Qwen2.5-7B-Instruct",
 ) -> BenchmarkResult:
     """
     Run the FULL training pipeline including model updates.
@@ -321,7 +323,7 @@ def run_full_training_benchmark(
     # Warmup
     warmup_duration = 0.0
     if not skip_warmup:
-        warmup_duration = warmup_inference_engine()
+        warmup_duration = warmup_inference_engine(model_id=model_id)
 
     # Launch the benchmark training function
     train_grpo_benchmark = modal.Function.from_name("diplomacy-grpo", "train_grpo_benchmark")
@@ -338,6 +340,8 @@ def run_full_training_benchmark(
         profiling_mode=profiling_mode,
         profile_run_name=profile_run_name,
         compact_prompts=compact_prompts,
+        rollout_visualize_chance=rollout_visualize_chance,
+        model_id=model_id,
     )
 
     training_duration = time.time() - training_start
@@ -436,6 +440,18 @@ def main():
         action="store_true",
         help="Use compact prompts (default: False)",
     )
+    parser.add_argument(
+        "--rollout-visualize-chance",
+        type=float,
+        default=0.01,
+        help="Chance of visualizing a rollout (default: 0.01)",
+    )
+    parser.add_argument(
+        "--model-id",
+        type=str,
+        default="Qwen/Qwen2.5-7B-Instruct",
+        help="Model ID (default: Qwen/Qwen2.5-7B-Instruct)",
+    )
 
     args = parser.parse_args()
 
@@ -465,6 +481,8 @@ def main():
             profiling_mode=profile_mode,
             profile_run_name=profile_name,
             compact_prompts=args.compact_prompts,
+            rollout_visualize_chance=args.rollout_visualize_chance,
+            model_id=args.model_id,
         )
     else:
         result = run_benchmark(

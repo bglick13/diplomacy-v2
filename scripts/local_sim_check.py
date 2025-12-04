@@ -1,5 +1,6 @@
 from src.agents.baselines import ChaosBot, RandomBot
 from src.engine.wrapper import DiplomacyWrapper
+from src.utils.scoring import calculate_final_scores
 from src.utils.vis import GameVisualizer
 
 
@@ -42,6 +43,9 @@ def run_simulation(agent_class, run_name: str):
 
         # EXECUTE
         game.step(all_orders)
+        scores = calculate_final_scores(game)
+        for power, score in scores.items():
+            logs.append(f"{power}: {score}")
         vis.capture_turn(game.game, "\n".join(logs))
 
     output_file = f"sim_{run_name.lower()}.html"
