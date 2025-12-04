@@ -32,6 +32,8 @@ class GameVisualizer:
             print(f"⚠️ Visualization Warning: Could not render turn. {e}")
 
     def _make_path_if_not_exists(self, filepath: str):
+        if not filepath:
+            return
         if not os.path.exists(filepath):
             os.makedirs(filepath)
 

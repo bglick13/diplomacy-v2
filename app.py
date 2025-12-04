@@ -91,7 +91,7 @@ TRACE_PATH = Path("/traces")
         str(VOLUME_PATH): volume,
         str(HF_CACHE_PATH): hf_cache_volume,  # Cache HuggingFace models
     },
-    container_idle_timeout=300,  # 5 minutes
+    container_idle_timeout=60 * 10,  # 5 minutes
     # Use single container to maximize batching efficiency
     # vLLM batches concurrent requests together for better GPU utilization
     concurrency_limit=1,
