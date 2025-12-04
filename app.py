@@ -404,7 +404,7 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
                 inputs = main_game.get_all_inputs(agent=agent)
                 metrics.inference_calls += 1
 
-                raw_responses = InferenceEngine().generate.remote(
+                raw_responses = await InferenceEngine().generate.remote.aio(
                     prompts=inputs["prompts"],
                     valid_moves=inputs["valid_moves"],
                     lora_name=lora_name,
@@ -462,86 +462,88 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
         target_year = current_year + cfg.rollout_horizon_years
 
         fork_data = {i: {} for i in range(len(games))}
-        active_indices = list(range(len(games)))
-        is_fork_step = True
-        step_count = 0
 
-        # 3. THE GROUP ROLLOUT
+        # 3. THE GROUP ROLLOUT (ASYNC FORK PIPELINE)
         # --------------------------------------------------
-        while active_indices:
-            step_count += 1
-            batch_prompts = []
-            batch_valid_moves = []
-            batch_meta = []  # (game_idx, power_name, expected_orders)
+        # Convert to async tasks per cloned game for concurrent inference + parsing
+        import asyncio
 
-            for g_idx in active_indices:
-                g = games[g_idx]
-                if g.get_year() >= target_year or g.is_done():
-                    continue
+        async def run_game_async(g_idx: int, game: DiplomacyWrapper, vis_obj) -> dict:
+            """Run a single game clone asynchronously until completion."""
+            game_fork_data = {}
+            step_count = 0
 
-                inputs = g.get_all_inputs(agent=agent)
+            while game.get_year() < target_year and not game.is_done():
+                step_count += 1
 
-                for p_idx, power in enumerate(inputs["power_names"]):
-                    batch_prompts.append(inputs["prompts"][p_idx])
-                    batch_valid_moves.append(inputs["valid_moves"][p_idx])
-                    expected = len(inputs["valid_moves"][p_idx])
-                    batch_meta.append((g_idx, power, expected))
+                # Get inputs for all powers in this game
+                inputs = game.get_all_inputs(agent=agent)
 
-            if not batch_prompts:
-                break
+                # Submit inference request for all powers concurrently
+                with stopwatch(
+                    f"Game {g_idx} Step {step_count} (Batch Size: {len(inputs['prompts'])})"
+                ):
+                    metrics.inference_calls += 1
+                    responses = await InferenceEngine().generate.remote.aio(
+                        prompts=inputs["prompts"],
+                        valid_moves=inputs["valid_moves"],
+                        lora_name=lora_name,
+                    )
 
-            # Inference call
-            with stopwatch(f"Rollout Step {step_count} (Batch Size: {len(batch_prompts)})"):
-                metrics.inference_calls += 1
-                responses = InferenceEngine().generate.remote(
-                    prompts=batch_prompts,
-                    valid_moves=batch_valid_moves,
-                    lora_name=lora_name,
-                )
+                # Parse responses and collect orders concurrently
+                all_orders = []
+                phase = game.get_current_phase()
 
-            # Distribute responses with observability
-            game_orders = {g_idx: [] for g_idx in active_indices}
-            phase = games[active_indices[0]].get_current_phase() if active_indices else ""
+                for idx, (response, power) in enumerate(
+                    zip(responses, inputs["power_names"], strict=True)
+                ):
+                    orders = extract_orders(response)
+                    expected_count = len(inputs["valid_moves"][idx])
 
-            for i, response in enumerate(responses):
-                g_idx, power, expected_count = batch_meta[i]
-                orders = extract_orders(response)
+                    # Log extraction result
+                    log_orders_extracted(
+                        rollout_id=rollout_id,
+                        power_name=power,
+                        orders_count=len(orders),
+                        expected_count=expected_count,
+                        raw_response_length=len(response),
+                        phase=phase,
+                        raw_response=response,
+                    )
+                    metrics.record_extraction(len(orders), expected_count)
 
-                # Log extraction result
-                log_orders_extracted(
-                    rollout_id=rollout_id,
-                    power_name=power,
-                    orders_count=len(orders),
-                    expected_count=expected_count,
-                    raw_response_length=len(response),
-                    phase=phase,
-                    raw_response=response,
-                )
-                metrics.record_extraction(len(orders), expected_count)
+                    # Store fork data on first step
+                    if step_count == 1:
+                        game_fork_data[power] = {
+                            "prompt": inputs["prompts"][idx],
+                            "completion": response,
+                        }
 
-                if is_fork_step:
-                    fork_data[g_idx][power] = {
-                        "prompt": batch_prompts[i],
-                        "completion": response,
-                    }
+                    all_orders.extend(orders)
 
-                game_orders[g_idx].extend(orders)
+                # Step the game
+                game.step(all_orders)
 
-            # Step all games
-            next_active = []
-            for g_idx in active_indices:
-                if g_idx in game_orders:
-                    games[g_idx].step(game_orders[g_idx])
-                    if should_visualize and visualizers is not None:
-                        visualizers[g_idx].capture_turn(
-                            games[g_idx].game,
-                            f"Rollout step {step_count}\n{chr(10).join(game_orders[g_idx])}",
-                        )
-                    if not (games[g_idx].get_year() >= target_year or games[g_idx].is_done()):
-                        next_active.append(g_idx)
+                # Update visualization if enabled
+                if should_visualize and vis_obj is not None:
+                    vis_obj.capture_turn(
+                        game.game,
+                        f"Rollout step {step_count}\n{chr(10).join(all_orders)}",
+                    )
 
-            active_indices = next_active
-            is_fork_step = False
+            return {"g_idx": g_idx, "fork_data": game_fork_data}
+
+        # Run all games concurrently
+        with stopwatch("Async Group Rollout"):
+            game_tasks = [
+                run_game_async(g_idx, game, visualizers[g_idx] if visualizers else None)
+                for g_idx, game in enumerate(games)
+            ]
+            game_results = await asyncio.gather(*game_tasks)
+
+        # Collect fork data from all games
+        for result in game_results:
+            fork_data[result["g_idx"]] = result["fork_data"]
 
         # 4. SCORING & RETURN
         # -------------------
