@@ -98,6 +98,8 @@ TRACE_PATH = Path("/traces")
     allow_concurrent_inputs=200,  # Allow many concurrent requests for batching
 )
 class InferenceEngine:
+    model_id: str = modal.parameter(default="Qwen/Qwen2.5-7B-Instruct")
+
     @modal.enter()
     def setup(self):
         import asyncio
@@ -111,8 +113,6 @@ class InferenceEngine:
         from src.inference.logits import DiplomacyLogitsProcessor
 
         print("🥶 Initializing vLLM v1 Engine...")
-
-        model_id = MODEL_ID
 
         # Set HuggingFace cache to use volume for persistence across cold starts
         # This allows model files to persist even if container restarts
@@ -130,7 +130,7 @@ class InferenceEngine:
 
         # Use cached tokenizer (faster than downloading)
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_id,
+            self.model_id,
             cache_dir=str(HF_CACHE_PATH / "transformers"),
         )
 
@@ -143,7 +143,7 @@ class InferenceEngine:
         # The processor is loaded once and handles all requests at batch level
         # NOTE: max_lora_rank must match or exceed the rank used during training
         engine_args = AsyncEngineArgs(
-            model=model_id,
+            model=self.model_id,
             enable_lora=True,
             max_loras=4,
             max_lora_rank=16,  # Must match training LoRA rank
@@ -1026,10 +1026,12 @@ def train_grpo_benchmark(
     num_groups_per_step: int = 2,
     samples_per_group: int = 4,
     rollout_horizon_years: int = 1,
+    rollout_visualize_chance: float = 0.0,
     learning_rate: float = 1e-5,
     profiling_mode: str | None = None,
     profile_run_name: str | None = None,
     compact_prompts: bool = False,
+    model_id: str = "Qwen/Qwen2.5-7B-Instruct",
 ) -> dict:
     """
     Benchmark version of GRPO training with configurable parameters.
@@ -1066,17 +1068,17 @@ def train_grpo_benchmark(
 
     cfg = ExperimentConfig(
         run_name=run_name,
+        base_model_id=model_id,
         total_steps=total_steps,
         num_groups_per_step=num_groups_per_step,
         samples_per_group=samples_per_group,
         rollout_horizon_years=rollout_horizon_years,
-        rollout_visualize_chance=0.0,  # Disable visualization for speed
+        rollout_visualize_chance=rollout_visualize_chance,
         profiling_mode=profiling_mode if profiling_mode is None else ProfilingMode(profiling_mode),  # type: ignore[arg-type]
         profile_run_name=profile_run_name or run_name,
         compact_prompts=compact_prompts,
     )
 
-    model_id = "Qwen/Qwen2.5-7B-Instruct"
     # learning_rate is now a parameter
     max_grad_norm = 1.0
     # chunk_size=8 balances GPU utilization vs memory
@@ -1158,11 +1160,11 @@ def train_grpo_benchmark(
 
         model_load_start = time.time()
 
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_id)
         tokenizer.pad_token = tokenizer.eos_token
 
         base_model = AutoModelForCausalLM.from_pretrained(
-            model_id,
+            cfg.base_model_id,
             torch_dtype=torch.bfloat16,
             device_map="auto",
             attn_implementation="sdpa",  # PyTorch native scaled dot product attention
