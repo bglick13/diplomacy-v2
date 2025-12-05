@@ -16,6 +16,7 @@ requirements = [
     "numpy",
     "tqdm",
     "cloudpickle",
+    "wandb",
 ]
 
 # MODERN PATTERN: Use .add_local_python_source("src")
@@ -71,6 +72,7 @@ app = modal.App("diplomacy-grpo")
 volume = modal.Volume.from_name("diplomacy-data", create_if_missing=True)
 hf_cache_volume = modal.Volume.from_name("hf-cache", create_if_missing=True)
 trace_volume = modal.Volume.from_name("diplomacy-traces", create_if_missing=True)
+
 
 VOLUME_PATH = Path("/data")
 MODELS_PATH = VOLUME_PATH / "models"
@@ -1494,7 +1496,7 @@ def train_grpo_benchmark(
 
 @app.function(
     image=cpu_image,
-    timeout=86400 * 3,  # 3 days max for long sweeps
+    timeout=86400,  # 24 hours max for long sweeps
     secrets=[modal.Secret.from_name("axiom-secrets")],
 )
 def run_power_laws_sweep(
@@ -1805,4 +1807,416 @@ def run_power_laws_sweep(
             "model_id": model_id,
             "parallel": parallel,
         },
+    }
+
+
+# ==============================================================================
+# 9. EVALUATION RUNNER
+# ==============================================================================
+
+EVALS_PATH = VOLUME_PATH / "evals"
+
+
+@app.function(
+    image=cpu_image,
+    timeout=86400,  # 24 hours max
+    secrets=[
+        modal.Secret.from_name("axiom-secrets"),
+        modal.Secret.from_name("wandb-secret"),
+    ],
+    volumes={str(VOLUME_PATH): volume},
+)
+async def run_evaluation(
+    checkpoint_path: str,
+    opponents: list[str] | None = None,
+    games_per_opponent: int = 10,
+    max_years: int = 10,
+    eval_powers: list[str] | None = None,
+    model_id: str = "Qwen/Qwen2.5-7B-Instruct",
+    visualize: bool = True,
+    visualize_sample_rate: float = 0.3,
+    log_to_wandb: bool = True,
+    wandb_run_name: str | None = None,
+) -> dict:
+    """
+    Evaluate a checkpoint against various opponents.
+
+    This function runs evaluation games and logs results to WandB with
+    HTML visualizations of sample games.
+
+    Args:
+        checkpoint_path: Path to checkpoint (relative to /data/models)
+                        e.g., "benchmark-20251205/adapter_v10"
+        opponents: List of opponent types ["random", "chaos"]
+        games_per_opponent: Number of games per opponent type
+        max_years: Maximum game length in years
+        eval_powers: Which powers use the checkpoint (default: ["FRANCE"])
+        model_id: Base model ID
+        visualize: Whether to generate HTML visualizations
+        visualize_sample_rate: Fraction of games to visualize
+        log_to_wandb: Whether to log results to WandB
+        wandb_run_name: Optional WandB run name
+
+    Returns:
+        Dict with evaluation metrics and visualization paths
+    """
+    import os
+    import random
+    import time
+    from datetime import datetime
+
+    import wandb
+
+    from src.agents import LLMAgent, PromptConfig
+    from src.agents.baselines import ChaosBot, RandomBot
+    from src.engine.wrapper import DiplomacyWrapper
+    from src.utils.observability import axiom, logger
+    from src.utils.parsing import extract_orders
+    from src.utils.vis import GameVisualizer
+
+    # Ensure evals directory exists
+    EVALS_PATH.mkdir(parents=True, exist_ok=True)
+
+    # Default opponents
+    if opponents is None:
+        opponents = ["random", "chaos"]
+
+    # Default eval powers (FRANCE for consistency)
+    if eval_powers is None:
+        eval_powers = ["FRANCE"]
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    checkpoint_name = checkpoint_path.split("/")[-1]
+
+    logger.info("=" * 60)
+    logger.info(f"🎯 EVALUATION: {checkpoint_path}")
+    logger.info("=" * 60)
+    logger.info(f"Opponents: {opponents}")
+    logger.info(f"Games per opponent: {games_per_opponent}")
+    logger.info(f"Eval powers: {eval_powers}")
+    logger.info(f"Max years: {max_years}")
+
+    # Log to Axiom
+    axiom.log(
+        {
+            "event": "evaluation_start",
+            "checkpoint_path": checkpoint_path,
+            "opponents": opponents,
+            "games_per_opponent": games_per_opponent,
+            "timestamp": timestamp,
+        }
+    )
+
+    # Initialize WandB
+    if log_to_wandb:
+        run_name = wandb_run_name or f"eval-{checkpoint_name}-{timestamp}"
+        wandb.init(
+            project="diplomacy-grpo",
+            name=run_name,
+            tags=["evaluation"],
+            config={
+                "checkpoint_path": checkpoint_path,
+                "opponents": opponents,
+                "games_per_opponent": games_per_opponent,
+                "max_years": max_years,
+                "eval_powers": eval_powers,
+                "model_id": model_id,
+            },
+        )
+
+    # Initialize LLM agent
+    prompt_config = PromptConfig(compact_mode=True)
+    llm_agent = LLMAgent(config=prompt_config)
+
+    # Results storage
+    all_results = []
+    all_visualizations = []
+
+    start_time = time.time()
+
+    for opponent_type in opponents:
+        logger.info(f"\n📊 Running {games_per_opponent} games vs {opponent_type}...")
+
+        # Select opponent agent
+        if opponent_type == "random":
+            opponent_agent = RandomBot()
+        elif opponent_type == "chaos":
+            opponent_agent = ChaosBot()
+        else:
+            logger.warning(f"Unknown opponent type: {opponent_type}, using random")
+            opponent_agent = RandomBot()
+
+        opponent_results = []
+
+        for game_idx in range(games_per_opponent):
+            random.seed(42 + game_idx)  # Reproducible
+
+            # Initialize game
+            game = DiplomacyWrapper(horizon=max_years * 2)
+            game_id = game.game.game_id
+
+            # Visualization for this game
+            should_viz = visualize and (random.random() < visualize_sample_rate)
+            vis = GameVisualizer() if should_viz else None
+            if vis:
+                vis.capture_turn(game.game, f"Game Start vs {opponent_type}")
+
+            # Track metrics
+            checkpoint_centers_history = []
+            all_powers = list(game.game.powers.keys())
+            checkpoint_power_set = set(eval_powers)
+
+            # Game loop
+            year = 0
+            while not game.is_done() and year < max_years:
+                year = game.get_year() - 1901
+                all_orders = []
+
+                # Collect prompts for checkpoint powers
+                checkpoint_prompts = []
+                checkpoint_valid_moves = []
+                active_checkpoint_powers = []
+
+                for power_name in all_powers:
+                    power = game.game.powers[power_name]
+                    if len(power.units) == 0 and len(power.centers) == 0:
+                        continue  # Eliminated
+
+                    if power_name in checkpoint_power_set:
+                        prompt, valid_moves = llm_agent.build_prompt(game, power_name)
+                        checkpoint_prompts.append(prompt)
+                        checkpoint_valid_moves.append(valid_moves)
+                        active_checkpoint_powers.append(power_name)
+                    else:
+                        orders = opponent_agent.get_orders(game, power_name)
+                        all_orders.extend(orders)
+
+                # Batch inference for checkpoint powers
+                if checkpoint_prompts:
+                    responses = await InferenceEngine(model_id=model_id).generate.remote.aio(
+                        prompts=checkpoint_prompts,
+                        valid_moves=checkpoint_valid_moves,
+                        lora_name=checkpoint_path,
+                    )
+
+                    for response, valid_moves in zip(
+                        responses, checkpoint_valid_moves, strict=True
+                    ):
+                        orders = extract_orders(response)
+                        if not orders:
+                            # Fallback: use first valid move for each unit
+                            orders = [moves[0] for moves in valid_moves.values() if moves]
+                        all_orders.extend(orders)
+
+                # Step game
+                game.step(all_orders)
+
+                # Track checkpoint centers
+                total_ckpt_centers = sum(
+                    len(game.game.powers[p].centers)
+                    for p in checkpoint_power_set
+                    if p in game.game.powers
+                )
+                checkpoint_centers_history.append(total_ckpt_centers)
+
+                # Capture visualization
+                if vis:
+                    phase = game.get_current_phase()
+                    vis.capture_turn(game.game, f"Year {game.get_year()} - {phase}")
+
+            # Game complete - collect results
+            game_result = {
+                "game_id": game_id,
+                "opponent": opponent_type,
+                "num_years": game.get_year() - 1901,
+                "checkpoint_powers": {},
+                "opponent_powers": {},
+            }
+
+            for power_name in all_powers:
+                power = game.game.powers[power_name]
+                power_data = {
+                    "final_centers": len(power.centers),
+                    "final_units": len(power.units),
+                    "survived": len(power.centers) > 0 or len(power.units) > 0,
+                    "won": len(power.centers) >= 18,
+                }
+
+                if power_name in checkpoint_power_set:
+                    game_result["checkpoint_powers"][power_name] = power_data
+                else:
+                    game_result["opponent_powers"][power_name] = power_data
+
+            opponent_results.append(game_result)
+
+            # Save visualization
+            if vis:
+                vis_filename = f"eval_{checkpoint_name}_{opponent_type}_{game_idx}.html"
+                vis_path = str(EVALS_PATH / vis_filename)
+                vis.save_html(vis_path)
+                all_visualizations.append(
+                    {
+                        "path": vis_path,
+                        "game_id": game_id,
+                        "opponent": opponent_type,
+                    }
+                )
+                logger.info(f"  Saved visualization: {vis_path}")
+
+            # Log progress
+            ckpt_centers = sum(
+                p["final_centers"] for p in game_result["checkpoint_powers"].values()
+            )
+            logger.info(
+                f"  Game {game_idx + 1}/{games_per_opponent}: "
+                f"{ckpt_centers} centers, {game_result['num_years']} years"
+            )
+
+        # Compute metrics for this opponent
+        total_games = len(opponent_results)
+        total_wins = sum(
+            1 for g in opponent_results for p in g["checkpoint_powers"].values() if p["won"]
+        )
+        total_survivals = sum(
+            1 for g in opponent_results for p in g["checkpoint_powers"].values() if p["survived"]
+        )
+        total_checkpoint_powers = sum(len(g["checkpoint_powers"]) for g in opponent_results)
+        avg_centers = (
+            sum(
+                p["final_centers"]
+                for g in opponent_results
+                for p in g["checkpoint_powers"].values()
+            )
+            / total_checkpoint_powers
+            if total_checkpoint_powers > 0
+            else 0
+        )
+
+        opponent_metrics = {
+            "opponent": opponent_type,
+            "games": total_games,
+            "win_rate": total_wins / total_checkpoint_powers if total_checkpoint_powers > 0 else 0,
+            "survival_rate": total_survivals / total_checkpoint_powers
+            if total_checkpoint_powers > 0
+            else 0,
+            "avg_centers": avg_centers,
+            "results": opponent_results,
+        }
+
+        all_results.append(opponent_metrics)
+
+        logger.info(f"\n  vs {opponent_type} Summary:")
+        logger.info(f"    Win Rate: {opponent_metrics['win_rate']:.1%}")
+        logger.info(f"    Survival Rate: {opponent_metrics['survival_rate']:.1%}")
+        logger.info(f"    Avg Centers: {opponent_metrics['avg_centers']:.1f}")
+
+        # Log to WandB
+        if log_to_wandb:
+            wandb.log(
+                {
+                    f"eval/vs_{opponent_type}/win_rate": opponent_metrics["win_rate"],
+                    f"eval/vs_{opponent_type}/survival_rate": opponent_metrics["survival_rate"],
+                    f"eval/vs_{opponent_type}/avg_centers": opponent_metrics["avg_centers"],
+                }
+            )
+
+    total_duration = time.time() - start_time
+
+    # Commit visualizations to volume
+    volume.commit()
+
+    # Log visualizations to WandB
+    if log_to_wandb and all_visualizations:
+        logger.info("\n📊 Logging visualizations to WandB...")
+
+        # Create artifact for all visualizations
+        artifact = wandb.Artifact(
+            f"eval-replays-{checkpoint_name}",
+            type="evaluation-replays",
+            description=f"Game replays for {checkpoint_path}",
+        )
+
+        for viz in all_visualizations:
+            if os.path.exists(viz["path"]):
+                artifact.add_file(viz["path"])
+
+                # Also log inline HTML for first game of each opponent
+                first_per_opponent = {}
+                for v in all_visualizations:
+                    if v["opponent"] not in first_per_opponent:
+                        first_per_opponent[v["opponent"]] = v
+
+                if viz == first_per_opponent.get(viz["opponent"]):
+                    with open(viz["path"], encoding="utf-8") as f:
+                        html_content = f.read()
+                    wandb.log({f"eval/replay_vs_{viz['opponent']}": wandb.Html(html_content)})
+
+        wandb.log_artifact(artifact)
+
+        # Create summary table
+        table = wandb.Table(
+            columns=[
+                "opponent",
+                "games",
+                "win_rate",
+                "survival_rate",
+                "avg_centers",
+            ]
+        )
+        for r in all_results:
+            table.add_data(
+                r["opponent"],
+                r["games"],
+                r["win_rate"],
+                r["survival_rate"],
+                r["avg_centers"],
+            )
+        wandb.log({"eval/summary_table": table})
+
+    # Log completion to Axiom
+    axiom.log(
+        {
+            "event": "evaluation_complete",
+            "checkpoint_path": checkpoint_path,
+            "total_duration_s": total_duration,
+            "results": [
+                {
+                    "opponent": r["opponent"],
+                    "win_rate": r["win_rate"],
+                    "survival_rate": r["survival_rate"],
+                    "avg_centers": r["avg_centers"],
+                }
+                for r in all_results
+            ],
+        }
+    )
+
+    # Finish WandB
+    if log_to_wandb:
+        wandb.finish()
+
+    # Flush Axiom
+    await axiom.flush()
+
+    logger.info("\n" + "=" * 60)
+    logger.info("✅ EVALUATION COMPLETE")
+    logger.info("=" * 60)
+    logger.info(f"Duration: {total_duration:.1f}s")
+    logger.info(f"Visualizations saved: {len(all_visualizations)}")
+
+    return {
+        "checkpoint_path": checkpoint_path,
+        "timestamp": timestamp,
+        "total_duration_s": total_duration,
+        "results": [
+            {
+                "opponent": r["opponent"],
+                "games": r["games"],
+                "win_rate": r["win_rate"],
+                "survival_rate": r["survival_rate"],
+                "avg_centers": r["avg_centers"],
+            }
+            for r in all_results
+        ],
+        "visualization_paths": [v["path"] for v in all_visualizations],
     }
