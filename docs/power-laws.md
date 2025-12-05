@@ -166,4 +166,4 @@ This is a principled way to debug RL systems before committing to expensive rewa
 
 - `scripts/launch_sweep.py` - Experiment launcher
 - `src/utils/config.py` - Configuration with `simulated_years` properties
-- `app.py` - `train_grpo_benchmark` function with power law metrics
+- `app.py` - `train_grpo` function with power law metrics

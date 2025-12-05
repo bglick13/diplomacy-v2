@@ -1,7 +1,23 @@
-# src/config.py
-from typing import Literal
+# src/utils/config.py
+"""
+Centralized configuration for Diplomacy GRPO experiments.
 
-from pydantic import BaseModel
+This module provides:
+- ExperimentConfig: Pydantic model for all training/experiment settings
+- EvalConfig: Pydantic model for evaluation settings
+- add_config_args: Helper to auto-generate argparse arguments from Pydantic models
+- config_from_args: Helper to create config from parsed arguments
+"""
+
+from __future__ import annotations
+
+import argparse
+from typing import TYPE_CHECKING, Any, Literal, get_args, get_origin
+
+from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    pass
 
 ProfilingMode = Literal["rollout", "trainer", "e2e"]
 
@@ -10,39 +26,96 @@ class ExperimentConfig(BaseModel):
     """
     Global configuration for a GRPO training run.
     Passed between Trainer, Inference, and Rollout workers.
+
+    All fields have sensible defaults and can be overridden via CLI arguments.
+    Use `add_config_args()` to auto-generate argparse arguments from this model.
     """
 
+    # =========================================================================
     # Experiment Metadata
-    run_name: str = "diplomacy-grpo-v1"
-    seed: int = 42
-    experiment_tag: str | None = None  # Tag for grouping related runs (e.g., "power-laws")
+    # =========================================================================
+    run_name: str = Field(
+        default="diplomacy-grpo-v1",
+        description="Name for this training run (used in WandB and checkpoints)",
+    )
+    seed: int = Field(default=42, description="Random seed for reproducibility")
+    experiment_tag: str | None = Field(
+        default=None,
+        description="Tag for grouping related runs in WandB (e.g., 'power-laws')",
+    )
+    wandb_project: str = Field(default="diplomacy-grpo", description="WandB project name")
 
+    # =========================================================================
     # Model Settings
-    base_model_id: str = "Qwen/Qwen2.5-7B-Instruct"
-    lora_rank: int = 16
+    # =========================================================================
+    base_model_id: str = Field(
+        default="Qwen/Qwen2.5-7B-Instruct",
+        description="HuggingFace model ID for base model",
+    )
+    lora_rank: int = Field(default=16, description="LoRA adapter rank")
 
-    # Environment Settings
-    rollout_horizon_years: int = 2
-    rollout_visualize_chance: float = 0
-    rollout_no_warmup_chance: float = 0.2
+    # =========================================================================
+    # Rollout/Environment Settings
+    # =========================================================================
+    rollout_horizon_years: int = Field(
+        default=2, description="Number of game years to simulate per rollout"
+    )
+    rollout_visualize_chance: float = Field(
+        default=0.0,
+        description="Probability of generating visualization for a rollout (0.0-1.0)",
+    )
+    rollout_no_warmup_chance: float = Field(
+        default=0.2,
+        description="Probability of skipping warmup phase in rollout (0.0-1.0)",
+    )
 
+    # =========================================================================
     # Training Loop
-    total_steps: int = 10
-    num_groups_per_step: int = 8  # G in GRPO
-    samples_per_group: int = 8  # N in GRPO
+    # =========================================================================
+    total_steps: int = Field(default=10, description="Total number of training steps")
+    num_groups_per_step: int = Field(
+        default=8, description="Number of rollout groups per step (G in GRPO)"
+    )
+    samples_per_group: int = Field(
+        default=8, description="Number of trajectory samples per group (N in GRPO)"
+    )
 
+    # =========================================================================
+    # Optimizer Settings
+    # =========================================================================
+    learning_rate: float = Field(default=1e-5, description="Learning rate for AdamW optimizer")
+    max_grad_norm: float = Field(default=1.0, description="Maximum gradient norm for clipping")
+    chunk_size: int = Field(default=8, description="Mini-batch size for gradient accumulation")
+
+    # =========================================================================
     # Inference Settings
-    max_new_tokens: int = 256
-    temperature: float = 0.8
-    compact_prompts: bool = True
+    # =========================================================================
+    max_new_tokens: int = Field(default=256, description="Maximum tokens to generate per inference")
+    temperature: float = Field(default=0.8, description="Sampling temperature for generation")
+    compact_prompts: bool = Field(
+        default=True, description="Use compact prompt format (reduces token count)"
+    )
 
-    # Profiling / instrumentation
-    profiling_mode: ProfilingMode | None = None
-    profile_run_name: str | None = None
-    profiling_trace_steps: int = 3
+    # =========================================================================
+    # Profiling / Instrumentation
+    # =========================================================================
+    profiling_mode: ProfilingMode | None = Field(
+        default=None,
+        description="Enable profiling: 'rollout', 'trainer', or 'e2e'",
+    )
+    profile_run_name: str | None = Field(
+        default=None, description="Custom name for profiling output files"
+    )
+    profiling_trace_steps: int = Field(
+        default=3, description="Number of steps to capture in profiler trace"
+    )
 
+    # =========================================================================
+    # Computed Properties
+    # =========================================================================
     @property
     def batch_size(self) -> int:
+        """Total batch size per training step."""
         return self.num_groups_per_step * self.samples_per_group
 
     @property
@@ -54,3 +127,261 @@ class ExperimentConfig(BaseModel):
     def total_simulated_years(self) -> int:
         """Calculate total simulated years for the full training run."""
         return self.simulated_years_per_step * self.total_steps
+
+
+class EvalConfig(BaseModel):
+    """
+    Configuration for checkpoint evaluation.
+
+    Separate from ExperimentConfig to keep concerns clear.
+    """
+
+    # =========================================================================
+    # Checkpoint Settings
+    # =========================================================================
+    checkpoint_path: str = Field(..., description="Path to checkpoint relative to /data/models")
+    base_model_id: str = Field(
+        default="Qwen/Qwen2.5-7B-Instruct",
+        description="HuggingFace model ID for base model",
+    )
+
+    # =========================================================================
+    # Evaluation Settings
+    # =========================================================================
+    opponents: list[str] = Field(
+        default=["random", "chaos"],
+        description="Opponent types to evaluate against",
+    )
+    games_per_opponent: int = Field(default=10, description="Number of games per opponent type")
+    max_years: int = Field(default=10, description="Maximum game length in years")
+    eval_powers: list[str] = Field(
+        default=["FRANCE"],
+        description="Which powers use the checkpoint",
+    )
+
+    # =========================================================================
+    # Visualization Settings
+    # =========================================================================
+    visualize: bool = Field(default=True, description="Generate HTML visualizations of games")
+    visualize_sample_rate: float = Field(
+        default=0.3, description="Fraction of games to visualize (0.0-1.0)"
+    )
+
+    # =========================================================================
+    # Logging Settings
+    # =========================================================================
+    log_to_wandb: bool = Field(default=True, description="Log results to WandB")
+    wandb_run_name: str | None = Field(default=None, description="Custom WandB run name")
+    wandb_project: str = Field(default="diplomacy-grpo", description="WandB project name")
+
+
+# =============================================================================
+# CLI Argument Helpers
+# =============================================================================
+
+
+def _get_field_type_name(field_type: Any) -> str:
+    """Get a human-readable name for a field type."""
+    origin = get_origin(field_type)
+    if origin is Literal:
+        choices = get_args(field_type)
+        return f"one of {choices}"
+    if origin is list:
+        inner = get_args(field_type)
+        if inner:
+            return f"list of {inner[0].__name__}"
+        return "list"
+    if hasattr(field_type, "__name__"):
+        return field_type.__name__
+    return str(field_type)
+
+
+def add_config_args(
+    parser: argparse.ArgumentParser,
+    config_class: type[BaseModel],
+    exclude: set[str] | None = None,
+    prefix: str = "",
+) -> None:
+    """
+    Auto-generate argparse arguments from a Pydantic model.
+
+    This ensures CLI arguments stay in sync with the config model.
+    Arguments are named with dashes (e.g., --learning-rate) but stored
+    with underscores in the namespace to match Pydantic field names.
+
+    Args:
+        parser: ArgumentParser to add arguments to
+        config_class: Pydantic model class to generate args from
+        exclude: Set of field names to skip (e.g., computed properties)
+        prefix: Optional prefix for argument names
+
+    Example:
+        >>> parser = argparse.ArgumentParser()
+        >>> add_config_args(parser, ExperimentConfig, exclude={"batch_size"})
+        >>> args = parser.parse_args(["--total-steps", "100"])
+        >>> cfg = config_from_args(args, ExperimentConfig)
+    """
+    exclude = exclude or set()
+
+    for field_name, field_info in config_class.model_fields.items():
+        if field_name in exclude:
+            continue
+
+        # Convert underscore to dash for CLI (e.g., learning_rate -> learning-rate)
+        arg_name = f"--{prefix}{field_name.replace('_', '-')}"
+
+        # Get field type and default
+        field_type = field_info.annotation
+        default = field_info.default
+        description = field_info.description or ""
+
+        # Handle Optional types (Union[X, None])
+        origin = get_origin(field_type)
+        is_optional = origin is type(None) or (
+            hasattr(origin, "__origin__") and type(None) in get_args(field_type)
+        )
+
+        # Extract inner type from Optional
+        if origin is type(str | None) or (is_optional and origin is not None):
+            args = get_args(field_type)
+            inner_types = [t for t in args if t is not type(None)]
+            if inner_types:
+                field_type = inner_types[0]
+                origin = get_origin(field_type)
+
+        # Build argument kwargs
+        kwargs: dict[str, Any] = {
+            "help": f"{description} (default: {default})",
+            "dest": field_name,  # Store with underscore name
+        }
+
+        # Handle different types
+        if field_type is bool:
+            # Booleans get --flag and --no-flag
+            if default is True:
+                parser.add_argument(
+                    f"--no-{prefix}{field_name.replace('_', '-')}",
+                    action="store_false",
+                    dest=field_name,
+                    help=f"Disable: {description}",
+                )
+            else:
+                parser.add_argument(
+                    arg_name,
+                    action="store_true",
+                    dest=field_name,
+                    help=description,
+                )
+            continue
+
+        elif origin is Literal:
+            # Literal types become choices
+            choices = get_args(field_type)
+            kwargs["choices"] = choices
+            kwargs["type"] = str
+            kwargs["default"] = default
+
+        elif origin is list:
+            # List types use nargs
+            inner_types = get_args(field_type)
+            inner_type = inner_types[0] if inner_types else str
+            kwargs["nargs"] = "+"
+            kwargs["type"] = inner_type
+            kwargs["default"] = default
+
+        elif field_type in (int, float, str):
+            kwargs["type"] = field_type
+            kwargs["default"] = default
+
+        else:
+            # Fallback for complex types - treat as string
+            kwargs["type"] = str
+            kwargs["default"] = str(default) if default is not None else None
+
+        parser.add_argument(arg_name, **kwargs)
+
+
+def config_from_args(
+    args: argparse.Namespace,
+    config_class: type[BaseModel],
+    extra_values: dict[str, Any] | None = None,
+) -> BaseModel:
+    """
+    Create a Pydantic config from parsed argparse namespace.
+
+    Args:
+        args: Parsed argument namespace
+        config_class: Pydantic model class to instantiate
+        extra_values: Additional values to include (override args)
+
+    Returns:
+        Instantiated config model
+
+    Example:
+        >>> args = parser.parse_args(["--total-steps", "100"])
+        >>> cfg = config_from_args(args, ExperimentConfig)
+        >>> print(cfg.total_steps)
+        100
+    """
+    # Convert namespace to dict, filtering out None values for optional fields
+    values = {
+        k: v for k, v in vars(args).items() if v is not None and k in config_class.model_fields
+    }
+
+    # Apply extra values
+    if extra_values:
+        values.update(extra_values)
+
+    return config_class(**values)
+
+
+def create_experiment_parser(
+    description: str = "Run Diplomacy GRPO experiment",
+    exclude: set[str] | None = None,
+) -> argparse.ArgumentParser:
+    """
+    Create a fully-configured argument parser for experiments.
+
+    Convenience function that creates a parser with all ExperimentConfig fields.
+
+    Args:
+        description: Parser description
+        exclude: Fields to exclude from CLI
+
+    Returns:
+        Configured ArgumentParser
+
+    Example:
+        >>> parser = create_experiment_parser("My training script")
+        >>> parser.add_argument("--my-custom-arg", type=str)
+        >>> args = parser.parse_args()
+        >>> cfg = config_from_args(args, ExperimentConfig)
+    """
+    parser = argparse.ArgumentParser(
+        description=description,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_config_args(parser, ExperimentConfig, exclude=exclude)
+    return parser
+
+
+def create_eval_parser(
+    description: str = "Evaluate Diplomacy GRPO checkpoint",
+    exclude: set[str] | None = None,
+) -> argparse.ArgumentParser:
+    """
+    Create a fully-configured argument parser for evaluation.
+
+    Args:
+        description: Parser description
+        exclude: Fields to exclude from CLI
+
+    Returns:
+        Configured ArgumentParser
+    """
+    parser = argparse.ArgumentParser(
+        description=description,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_config_args(parser, EvalConfig, exclude=exclude)
+    return parser
