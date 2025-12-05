@@ -34,6 +34,31 @@ class PromptConfig:
 
     compact_mode: bool = False
 
+    # Optimize prompt structure for vLLM prefix caching
+    # When True, static instructions come FIRST so they're shared across all requests
+    prefix_cache_optimized: bool = True
+
+
+# =============================================================================
+# Static Prompt Prefixes (for prefix caching)
+# =============================================================================
+# These are placed at the START of prompts so vLLM can cache the KV values
+# and reuse them across all requests. Keep these IDENTICAL across all powers.
+
+MOVEMENT_PREFIX = (
+    "You are playing Diplomacy. "
+    "Output one order per unit using EXACT strings from valid moves. "
+    "Format: one order per line inside <orders> tags. "
+    "Valid moves and game state follow.\n"
+)
+
+ADJUSTMENT_PREFIX = (
+    "You are playing Diplomacy adjustment phase. "
+    "Output adjustment orders using EXACT strings from valid options. "
+    "Format: one order per line inside <orders> tags. "
+    "Valid options and game state follow.\n"
+)
+
 
 @dataclass
 class AgentResponse:
@@ -140,18 +165,32 @@ class LLMAgent:
         IMPORTANT: The prompt ends with '<orders>\n' to prime the model.
         This ensures the logits processor immediately enters ACTIVE mode
         and constrains generation to valid moves from the trie.
+
+        When prefix_cache_optimized=True, static instructions come FIRST
+        so vLLM can cache and reuse them across all requests.
         """
 
         # Count total units for context
         unit_count = len(valid_moves)
+
         if self.config.compact_mode:
-            prompt = (
-                f"You are {power_name} in a game of Diplomacy. Phase:{phase}. Units:{unit_count}. "
-                "ValidMoves JSON follows"
-                f"{moves_display}"
-                "Emit exactly one order per unit using EXACT strings. Output format: <orders>...\n</orders>"
-                "<orders>\n"
-            )
+            if self.config.prefix_cache_optimized:
+                # Prefix-optimized: static instructions FIRST, then dynamic content
+                prompt = (
+                    f"{MOVEMENT_PREFIX}"
+                    f"Power:{power_name} Phase:{phase} Units:{unit_count}\n"
+                    f"Moves:{moves_display}\n"
+                    "<orders>\n"
+                )
+            else:
+                # Legacy compact format (dynamic content first)
+                prompt = (
+                    f"You are {power_name} in a game of Diplomacy. Phase:{phase}. Units:{unit_count}. "
+                    "ValidMoves JSON follows"
+                    f"{moves_display}"
+                    "Emit exactly one order per unit using EXACT strings. Output format: <orders>...\n</orders>"
+                    "<orders>\n"
+                )
         else:
             prompt = f"""You are playing Diplomacy as {power_name}.
     Phase: {phase}
@@ -226,12 +265,22 @@ WAIVE
             example = self._get_example_move(valid_moves)
 
         if self.config.compact_mode:
-            prompt = (
-                f"You are {power_name} in {phase}. Action:{action} count:{order_count}. "
-                "Valid options JSON follows. Emit EXACT adjustment orders in <orders> "
-                "immediately with no explanation.\n"
-                f"{moves_display}\n<orders>\n"
-            )
+            if self.config.prefix_cache_optimized:
+                # Prefix-optimized: static instructions FIRST, then dynamic content
+                prompt = (
+                    f"{ADJUSTMENT_PREFIX}"
+                    f"Power:{power_name} Phase:{phase} Action:{action} Count:{order_count}\n"
+                    f"Options:{moves_display}\n"
+                    "<orders>\n"
+                )
+            else:
+                # Legacy compact format (dynamic content first)
+                prompt = (
+                    f"You are {power_name} in {phase}. Action:{action} count:{order_count}. "
+                    "Valid options JSON follows. Emit EXACT adjustment orders in <orders> "
+                    "immediately with no explanation.\n"
+                    f"{moves_display}\n<orders>\n"
+                )
         else:
             prompt = f"""You are playing Diplomacy as {power_name}.
 Phase: {phase}

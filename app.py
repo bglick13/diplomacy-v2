@@ -150,8 +150,9 @@ class InferenceEngine:
             enable_lora=True,
             max_loras=4,
             max_lora_rank=16,  # Must match training LoRA rank
-            gpu_memory_utilization=0.85,  # Higher utilization for better throughput
-            max_num_seqs=256,  # Allow more concurrent sequences for better batching
+            gpu_memory_utilization=0.92,  # Higher utilization for better throughput
+            max_num_seqs=512,  # Allow more concurrent sequences for better batching
+            enable_prefix_caching=True,
             disable_log_stats=False,
             logits_processors=[DiplomacyLogitsProcessor],
             # Optimization: Use cached model location
@@ -589,7 +590,17 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
         )
         metrics.log_summary()
 
-        return trajectories
+        # Return trajectories with extraction stats for WandB aggregation
+        return {
+            "trajectories": trajectories,
+            "extraction_stats": {
+                "orders_expected": metrics.total_orders_expected,
+                "orders_extracted": metrics.total_orders_extracted,
+                "empty_responses": metrics.empty_responses,
+                "partial_responses": metrics.partial_responses,
+                "extraction_rate": metrics.get_extraction_rate(),
+            },
+        }
 
     except Exception as e:
         logger.error(f"❌ Error running rollout: {e}")
@@ -883,9 +894,32 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             rollout_start = time.time()
             with stopwatch(f"Benchmark_Rollout_{step}"):
                 raw_trajectories = []
+                # Aggregate extraction stats across all rollouts in this batch
+                step_extraction_stats: dict[str, int | float] = {
+                    "orders_expected": 0,
+                    "orders_extracted": 0,
+                    "empty_responses": 0,
+                    "partial_responses": 0,
+                    "extraction_rate": 1.0,
+                }
                 for handle in current_handles:
                     result = handle.get()  # Block until this rollout completes
-                    raw_trajectories.extend(result)
+                    # Unpack new return format: {"trajectories": [...], "extraction_stats": {...}}
+                    raw_trajectories.extend(result["trajectories"])
+                    # Aggregate extraction stats
+                    stats = result["extraction_stats"]
+                    step_extraction_stats["orders_expected"] += stats["orders_expected"]  # type: ignore[operator]
+                    step_extraction_stats["orders_extracted"] += stats["orders_extracted"]  # type: ignore[operator]
+                    step_extraction_stats["empty_responses"] += stats["empty_responses"]  # type: ignore[operator]
+                    step_extraction_stats["partial_responses"] += stats["partial_responses"]  # type: ignore[operator]
+
+                # Compute step-level extraction rate
+                orders_expected = step_extraction_stats["orders_expected"]
+                orders_extracted = step_extraction_stats["orders_extracted"]
+                if isinstance(orders_expected, int) and orders_expected > 0:
+                    step_extraction_stats["extraction_rate"] = float(orders_extracted) / float(
+                        orders_expected
+                    )
 
             rollout_time = time.time() - rollout_start
             step_metrics["rollout_time_s"] = rollout_time
@@ -894,6 +928,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             step_metrics["buffer_depth_actual"] = (
                 len(rollout_buffer) + 1
             )  # +1 for the one we just popped
+            step_metrics["extraction_stats"] = step_extraction_stats
             if step_profile is not None:
                 step_profile["rollout_time_ms"] = rollout_time * 1000
 
@@ -1001,9 +1036,11 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
 
             metrics["step_metrics"].append(step_metrics)
 
+            extraction_rate_pct = float(step_extraction_stats["extraction_rate"]) * 100
             logger.info(
                 f"Step {step}: loss={avg_loss:.4f} | kl={avg_kl:.4f} | "
                 f"reward={traj_stats.reward_mean:.2f}±{traj_stats.reward_std:.2f} | "
+                f"extraction={extraction_rate_pct:.1f}% | "
                 f"trajectories={len(batch_data)} | time={step_total:.2f}s"
             )
 
@@ -1030,6 +1067,12 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     "benchmark/trajectories": len(batch_data),
                     "benchmark/grad_norm": grad_norm,
                     "benchmark/pipeline_overlap_s": pipeline_overlap,
+                    # Order extraction metrics (monitor prompt structure regressions)
+                    "extraction/rate": step_extraction_stats["extraction_rate"],
+                    "extraction/orders_expected": step_extraction_stats["orders_expected"],
+                    "extraction/orders_extracted": step_extraction_stats["orders_extracted"],
+                    "extraction/empty_responses": step_extraction_stats["empty_responses"],
+                    "extraction/partial_responses": step_extraction_stats["partial_responses"],
                     # Power Law metrics (for X-axis comparison across runs)
                     "power_law/cumulative_simulated_years": cumulative_sim_years,
                     "power_law/simulated_years_per_step": sim_years_per_step,
