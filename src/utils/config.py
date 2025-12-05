@@ -79,6 +79,10 @@ class ExperimentConfig(BaseModel):
     samples_per_group: int = Field(
         default=8, description="Number of trajectory samples per group (N in GRPO)"
     )
+    buffer_depth: int = Field(
+        default=4,
+        description="Number of rollout batches to keep in flight ahead of trainer (2-4 recommended)",
+    )
 
     # =========================================================================
     # Optimizer Settings
