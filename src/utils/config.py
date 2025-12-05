@@ -15,6 +15,7 @@ class ExperimentConfig(BaseModel):
     # Experiment Metadata
     run_name: str = "diplomacy-grpo-v1"
     seed: int = 42
+    experiment_tag: str | None = None  # Tag for grouping related runs (e.g., "power-laws")
 
     # Model Settings
     base_model_id: str = "Qwen/Qwen2.5-7B-Instruct"
@@ -22,7 +23,7 @@ class ExperimentConfig(BaseModel):
 
     # Environment Settings
     rollout_horizon_years: int = 2
-    rollout_visualize_chance: float = 0.1
+    rollout_visualize_chance: float = 0
 
     # Training Loop
     total_steps: int = 10
@@ -42,3 +43,13 @@ class ExperimentConfig(BaseModel):
     @property
     def batch_size(self) -> int:
         return self.num_groups_per_step * self.samples_per_group
+
+    @property
+    def simulated_years_per_step(self) -> int:
+        """Calculate total simulated years per training step."""
+        return self.num_groups_per_step * self.samples_per_group * self.rollout_horizon_years
+
+    @property
+    def total_simulated_years(self) -> int:
+        """Calculate total simulated years for the full training run."""
+        return self.simulated_years_per_step * self.total_steps

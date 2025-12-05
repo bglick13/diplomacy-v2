@@ -193,6 +193,103 @@ Some powers may have more complex positions leading to worse extraction:
 - Row 3: Extraction Rate by Power (bar), Recent Errors (table)
 - Row 4: Inference Latency (line), Empty Orders Timeline (line)
 
+---
+
+## Power Laws Experiment Queries
+
+These queries help monitor and analyze the Power Laws scaling experiment.
+
+### 12. Training Progress by Run
+
+Track reward progression across all power-laws runs:
+
+```apl
+['diplomacy']
+| where event == "training_step"
+| where run_name startswith "power-laws-"
+| extend config_type = case(
+    run_name contains "baseline", "A: Baseline",
+    run_name contains "deep", "B: Deep Search",
+    run_name contains "broad", "C: Broad Search",
+    "unknown"
+  )
+| summarize avg_reward = avg(reward_mean) by config_type, step
+| order by config_type, step
+```
+
+### 13. Compute Efficiency Comparison
+
+Compare simulated years per wall-clock hour:
+
+```apl
+['diplomacy']
+| where event == "rollout_complete"
+| where rollout_id startswith "power-laws-"
+| summarize 
+    total_rollouts = count(),
+    total_trajectories = sum(trajectories_count),
+    avg_duration_ms = avg(total_duration_ms)
+  by bin(_time, 1h)
+| extend sim_years_per_hour = (total_trajectories * 2) / (avg_duration_ms / 3600000)
+```
+
+### 14. Reward Distribution by Config
+
+```apl
+['diplomacy']
+| where event == "training_step"
+| where run_name startswith "power-laws-"
+| extend config = case(
+    run_name contains "baseline", "baseline",
+    run_name contains "deep", "deep-search",
+    run_name contains "broad", "broad-search",
+    "unknown"
+  )
+| summarize 
+    p25 = percentile(reward_mean, 25),
+    p50 = percentile(reward_mean, 50),
+    p75 = percentile(reward_mean, 75),
+    final_reward = argmax(step, reward_mean)
+  by config
+```
+
+### 15. Rollout Health by Experiment
+
+```apl
+['diplomacy']
+| where event in ("rollout_complete", "rollout_error")
+| where rollout_id startswith "power-laws-"
+| summarize 
+    completed = countif(event == "rollout_complete"),
+    errors = countif(event == "rollout_error")
+  by bin(_time, 30m)
+| extend success_rate = todouble(completed) / todouble(completed + errors)
+```
+
+### 16. Power Laws Summary (Last Run)
+
+```apl
+['diplomacy']
+| where event == "training_step"
+| where run_name startswith "power-laws-"
+| where _time > ago(6h)
+| extend config = case(
+    run_name contains "baseline", "A: Baseline (1x)",
+    run_name contains "deep", "B: Deep (2x)",
+    run_name contains "broad", "C: Broad (2x)",
+    "unknown"
+  )
+| summarize 
+    max_step = max(step),
+    final_reward = argmax(step, reward_mean),
+    avg_loss = avg(loss),
+    avg_kl = avg(kl)
+  by config, run_name
+| order by config
+```
+
+---
+
 ## Alert Recommendations
 
 Set up Axiom monitors for:
@@ -208,3 +305,7 @@ Set up Axiom monitors for:
 3. **Critical: Rollout Errors**
    - Condition: `rollout_error` count > 5 in 1 hour
    - This indicates infrastructure issues
+
+4. **Power Laws: Run Divergence**
+   - Condition: Reward variance across configs > threshold after step 50
+   - This indicates one config is significantly outperforming others
