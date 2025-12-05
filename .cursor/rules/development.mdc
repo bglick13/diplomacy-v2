@@ -1,0 +1,24 @@
+---
+alwaysApply: true
+---
+# Engineering & Workflow Standards
+
+## Git & Graphite Workflow
+- **Atomic Changes:** Plan and generate code changes that are small, isolated, and atomic. Optimize for **Graphite** stacked diffs. Avoid monolithic refactors unless explicitly requested.
+- **Commit Strategy:** When suggesting git operations, prefer multiple small commits over single large ones to facilitate easier stacking.
+
+## PR & Documentation Requirements
+When generating PR descriptions or commit messages, you must strictly follow this structure:
+1.  **Summary:** High-level overview of the change.
+2.  **Detailed Changes:** Bulleted list of specific modifications.
+3.  **Testing Plan (MANDATORY):**
+    - **Execution:** Exact scripts or commands to run (e.g., `python train.py --config x`).
+    - **Validation:** Specific expected outputs or metrics.
+    - **Artifacts:**
+        - For ML/Training changes: Placeholders for **WandB** run links/graphs.
+        - For System/Infra changes: **Axiom** query snippets used to verify the event flow.
+
+## Observability & Logging
+- **Default to Observability:** Treat observability as a first-class citizen.
+- **Axiom Integration:** When writing or modifying core logic, **always** implement corresponding Axiom events to measure the change.
+- **Validation:** If modifying a critical path, ask: "How will we query this in Axiom?" and suggest the logging implementation accordingly.
