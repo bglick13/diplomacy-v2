@@ -1,7 +1,10 @@
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import diplomacy
 from diplomacy.utils.export import to_saved_game_format
+
+if TYPE_CHECKING:
+    from src.agents.llm_agent import LLMAgent
 
 
 class DiplomacyWrapper:
@@ -111,7 +114,7 @@ class DiplomacyWrapper:
         power = self.game.powers[power_name]
         return len(power.centers) - len(power.units)
 
-    def get_all_inputs(self, agent=None) -> dict[str, list]:
+    def get_all_inputs(self, agent: "LLMAgent") -> dict[str, list]:
         """
         Prepares the batch of inputs for all 7 powers to send to the GPU.
 
@@ -125,11 +128,6 @@ class DiplomacyWrapper:
             "power_names": [str, str, ...]
         }
         """
-        # Lazy import to avoid circular dependency
-        if agent is None:
-            from src.agents.llm_agent import LLMAgent
-
-            agent = LLMAgent()
 
         prompts = []
         valid_moves_list = []

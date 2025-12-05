@@ -1,6 +1,6 @@
 import modal
 
-from src.agents.llm_agent import LLMAgent
+from src.agents.llm_agent import LLMAgent, PromptConfig
 from src.engine.wrapper import DiplomacyWrapper
 from src.utils.config import ExperimentConfig
 from src.utils.parsing import extract_orders
@@ -22,7 +22,8 @@ def run_simulation(cfg: ExperimentConfig, run_name: str = "LLMAgent"):
 
     # We can assign different agents to different powers if we want!
     # For now, everyone uses the same bot class.
-    agent = LLMAgent()
+    prompt_config = PromptConfig(compact_mode=cfg.compact_prompts)
+    agent = LLMAgent(config=prompt_config)
 
     vis.capture_turn(game.game, f"Game Start ({run_name})")
 
@@ -60,5 +61,5 @@ def run_simulation(cfg: ExperimentConfig, run_name: str = "LLMAgent"):
 
 if __name__ == "__main__":
     # Run two comparisons
-    cfg = ExperimentConfig(rollout_horizon_years=4, samples_per_group=8)
+    cfg = ExperimentConfig(rollout_horizon_years=4, samples_per_group=8, compact_prompts=True)
     run_simulation(cfg)

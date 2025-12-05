@@ -32,6 +32,7 @@ class ExperimentConfig(BaseModel):
     # Inference Settings
     max_new_tokens: int = 256
     temperature: float = 0.8
+    compact_prompts: bool = False
 
     # Profiling / instrumentation
     profiling_mode: ProfilingMode | None = None

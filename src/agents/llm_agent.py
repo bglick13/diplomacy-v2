@@ -32,6 +32,8 @@ class PromptConfig:
     # Temperature hint for the model (informational, actual temp set in SamplingParams)
     temperature_hint: float = 0.7
 
+    compact_mode: bool = False
+
 
 @dataclass
 class AgentResponse:
@@ -114,7 +116,8 @@ class LLMAgent:
                 ]
             else:
                 truncated[unit] = moves
-
+        if self.config.compact_mode:
+            return json.dumps(truncated, separators=(",", ":"))
         return json.dumps(truncated, indent=2)
 
     def _get_example_move(self, valid_moves: dict[str, list[str]]) -> str:
@@ -141,31 +144,38 @@ class LLMAgent:
 
         # Count total units for context
         unit_count = len(valid_moves)
+        if self.config.compact_mode:
+            prompt = (
+                f"You are {power_name} in a game of Diplomacy. Phase:{phase}. Units:{unit_count}. "
+                "ValidMoves JSON follows"
+                f"{moves_display}"
+                "Emit exactly one order per unit using EXACT strings. Output format: <orders>...\n</orders>"
+                "<orders>\n"
+            )
+        else:
+            prompt = f"""You are playing Diplomacy as {power_name}.
+    Phase: {phase}
+    Units: {unit_count}
 
-        prompt = f"""You are playing Diplomacy as {power_name}.
-Phase: {phase}
-Units: {unit_count}
+    Your units and their valid moves:
+    {moves_display}
 
-Your units and their valid moves:
-{moves_display}
+    Output exactly {unit_count} orders, one per line.
+    Use the EXACT move strings from the valid moves list above.
 
-Output exactly {unit_count} orders, one per line.
-Use the EXACT move strings from the valid moves list above.
-
-Example:
-<orders>
-A PAR - BUR
-F BRE - MAO
-A MAR H
-</orders>
-"""
+    Example:
+    <orders>
+    A PAR - BUR
+    F BRE - MAO
+    A MAR H
+    </orders>
+    """
 
         if self.config.custom_instructions:
             prompt += f"\n{self.config.custom_instructions}\n"
 
-        # CRITICAL: End with <orders>\n to prime the model
-        # This ensures the logits processor enters ACTIVE mode immediately
-        prompt += "<orders>\n"
+        if not self.config.compact_mode:
+            prompt += "<orders>\n"
 
         return prompt
 
@@ -215,7 +225,15 @@ WAIVE
             order_count = len(valid_moves)
             example = self._get_example_move(valid_moves)
 
-        prompt = f"""You are playing Diplomacy as {power_name}.
+        if self.config.compact_mode:
+            prompt = (
+                f"You are {power_name} in {phase}. Action:{action} count:{order_count}. "
+                "Valid options JSON follows. Emit EXACT adjustment orders in <orders> "
+                "immediately with no explanation.\n"
+                f"{moves_display}\n<orders>\n"
+            )
+        else:
+            prompt = f"""You are playing Diplomacy as {power_name}.
 Phase: {phase}
 Action: {action} {order_count} unit(s)
 
@@ -241,7 +259,8 @@ Example:
             prompt += f"\n{self.config.custom_instructions}\n"
 
         # Prime the model
-        prompt += "<orders>\n"
+        if not self.config.compact_mode:
+            prompt += "<orders>\n"
 
         return prompt
 
