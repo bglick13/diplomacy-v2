@@ -99,6 +99,13 @@ class ExperimentConfig(BaseModel):
     compact_prompts: bool = Field(
         default=True, description="Use compact prompt format (reduces token count)"
     )
+    compute_ref_logprobs_in_rollout: bool = Field(
+        default=True,
+        description=(
+            "Compute reference (base model) logprobs during rollouts. "
+            "Adds inference latency but eliminates reference forward pass in trainer (~50% speedup)."
+        ),
+    )
 
     # =========================================================================
     # Profiling / Instrumentation

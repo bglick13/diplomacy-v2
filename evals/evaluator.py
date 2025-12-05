@@ -273,8 +273,9 @@ async def run_eval_game(
                 lora_name=config.checkpoint_path,
             )
 
-            for response, valid_moves in zip(responses, checkpoint_valid_moves, strict=True):
-                orders = extract_orders(response)
+            for response_data, valid_moves in zip(responses, checkpoint_valid_moves, strict=True):
+                # Extract text from rich response format
+                orders = extract_orders(response_data["text"])
                 # Fallback if no orders extracted
                 if not orders:
                     # Use first valid move for each unit

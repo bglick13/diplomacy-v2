@@ -240,11 +240,13 @@ class InferenceEngine:
                 """Generate for a single prompt. Allows concurrent execution."""
                 request_id = str(uuid.uuid4())
                 # vLLM SamplingParams accepts these at runtime but type stubs may be incomplete
+                # logprobs=1 returns per-token log probabilities for the sampled token
                 sampling_params = SamplingParams(  # type: ignore[call-arg, misc]
                     temperature=0.7,  # type: ignore[arg-type]
                     max_tokens=200,  # type: ignore[arg-type]
                     extra_args={"valid_moves_dict": moves},  # type: ignore[arg-type]
                     stop=["</orders>", "</Orders>"],  # type: ignore[arg-type]
+                    logprobs=1,  # type: ignore[arg-type]  # Return logprobs for ref model opt
                 )
                 try:
                     generator = self.engine.generate(
@@ -256,12 +258,53 @@ class InferenceEngine:
                     final_output = None
                     async for output in generator:
                         final_output = output
+
                     text = ""
-                    token_count = 0
-                    if final_output and final_output.outputs:
-                        text = final_output.outputs[0].text
-                        token_count = len(final_output.outputs[0].token_ids)
-                    return {"text": text, "token_count": token_count}
+                    token_ids: list[int] = []
+                    prompt_token_ids: list[int] = []
+                    completion_logprobs: list[float] = []
+
+                    if final_output:
+                        # Get prompt token IDs for computing prompt_len
+                        prompt_token_ids = final_output.prompt_token_ids or []
+
+                        if final_output.outputs:
+                            output = final_output.outputs[0]
+                            text = output.text
+                            token_ids = list(output.token_ids)
+
+                            # Extract per-token logprobs (for reference model optimization)
+                            if output.logprobs:
+                                # SampleLogprobs can be FlatLogprobs or list[dict[int, Logprob]]
+                                logprobs_data = output.logprobs
+                                if hasattr(logprobs_data, "logprobs"):
+                                    # FlatLogprobs - extract directly
+                                    # The sampled token's logprob is the first in each position
+                                    for i in range(len(logprobs_data)):
+                                        pos_logprobs = logprobs_data[i]
+                                        if pos_logprobs and token_ids[i] in pos_logprobs:
+                                            completion_logprobs.append(
+                                                pos_logprobs[token_ids[i]].logprob
+                                            )
+                                        else:
+                                            completion_logprobs.append(0.0)
+                                else:
+                                    # list[dict[int, Logprob]]
+                                    for i, pos_logprobs in enumerate(logprobs_data):
+                                        if pos_logprobs and token_ids[i] in pos_logprobs:
+                                            completion_logprobs.append(
+                                                pos_logprobs[token_ids[i]].logprob
+                                            )
+                                        else:
+                                            completion_logprobs.append(0.0)
+
+                    return {
+                        "text": text,
+                        "token_count": len(token_ids),
+                        "token_ids": token_ids,
+                        "prompt_token_ids": prompt_token_ids,
+                        "completion_logprobs": completion_logprobs,
+                    }
                 except Exception as e:
                     # Log on GPU side for debugging
                     print(f"❌ Generation Error: {e}")
@@ -289,11 +332,118 @@ class InferenceEngine:
                 tokens_per_second=tokens_per_second,
             )
 
-            return [str(resp.get("text", "")) for resp in responses]
+            # Return rich response structure with token data for trainer optimization
+            return [
+                {
+                    "text": str(resp.get("text", "")),
+                    "token_ids": resp.get("token_ids", []),
+                    "prompt_token_ids": resp.get("prompt_token_ids", []),
+                    "completion_logprobs": resp.get("completion_logprobs", []),
+                }
+                for resp in responses
+            ]
         except Exception as e:
             error_msg = f"GPU Inference Failed: {type(e).__name__}: {str(e)}"
             print(error_msg)
             raise RuntimeError(error_msg) from None
+
+    @modal.method()
+    async def score(
+        self,
+        prompts: list[str],
+        completions: list[str],
+        prompt_token_ids_list: list[list[int]],
+    ) -> list[dict]:
+        """
+        Compute reference logprobs for completions using BASE MODEL (no LoRA).
+
+        This enables skipping the reference forward pass in the trainer by capturing
+        base model logprobs during rollouts.
+
+        Uses vLLM's prompt_logprobs feature: pass full sequence as "prompt" with
+        max_tokens=0 to score without generation.
+
+        Args:
+            prompts: List of prompt strings (for prefix caching benefit)
+            completions: List of completion strings to score
+            prompt_token_ids_list: List of prompt token IDs (to know where completion starts)
+
+        Returns:
+            List of dicts with 'ref_completion_logprobs' (sum of completion token logprobs)
+        """
+        import asyncio
+        import time
+        import uuid
+
+        from vllm.sampling_params import SamplingParams
+
+        request_start = time.time()
+
+        async def _score_single(prompt: str, completion: str, prompt_token_ids: list[int]) -> dict:
+            """Score a single sequence using base model."""
+            request_id = str(uuid.uuid4())
+
+            # Scoring params: no generation, just compute logprobs for input
+            sampling_params = SamplingParams(  # type: ignore[call-arg, misc]
+                max_tokens=0,  # type: ignore[arg-type]  # Don't generate
+                prompt_logprobs=1,  # type: ignore[arg-type]  # Get logprobs for all input tokens
+            )
+
+            # Full sequence = prompt + completion
+            full_sequence = prompt + completion
+
+            try:
+                # Score with base model (no LoRA) to get reference logprobs
+                generator = self.engine.generate(
+                    prompt=full_sequence,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                    lora_request=None,  # CRITICAL: Use base model for reference
+                )
+                final_output = None
+                async for output in generator:
+                    final_output = output
+
+                # Extract completion logprobs from prompt_logprobs
+                completion_logprobs_sum = 0.0
+                if final_output and final_output.prompt_logprobs:
+                    prompt_len = len(prompt_token_ids)
+                    # prompt_logprobs is list[dict[token_id, Logprob] | None]
+                    # Index 0 is None (no logprob for first token)
+                    # Completion tokens start at index prompt_len
+                    for i in range(prompt_len, len(final_output.prompt_logprobs)):
+                        pos_logprobs = final_output.prompt_logprobs[i]
+                        if pos_logprobs:
+                            # Get the logprob of the actual token at this position
+                            # The token_id is the key with highest logprob (or we can get from prompt_token_ids)
+                            # vLLM returns logprobs for top-k tokens, including the actual one
+                            actual_token_id = (
+                                final_output.prompt_token_ids[i]
+                                if final_output.prompt_token_ids
+                                else None
+                            )
+                            if actual_token_id is not None and actual_token_id in pos_logprobs:
+                                completion_logprobs_sum += pos_logprobs[actual_token_id].logprob
+
+                return {"ref_completion_logprobs": completion_logprobs_sum}
+
+            except Exception as e:
+                print(f"❌ Scoring Error: {e}")
+                # Return empty logprob on error - trainer will fall back to computing
+                return {"ref_completion_logprobs": None}
+
+        # Score all sequences concurrently
+        results = await asyncio.gather(
+            *[
+                _score_single(p, c, pt)
+                for p, c, pt in zip(prompts, completions, prompt_token_ids_list, strict=True)
+            ]
+        )
+
+        duration_ms = int((time.time() - request_start) * 1000)
+        print(f"📊 Scored {len(prompts)} sequences in {duration_ms}ms (base model)")
+
+        return results
 
 
 # ==============================================================================
@@ -420,10 +570,12 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
             all_orders = []
             phase = main_game.get_current_phase()
 
-            for idx, (response, power) in enumerate(
+            for idx, (response_data, power) in enumerate(
                 zip(raw_responses, inputs["power_names"], strict=True)
             ):
-                orders = extract_orders(response)
+                # Extract text from rich response (warmup doesn't need token data)
+                response_text = response_data["text"]
+                orders = extract_orders(response_text)
                 expected_count = len(inputs["valid_moves"][idx])
 
                 # Log extraction result
@@ -432,9 +584,9 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
                     power_name=power,
                     orders_count=len(orders),
                     expected_count=expected_count,
-                    raw_response_length=len(response),
+                    raw_response_length=len(response_text),
                     phase=phase,
-                    raw_response=response,
+                    raw_response=response_text,
                 )
                 metrics.record_extraction(len(orders), expected_count)
 
@@ -500,10 +652,12 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
                 all_orders = []
                 phase = game.get_current_phase()
 
-                for idx, (response, power) in enumerate(
+                for idx, (response_data, power) in enumerate(
                     zip(responses, inputs["power_names"], strict=True)
                 ):
-                    orders = extract_orders(response)
+                    # Extract text and token data from rich response
+                    response_text = response_data["text"]
+                    orders = extract_orders(response_text)
                     expected_count = len(inputs["valid_moves"][idx])
 
                     # Log extraction result
@@ -512,17 +666,21 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
                         power_name=power,
                         orders_count=len(orders),
                         expected_count=expected_count,
-                        raw_response_length=len(response),
+                        raw_response_length=len(response_text),
                         phase=phase,
-                        raw_response=response,
+                        raw_response=response_text,
                     )
                     metrics.record_extraction(len(orders), expected_count)
 
-                    # Store fork data on first step
+                    # Store fork data on first step (includes token data for trainer optimization)
                     if step_count == 1:
                         game_fork_data[power] = {
                             "prompt": inputs["prompts"][idx],
-                            "completion": response,
+                            "completion": response_text,
+                            # Token data for skipping tokenization and reference forward pass
+                            "prompt_token_ids": response_data.get("prompt_token_ids", []),
+                            "completion_token_ids": response_data.get("token_ids", []),
+                            "completion_logprobs": response_data.get("completion_logprobs", []),
                         }
 
                     all_orders.extend(orders)
@@ -551,7 +709,48 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
         for result in game_results:
             fork_data[result["g_idx"]] = result["fork_data"]
 
-        # 4. SCORING & RETURN
+        # 4. REFERENCE LOGPROBS (Optional - eliminates trainer reference forward pass)
+        # ---------------------------------------------------------------------------
+        # If enabled, compute base model logprobs for all completions
+        # This adds ~1 forward pass to rollouts but saves ~1 forward pass in trainer
+        ref_logprobs_map: dict[tuple[int, str], float | None] = {}
+
+        if cfg.compute_ref_logprobs_in_rollout and lora_name is not None:
+            # Only needed when generating with LoRA (step > 0)
+            # For step 0 (no LoRA), generation logprobs ARE reference logprobs
+            with stopwatch("Reference Logprob Scoring"):
+                # Batch all sequences for scoring
+                score_prompts = []
+                score_completions = []
+                score_prompt_token_ids = []
+                score_keys = []  # (g_idx, power) to map results back
+
+                for g_idx in range(len(games)):
+                    for power, data in fork_data[g_idx].items():
+                        prompt_tids = data.get("prompt_token_ids", [])
+                        if prompt_tids:  # Only if we have token data
+                            score_prompts.append(data["prompt"])
+                            score_completions.append(data["completion"])
+                            score_prompt_token_ids.append(prompt_tids)
+                            score_keys.append((g_idx, power))
+
+                if score_prompts:
+                    # Call scoring endpoint (uses base model, no LoRA)
+                    score_results = await InferenceEngine().score.remote.aio(
+                        prompts=score_prompts,
+                        completions=score_completions,
+                        prompt_token_ids_list=score_prompt_token_ids,
+                    )
+
+                    # Map results back
+                    for key, result in zip(score_keys, score_results, strict=True):
+                        ref_logprobs_map[key] = result.get("ref_completion_logprobs")
+
+                    logger.info(
+                        f"📊 Computed {len(score_results)} reference logprobs (using base model)"
+                    )
+
+        # 5. SCORING & RETURN
         # -------------------
         trajectories = []
 
@@ -560,14 +759,31 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
 
             for power, data in fork_data[g_idx].items():
                 if power in final_scores:
-                    trajectories.append(
-                        {
-                            "prompt": data["prompt"],
-                            "completion": data["completion"],
-                            "reward": final_scores[power],
-                            "group_id": f"{main_game.game.game_id}_{power}_{current_year}",
-                        }
-                    )
+                    # Get reference logprobs if computed
+                    ref_logprobs = ref_logprobs_map.get((g_idx, power))
+
+                    # If no LoRA used (step 0), generation logprobs ARE reference logprobs
+                    if ref_logprobs is None and lora_name is None:
+                        completion_logprobs = data.get("completion_logprobs", [])
+                        if completion_logprobs:
+                            ref_logprobs = sum(completion_logprobs)
+
+                    traj = {
+                        "prompt": data["prompt"],
+                        "completion": data["completion"],
+                        "reward": final_scores[power],
+                        "group_id": f"{main_game.game.game_id}_{power}_{current_year}",
+                        # Token data for trainer optimization (skip tokenization)
+                        "prompt_token_ids": data.get("prompt_token_ids", []),
+                        "completion_token_ids": data.get("completion_token_ids", []),
+                        "completion_logprobs": data.get("completion_logprobs", []),
+                    }
+
+                    # Add reference logprobs if available (enables skipping trainer ref forward)
+                    if ref_logprobs is not None:
+                        traj["ref_logprobs"] = ref_logprobs
+
+                    trajectories.append(traj)
 
         # Save visualizations
         if should_visualize and vis and visualizers is not None:
@@ -1668,10 +1884,10 @@ async def run_evaluation(
                         lora_name=checkpoint_path,
                     )
 
-                    for response, valid_moves in zip(
+                    for response_data, valid_moves in zip(
                         responses, checkpoint_valid_moves, strict=True
                     ):
-                        orders = extract_orders(response)
+                        orders = extract_orders(response_data["text"])
                         if not orders:
                             # Fallback: use first valid move for each unit
                             orders = [moves[0] for moves in valid_moves.values() if moves]
