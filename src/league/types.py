@@ -14,13 +14,21 @@ class OpponentType(str, Enum):
     """Types of opponents for training and evaluation."""
 
     # Baselines (no LLM inference)
-    RANDOM = "random_bot"
-    CHAOS = "chaos_bot"
+    RANDOM = "random"
+    CHAOS = "chaos"
 
     # Model-based opponents
     BASE_MODEL = "base_model"  # No LoRA adapter
     CHECKPOINT = "checkpoint"  # Historical checkpoint with LoRA
     SELF = "self"  # Current policy (pure self-play)
+
+
+# Mapping from OpponentType to agent registry names
+OPPONENT_TO_AGENT_NAME: dict[OpponentType, str] = {
+    OpponentType.RANDOM: "random_bot",
+    OpponentType.CHAOS: "chaos_bot",
+    OpponentType.BASE_MODEL: "base_model",
+}
 
 
 class AgentType(str, Enum):
@@ -211,12 +219,7 @@ DEFAULT_BASELINES: list[AgentInfo] = [
 
 
 def opponent_type_to_agent_name(opponent_type: OpponentType) -> str:
-    """Convert OpponentType enum to agent name string."""
-    if opponent_type == OpponentType.RANDOM:
-        return "random_bot"
-    elif opponent_type == OpponentType.CHAOS:
-        return "chaos_bot"
-    elif opponent_type == OpponentType.BASE_MODEL:
-        return "base_model"
-    else:
-        raise ValueError(f"Cannot convert {opponent_type} to agent name")
+    """Convert OpponentType enum to agent registry name."""
+    if opponent_type in OPPONENT_TO_AGENT_NAME:
+        return OPPONENT_TO_AGENT_NAME[opponent_type]
+    raise ValueError(f"Cannot convert {opponent_type} to agent name")

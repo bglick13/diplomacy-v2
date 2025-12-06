@@ -70,6 +70,21 @@ class ExperimentConfig(BaseModel):
     )
 
     # =========================================================================
+    # Reward / Scoring Settings
+    # =========================================================================
+    win_bonus: float = Field(
+        default=5.0,
+        description=(
+            "Bonus reward for the sole leader when they have >= winner_threshold_sc supply centers. "
+            "Creates pressure to WIN outright, breaking cooperative stalemate equilibria."
+        ),
+    )
+    winner_threshold_sc: int = Field(
+        default=10,
+        description="Minimum supply centers required to be eligible for win bonus",
+    )
+
+    # =========================================================================
     # Training Loop
     # =========================================================================
     total_steps: int = Field(default=10, description="Total number of training steps")

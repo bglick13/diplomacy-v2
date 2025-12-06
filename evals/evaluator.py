@@ -6,17 +6,10 @@ against various opponents and generate metrics + visualizations.
 """
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
-
-class OpponentType(str, Enum):
-    """Types of opponents for evaluation."""
-
-    RANDOM = "random"
-    CHAOS = "chaos"
-    CHECKPOINT = "checkpoint"  # Another trained checkpoint
-    SELF = "self"  # Self-play (all powers use the same checkpoint)
+# Import shared OpponentType from league module
+from src.league import OpponentType
 
 
 @dataclass
