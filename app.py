@@ -828,53 +828,58 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
         logger.info(f"✅ Model loaded in {model_load_time:.2f}s")
 
         # ==========================================================================
-        # 2. Training Loop (DOUBLE-BUFFERED PIPELINE)
+        # 2. Training Loop (BUFFERED PIPELINE)
         # ==========================================================================
-        # Double buffering strategy: Keep TWO batches of rollouts in flight
+        # Buffering strategy: Keep `buffer_depth` batches of rollouts in flight
         # - This ensures we always have rollouts ready even when they take
         #   longer than training (common with longer horizons)
+        # - Higher buffer_depth = more rollouts in flight = less GPU idle time
+        #   but also more "stale" trajectories (trained on older adapter)
         #
-        # Timeline visualization:
+        # Timeline visualization (buffer_depth=3):
         #   Rollout[0] ──────────────────────►
-        #   Rollout[1] ──────────────────────────────────────►  (pre-launched)
+        #   Rollout[1] ──────────────────────────────────────►
+        #   Rollout[2] ──────────────────────────────────────────────────►
         #                                      Train[0] ────► Train[1] ────►
         #                                                     ↑ No GPU idle!
         #
         # Adapter versioning:
-        # - Steps 0,1: Use base model (no adapter trained yet)
-        # - Step N (N>=2): Uses adapter_v{N-1}
+        # - All pre-launched batches use base model (no adapter trained yet)
+        # - After step N training, new batches use adapter_v{N+1}
         # ==========================================================================
+        from collections import deque
+
         total_trajectories = 0
         all_rewards = []
+        buffer_depth = cfg.buffer_depth
 
-        logger.info("🚀 Starting DOUBLE-BUFFERED pipelined training loop")
+        logger.info(f"🚀 Starting BUFFERED pipelined training loop (buffer_depth={buffer_depth})")
 
-        # Pre-launch TWO batches of rollouts for double buffering
-        # Both use base model initially (no adapter trained yet)
-        logger.info("Step 0: Pre-launching 2 batches of rollouts with base model")
+        # Pre-launch `buffer_depth` batches of rollouts
+        # All use base model initially (no adapter trained yet)
+        logger.info(f"Step 0: Pre-launching {buffer_depth} batches of rollouts with base model")
 
-        # Batch 0: Will be consumed first
-        current_handles = [
-            run_rollout.spawn(cfg.model_dump(), lora_name=None)
-            for _ in range(cfg.num_groups_per_step)
-        ]
-        current_lora_name = None
+        # Each entry is (handles_list, lora_name_used)
+        rollout_buffer: deque[tuple[list, str | None]] = deque()
+        for _ in range(buffer_depth):
+            handles = [
+                run_rollout.spawn(cfg.model_dump(), lora_name=None)
+                for _ in range(cfg.num_groups_per_step)
+            ]
+            rollout_buffer.append((handles, None))
 
-        # Batch 1: Pre-launched buffer (also base model for step 0)
-        next_handles = [
-            run_rollout.spawn(cfg.model_dump(), lora_name=None)
-            for _ in range(cfg.num_groups_per_step)
-        ]
-        next_lora_name = None
-
-        logger.info("📦 Double buffer initialized: 2 batches in flight")
+        total_in_flight = buffer_depth * cfg.num_groups_per_step
+        logger.info(
+            f"📦 Buffer initialized: {buffer_depth} batches ({total_in_flight} rollouts) in flight"
+        )
 
         for step in range(cfg.total_steps):
             step_start = time.time()
             step_metrics: dict[str, Any] = {"step": step}
             step_profile: dict[str, Any] | None = {"step": step} if profile_enabled else None
 
-            # A. Wait for CURRENT rollouts (the earlier batch)
+            # A. Wait for OLDEST rollouts (front of buffer)
+            current_handles, current_lora_name = rollout_buffer.popleft()
             rollout_start = time.time()
             with stopwatch(f"Benchmark_Rollout_{step}"):
                 raw_trajectories = []
@@ -886,38 +891,38 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             step_metrics["rollout_time_s"] = rollout_time
             step_metrics["raw_trajectories"] = len(raw_trajectories)
             step_metrics["rollout_lora"] = current_lora_name or "base_model"
+            step_metrics["buffer_depth_actual"] = (
+                len(rollout_buffer) + 1
+            )  # +1 for the one we just popped
             if step_profile is not None:
                 step_profile["rollout_time_ms"] = rollout_time * 1000
 
-            # B. Shift buffers: next becomes current
-            current_handles = next_handles
-            current_lora_name = next_lora_name
-
-            # C. Launch NEW next batch (if not near the end)
-            # This batch runs during BOTH the wait for current AND training
-            if step < cfg.total_steps - 2:
-                # Determine which adapter to use
-                # After step 0 training, we have adapter_v1
+            # B. Launch NEW batch to maintain buffer (if not near the end)
+            # This batch runs during training, keeping the pipeline full
+            steps_remaining = cfg.total_steps - step - 1
+            if steps_remaining >= buffer_depth:
+                # Determine which adapter to use for the new batch
+                # After step 0 training completes, we'll have adapter_v1
                 if step >= 1:
                     adapter_rel_path = f"{cfg.run_name}/adapter_v{step}"
                     adapter_full_path = MODELS_PATH / cfg.run_name / f"adapter_v{step}"
                     policy_model.save_pretrained(str(adapter_full_path))
                     volume.commit()
-                    next_lora_name = adapter_rel_path
+                    new_lora_name = adapter_rel_path
                     logger.info(f"Saved adapter to {adapter_full_path}")
                 else:
-                    next_lora_name = None  # Still use base model for step 1's rollouts
+                    new_lora_name = None  # Still use base model
 
+                target_step = step + buffer_depth
                 logger.info(
-                    f"🔀 Launching rollouts for step {step + 2} "
-                    f"(using {'base model' if not next_lora_name else next_lora_name})"
+                    f"🔀 Launching rollouts for step {target_step} "
+                    f"(using {'base model' if not new_lora_name else new_lora_name})"
                 )
-                next_handles = [
-                    run_rollout.spawn(cfg.model_dump(), lora_name=next_lora_name)
+                new_handles = [
+                    run_rollout.spawn(cfg.model_dump(), lora_name=new_lora_name)
                     for _ in range(cfg.num_groups_per_step)
                 ]
-            else:
-                next_handles = []  # No more batches to pre-launch
+                rollout_buffer.append((new_handles, new_lora_name))
 
             if not raw_trajectories:
                 logger.warning(f"Step {step}: No trajectories, skipping")
