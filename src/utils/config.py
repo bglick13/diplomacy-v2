@@ -24,6 +24,7 @@ class ExperimentConfig(BaseModel):
     # Environment Settings
     rollout_horizon_years: int = 2
     rollout_visualize_chance: float = 0
+    rollout_no_warmup_chance: float = 0.2
 
     # Training Loop
     total_steps: int = 10
@@ -33,7 +34,7 @@ class ExperimentConfig(BaseModel):
     # Inference Settings
     max_new_tokens: int = 256
     temperature: float = 0.8
-    compact_prompts: bool = False
+    compact_prompts: bool = True
 
     # Profiling / instrumentation
     profiling_mode: ProfilingMode | None = None

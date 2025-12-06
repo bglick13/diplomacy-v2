@@ -377,6 +377,8 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
         # 1. THE WARMUP (Generate a random state)
         # ---------------------------------------
         warmup_phases = random.randint(0, 8)
+        if random.random() < cfg.rollout_no_warmup_chance:
+            warmup_phases = 0
 
         # Init main game
         main_game = DiplomacyWrapper(horizon=99)

@@ -28,7 +28,7 @@ def calculate_final_scores(game: DiplomacyWrapper) -> dict[str, float]:
         # 2. Compute Weighted Score
         # SCs are the primary objective (Real power)
         # Units are secondary (Projected power)
-        raw_score = (n_sc * 1.0) + (n_units * 0.2) + 0.5
+        raw_score = (n_sc * 2.0) + (n_units * 0.2) + 0.5
 
         forward_units = 0
         my_homes = map_home_centers.get(power_name, set())
@@ -47,7 +47,7 @@ def calculate_final_scores(game: DiplomacyWrapper) -> dict[str, float]:
                 forward_units += 1
 
         # Weight this highly to force the model to explore openings
-        raw_score += forward_units * 0.2
+        raw_score += forward_units * 0.1
 
         scores[power_name] = raw_score
 
