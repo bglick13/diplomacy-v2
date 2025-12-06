@@ -93,12 +93,9 @@ TRACE_PATH = Path("/traces")
         str(VOLUME_PATH): volume,
         str(HF_CACHE_PATH): hf_cache_volume,  # Cache HuggingFace models
     },
-    container_idle_timeout=60 * 10,  # 10 minutes
-    # Allow multiple containers for parallel sweeps/experiments
-    # Each container can batch requests internally via vLLM
-    # Trade-off: More containers = more parallelism but less batching per container
-    concurrency_limit=1,
-    allow_concurrent_inputs=200,  # Per-container concurrent request limit
+    scaledown_window=60 * 10,  # 10 minutes - longer to prevent churn
+    allow_concurrent_inputs=128,  # Queue depth for continuous batching
+    buffer_containers=1,
 )
 class InferenceEngine:
     model_id: str = modal.parameter(default="Qwen/Qwen2.5-7B-Instruct")
@@ -168,6 +165,23 @@ class InferenceEngine:
         print("✅ Engine Ready (with dynamic LoRA support).")
 
     @modal.method()
+    def warmup(self) -> dict:
+        """
+        Lightweight warmup method to pre-spin containers.
+        Call this in parallel to force Modal to spin up multiple containers.
+        Returns container info for logging.
+        """
+        import os
+        import socket
+
+        return {
+            "status": "ready",
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "model_id": self.model_id,
+        }
+
+    @modal.method()
     async def generate(
         self, prompts: list[str], valid_moves: list[dict], lora_name: str | None = None
     ):
@@ -209,8 +223,28 @@ class InferenceEngine:
                     async with self._adapter_lock:
                         # Double-check after acquiring lock (another request might have loaded it)
                         if lora_name not in self._loaded_adapters:
-                            print(f"📂 Reloading volume for NEW adapter: {lora_name}")
-                            volume.reload()
+                            print(f"📂 Loading NEW adapter: {lora_name}")
+
+                            # Wait for adapter to appear with retries
+                            # The trainer saves adapters to the volume, which takes time to sync
+                            max_retries = 5
+                            for attempt in range(max_retries):
+                                # Only reload volume if path doesn't exist yet
+                                if not os.path.exists(full_path):
+                                    try:
+                                        volume.reload()
+                                    except Exception as e:
+                                        print(f"⚠️ Volume reload warning: {e}")
+
+                                if os.path.exists(full_path):
+                                    break
+
+                                if attempt < max_retries - 1:
+                                    wait_time = 1 + attempt  # 1, 2, 3, 4 seconds
+                                    print(
+                                        f"⏳ Adapter not found (attempt {attempt + 1}), waiting {wait_time}s..."
+                                    )
+                                    await asyncio.sleep(wait_time)
 
                             if not os.path.exists(full_path):
                                 # List what's in models dir for debugging
@@ -218,7 +252,9 @@ class InferenceEngine:
                                 if os.path.exists(models_dir):
                                     contents = os.listdir(models_dir)
                                     print(f"📁 Contents of {models_dir}: {contents}")
-                                raise RuntimeError(f"LoRA path does not exist: {full_path}")
+                                raise RuntimeError(
+                                    f"LoRA path does not exist after retries: {full_path}"
+                                )
 
                             # List adapter files for confirmation
                             adapter_files = os.listdir(full_path)
@@ -383,9 +419,9 @@ class InferenceEngine:
             """Score a single sequence using base model."""
             request_id = str(uuid.uuid4())
 
-            # Scoring params: no generation, just compute logprobs for input
+            # Scoring params: generate 1 token (vLLM requires >= 1) but we only care about prompt_logprobs
             sampling_params = SamplingParams(  # type: ignore[call-arg, misc]
-                max_tokens=0,  # type: ignore[arg-type]  # Don't generate
+                max_tokens=1,  # type: ignore[arg-type]  # Min 1 required by vLLM, we ignore the output
                 prompt_logprobs=1,  # type: ignore[arg-type]  # Get logprobs for all input tokens
             )
 
@@ -498,11 +534,16 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
     # NOTE: We use vLLM's lora_filesystem_resolver to load adapters dynamically
     # The resolver looks in VLLM_LORA_RESOLVER_CACHE_DIR (/data/models) for the adapter
     # We just need to reload the volume to see newly committed adapter files
+    volume_reload_time = 0.0
     if lora_name:
         logger.info(f"📂 Using LoRA adapter: {lora_name}")
         global CURRENT_ROLLOUT_LORA
         if CURRENT_ROLLOUT_LORA != lora_name:
+            reload_start = time.time()
             volume.reload()  # Ensure we see the latest adapter files
+            volume_reload_time = time.time() - reload_start
+            logger.info(f"⏱️ Volume reload took {volume_reload_time:.2f}s")
+
             full_path = f"/data/models/{lora_name}"
             if os.path.exists(full_path):
                 files = os.listdir(full_path)
@@ -522,7 +563,9 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
         should_visualize = random.random() < cfg.rollout_visualize_chance
 
         # Initialize the LLM agent for prompt generation
-        prompt_config = PromptConfig(compact_mode=cfg.compact_prompts)
+        prompt_config = PromptConfig(
+            compact_mode=cfg.compact_prompts, prefix_cache_optimized=cfg.prefix_cache_optimized
+        )
         agent = LLMAgent(config=prompt_config)
 
         # 1. THE WARMUP (Generate a random state)
@@ -560,7 +603,9 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
                 inputs = main_game.get_all_inputs(agent=agent)
                 metrics.inference_calls += 1
 
-                raw_responses = await InferenceEngine().generate.remote.aio(
+                raw_responses = await InferenceEngine(
+                    model_id=cfg.base_model_id
+                ).generate.remote.aio(
                     prompts=inputs["prompts"],
                     valid_moves=inputs["valid_moves"],
                     lora_name=lora_name,
@@ -642,7 +687,9 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
                     f"Game {g_idx} Step {step_count} (Batch Size: {len(inputs['prompts'])})"
                 ):
                     metrics.inference_calls += 1
-                    responses = await InferenceEngine().generate.remote.aio(
+                    responses = await InferenceEngine(
+                        model_id=cfg.base_model_id
+                    ).generate.remote.aio(
                         prompts=inputs["prompts"],
                         valid_moves=inputs["valid_moves"],
                         lora_name=lora_name,
@@ -736,7 +783,9 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
 
                 if score_prompts:
                     # Call scoring endpoint (uses base model, no LoRA)
-                    score_results = await InferenceEngine().score.remote.aio(
+                    score_results = await InferenceEngine(
+                        model_id=cfg.base_model_id
+                    ).score.remote.aio(
                         prompts=score_prompts,
                         completions=score_completions,
                         prompt_token_ids_list=score_prompt_token_ids,
@@ -815,6 +864,10 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
                 "empty_responses": metrics.empty_responses,
                 "partial_responses": metrics.partial_responses,
                 "extraction_rate": metrics.get_extraction_rate(),
+            },
+            "timing": {
+                "volume_reload_s": volume_reload_time,
+                "total_s": time.time() - rollout_start_time,
             },
         }
 
@@ -1013,6 +1066,14 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
 
     try:
         # ==========================================================================
+        # 0. Pre-warm Inference Containers via Autoscaler
+        # ==========================================================================
+        # vLLM cold start is slow (~30-60s). The InferenceEngine class is configured
+        # with buffer_containers=1 at the decorator level, which keeps at least 1
+        # container warm automatically. We spawn warmup calls to ensure containers
+        # are actually ready.
+
+        # ==========================================================================
         # 1. Model Loading (Timed)
         # ==========================================================================
         logger.info(f"🚀 Starting GRPO Training: {cfg.run_name}")
@@ -1118,9 +1179,13 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     "partial_responses": 0,
                     "extraction_rate": 1.0,
                 }
+                # Aggregate timing stats from rollouts
+                max_volume_reload_s = 0.0
+                max_rollout_total_s = 0.0
+
                 for handle in current_handles:
                     result = handle.get()  # Block until this rollout completes
-                    # Unpack new return format: {"trajectories": [...], "extraction_stats": {...}}
+                    # Unpack new return format: {"trajectories": [...], "extraction_stats": {...}, "timing": {...}}
                     raw_trajectories.extend(result["trajectories"])
                     # Aggregate extraction stats
                     stats = result["extraction_stats"]
@@ -1128,6 +1193,12 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     step_extraction_stats["orders_extracted"] += stats["orders_extracted"]  # type: ignore[operator]
                     step_extraction_stats["empty_responses"] += stats["empty_responses"]  # type: ignore[operator]
                     step_extraction_stats["partial_responses"] += stats["partial_responses"]  # type: ignore[operator]
+                    # Track max timing stats (slowest rollout determines wait time)
+                    timing = result.get("timing", {})
+                    max_volume_reload_s = max(
+                        max_volume_reload_s, timing.get("volume_reload_s", 0.0)
+                    )
+                    max_rollout_total_s = max(max_rollout_total_s, timing.get("total_s", 0.0))
 
                 # Compute step-level extraction rate
                 orders_expected = step_extraction_stats["orders_expected"]
@@ -1145,6 +1216,9 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 len(rollout_buffer) + 1
             )  # +1 for the one we just popped
             step_metrics["extraction_stats"] = step_extraction_stats
+            # Track slowest rollout timing (identifies bottlenecks)
+            step_metrics["max_volume_reload_s"] = max_volume_reload_s
+            step_metrics["max_rollout_total_s"] = max_rollout_total_s
             if step_profile is not None:
                 step_profile["rollout_time_ms"] = rollout_time * 1000
 
@@ -1283,6 +1357,9 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     "benchmark/trajectories": len(batch_data),
                     "benchmark/grad_norm": grad_norm,
                     "benchmark/pipeline_overlap_s": pipeline_overlap,
+                    # Rollout timing breakdown (diagnose spikes)
+                    "rollout/max_volume_reload_s": max_volume_reload_s,
+                    "rollout/max_total_s": max_rollout_total_s,
                     # Order extraction metrics (monitor prompt structure regressions)
                     "extraction/rate": step_extraction_stats["extraction_rate"],
                     "extraction/orders_expected": step_extraction_stats["orders_expected"],
@@ -1363,6 +1440,10 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
         raise
 
     finally:
+        # Note: Autoscaler is configured via buffer_containers=1 at the class decorator level.
+        # Containers will scale down automatically based on scaledown_window after inactivity.
+        logger.info("🔄 Training complete. Containers will scale down after inactivity.")
+
         gpu_logger.stop()
         if profiler is not None:
             profiler.__exit__(None, None, None)
