@@ -767,9 +767,12 @@ async def run_rollout(
                 power_results: dict[int, dict] = {}
 
                 # 1. Handle baseline bots (no LLM inference needed)
+                baseline_count = 0
+                llm_count = 0
                 for idx, power in enumerate(inputs["power_names"]):
                     adapter = power_adapters.get(power)
                     if adapter in BASELINE_BOTS:
+                        baseline_count += 1
                         bot = BASELINE_BOTS[adapter]
                         orders = bot.get_orders(game, power)
                         power_results[idx] = {
@@ -781,6 +784,8 @@ async def run_rollout(
                                 "completion_logprobs": [],
                             },
                         }
+                    else:
+                        llm_count += 1
 
                 # 2. Group LLM powers by adapter for batched inference
                 # Map adapter -> list of (original_idx, prompt, valid_moves)
@@ -1268,6 +1273,50 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
         logger.info(f"✅ Model loaded in {model_load_time:.2f}s")
 
         # ==========================================================================
+        # 1.5 League Training Initialization (if enabled)
+        # ==========================================================================
+        league_registry = None
+        pfsp_matchmaker = None
+
+        if cfg.league_training:
+            from pathlib import Path
+
+            from src.league import LeagueRegistry, PFSPConfig, PFSPMatchmaker
+
+            logger.info("🏆 League training enabled - initializing registry and matchmaker")
+
+            # Initialize or load league registry
+            registry_path = Path(cfg.league_registry_path)
+            league_registry = LeagueRegistry(registry_path, run_name=cfg.run_name)
+
+            # Configure PFSP with weights from config
+            pfsp_config = PFSPConfig(
+                self_play_weight=cfg.pfsp_self_play_weight,
+                peer_weight=cfg.pfsp_peer_weight,
+                exploitable_weight=cfg.pfsp_exploitable_weight,
+                baseline_weight=cfg.pfsp_baseline_weight,
+            )
+            pfsp_matchmaker = PFSPMatchmaker(league_registry, pfsp_config)
+
+            logger.info(
+                f"📊 League status: {league_registry.num_checkpoints} checkpoints, "
+                f"best Elo: {league_registry.best_elo:.0f} ({league_registry.best_agent})"
+            )
+
+            # Log league config to WandB
+            wandb.config.update(
+                {
+                    "league_enabled": True,
+                    "pfsp_weights": {
+                        "self": cfg.pfsp_self_play_weight,
+                        "peer": cfg.pfsp_peer_weight,
+                        "exploitable": cfg.pfsp_exploitable_weight,
+                        "baseline": cfg.pfsp_baseline_weight,
+                    },
+                }
+            )
+
+        # ==========================================================================
         # 2. Training Loop (BUFFERED PIPELINE)
         # ==========================================================================
         # Buffering strategy: Keep `buffer_depth` batches of rollouts in flight
@@ -1299,13 +1348,75 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
         # All use base model initially (no adapter trained yet)
         logger.info(f"Step 0: Pre-launching {buffer_depth} batches of rollouts with base model")
 
-        # Each entry is (handles_list, lora_name_used)
+        # Helper function to spawn rollouts (handles both legacy and league modes)
+        def spawn_rollouts_batch(hero_adapter_path: str | None) -> list:
+            """
+            Spawn a batch of rollouts with appropriate opponent sampling.
+
+            Args:
+                hero_adapter_path: Path to the hero's LoRA adapter (e.g., "run/adapter_v5"),
+                                  or None for base model.
+            """
+            import random
+
+            handles = []
+            for _ in range(cfg.num_groups_per_step):
+                if cfg.league_training and pfsp_matchmaker is not None:
+                    # League training: hero uses latest adapter, opponents from registry
+                    POWERS = [
+                        "AUSTRIA",
+                        "ENGLAND",
+                        "FRANCE",
+                        "GERMANY",
+                        "ITALY",
+                        "RUSSIA",
+                        "TURKEY",
+                    ]
+                    hero_power = random.choice(POWERS)
+                    opponent_powers = [p for p in POWERS if p != hero_power]
+
+                    # Build power_adapters: hero uses provided path, opponents from PFSP
+                    power_adapters: dict[str, str | None] = {}
+                    power_adapters[hero_power] = hero_adapter_path
+
+                    # Sample opponents based on registry (cold start = all baselines)
+                    if league_registry and league_registry.num_checkpoints > 0:
+                        # Use PFSP sampling for opponents
+                        for opp_power in opponent_powers:
+                            category = pfsp_matchmaker._sample_category()
+                            all_checkpoints = league_registry.get_checkpoints()
+                            all_baselines = league_registry.get_baselines()
+                            # Use base Elo since we don't track hero's Elo in real-time
+                            agent = pfsp_matchmaker._sample_agent_for_category(
+                                category,
+                                hero_agent="current_policy",
+                                hero_elo=1000.0,
+                                checkpoints=all_checkpoints,
+                                baselines=all_baselines,
+                            )
+                            power_adapters[opp_power] = pfsp_matchmaker._agent_to_adapter(agent)
+                    else:
+                        # Cold start: all opponents are baselines
+                        baseline_cycle = ["random_bot", "chaos_bot"]
+                        for i, opp_power in enumerate(opponent_powers):
+                            power_adapters[opp_power] = baseline_cycle[i % 2]
+
+                    handles.append(
+                        run_rollout.spawn(
+                            cfg.model_dump(),
+                            power_adapters=power_adapters,
+                            hero_power=hero_power,
+                        )
+                    )
+                else:
+                    # Legacy mode: same adapter for all powers
+                    handles.append(run_rollout.spawn(cfg.model_dump(), lora_name=hero_adapter_path))
+            return handles
+
+        # Each entry is (handles_list, hero_adapter_path)
         rollout_buffer: deque[tuple[list, str | None]] = deque()
         for _ in range(buffer_depth):
-            handles = [
-                run_rollout.spawn(cfg.model_dump(), lora_name=None)
-                for _ in range(cfg.num_groups_per_step)
-            ]
+            handles = spawn_rollouts_batch(hero_adapter_path=None)  # Use base model initially
             rollout_buffer.append((handles, None))
 
         total_in_flight = buffer_depth * cfg.num_groups_per_step
@@ -1380,26 +1491,41 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             if steps_remaining >= buffer_depth:
                 # Determine which adapter to use for the new batch
                 # After step 0 training completes, we'll have adapter_v1
+                new_hero_agent: str | None = None
+
                 if step >= 1:
                     adapter_rel_path = f"{cfg.run_name}/adapter_v{step}"
                     adapter_full_path = MODELS_PATH / cfg.run_name / f"adapter_v{step}"
                     policy_model.save_pretrained(str(adapter_full_path))
                     volume.commit()
-                    new_lora_name = adapter_rel_path
                     logger.info(f"Saved adapter to {adapter_full_path}")
-                else:
-                    new_lora_name = None  # Still use base model
+
+                    # League training: Add checkpoint to registry if criteria met
+                    if cfg.league_training and league_registry is not None:
+                        from src.league import should_add_to_league
+
+                        checkpoint_name = f"adapter_v{step}"
+                        if should_add_to_league(step, league_registry):
+                            league_registry.add_checkpoint(
+                                name=checkpoint_name,
+                                path=adapter_rel_path,
+                                step=step,
+                                parent=f"adapter_v{step - 1}" if step > 1 else "base_model",
+                            )
+                            logger.info(f"🏆 Added checkpoint {checkpoint_name} to league")
+
+                    # Always use the adapter path directly for rollouts
+                    # (checkpoint registry is for Elo tracking, not adapter loading)
+                    new_hero_agent = adapter_rel_path
 
                 target_step = step + buffer_depth
                 logger.info(
                     f"🔀 Launching rollouts for step {target_step} "
-                    f"(using {'base model' if not new_lora_name else new_lora_name})"
+                    f"(using {'base model' if not new_hero_agent else new_hero_agent})"
                 )
-                new_handles = [
-                    run_rollout.spawn(cfg.model_dump(), lora_name=new_lora_name)
-                    for _ in range(cfg.num_groups_per_step)
-                ]
-                rollout_buffer.append((new_handles, new_lora_name))
+
+                new_handles = spawn_rollouts_batch(hero_adapter_path=new_hero_agent)
+                rollout_buffer.append((new_handles, new_hero_agent))
 
             if not raw_trajectories:
                 logger.warning(f"Step {step}: No trajectories, skipping")

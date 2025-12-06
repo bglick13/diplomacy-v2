@@ -21,6 +21,11 @@ from src.league.elo import (
     update_elo_from_match,
     update_elo_multiplayer,
 )
+from src.league.matchmaker import (
+    MatchmakingResult,
+    PFSPConfig,
+    PFSPMatchmaker,
+)
 from src.league.registry import (
     LeagueRegistry,
     get_checkpoint_name,
@@ -43,6 +48,7 @@ __all__ = [
     "AgentType",
     "AgentInfo",
     "MatchResult",
+    "MatchmakingResult",
     "LeagueMetadata",
     "DEFAULT_BASELINES",
     "OPPONENT_TO_AGENT_NAME",
@@ -51,6 +57,9 @@ __all__ = [
     "LeagueRegistry",
     "should_add_to_league",
     "get_checkpoint_name",
+    # Matchmaker
+    "PFSPMatchmaker",
+    "PFSPConfig",
     # Elo
     "update_elo_multiplayer",
     "update_elo_from_match",
