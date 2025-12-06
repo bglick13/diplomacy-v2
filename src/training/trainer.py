@@ -206,7 +206,7 @@ def process_trajectories(
             processed_batch.append(processed_item)
 
     stats.total_trajectories = len(processed_batch)
-    stats.total_tokens = total_completion_tokens
+    stats.total_tokens = int(total_completion_tokens)
     stats.avg_completion_tokens = (
         total_completion_tokens / len(processed_batch) if processed_batch else 0.0
     )
