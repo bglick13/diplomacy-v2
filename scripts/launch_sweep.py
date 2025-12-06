@@ -30,7 +30,7 @@ Usage:
     python scripts/launch_sweep.py --run C
 
     # Run with fewer steps for testing
-    python scripts/launch_sweep.py --steps 10 --run A
+    python scripts/launch_sweep.py --total-steps 10 --run A
 
     # Dry run (show config without launching)
     python scripts/launch_sweep.py --dry-run
@@ -44,6 +44,8 @@ Usage:
     # Use smaller model for faster iteration
     python scripts/launch_sweep.py --fast
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -168,6 +170,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+
+    # Core experiment settings (subset of ExperimentConfig)
     parser.add_argument(
         "--run",
         type=str,
@@ -176,23 +180,35 @@ def main():
         help="Which configuration to run (A=baseline, B=deep, C=broad, all=sequential)",
     )
     parser.add_argument(
-        "--steps",
+        "--total-steps",
         type=int,
         default=100,
+        dest="total_steps",
         help="Number of training steps per run (default: 100)",
     )
     parser.add_argument(
-        "--groups",
+        "--num-groups-per-step",
         type=int,
         default=8,
+        dest="num_groups_per_step",
         help="Number of rollout groups per step (default: 8)",
     )
     parser.add_argument(
-        "--lr",
+        "--learning-rate",
         type=float,
         default=1e-5,
+        dest="learning_rate",
         help="Learning rate (default: 1e-5)",
     )
+    parser.add_argument(
+        "--base-model-id",
+        type=str,
+        default="Qwen/Qwen2.5-7B-Instruct",
+        dest="base_model_id",
+        help="Model ID for inference (default: Qwen/Qwen2.5-7B-Instruct)",
+    )
+
+    # Sweep-specific options
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -202,12 +218,6 @@ def main():
         "--parallel",
         action="store_true",
         help="Run all configurations in parallel (3x cost, 3x faster)",
-    )
-    parser.add_argument(
-        "--model-id",
-        type=str,
-        default="Qwen/Qwen2.5-7B-Instruct",
-        help="Model ID for inference (default: Qwen/Qwen2.5-7B-Instruct)",
     )
     parser.add_argument(
         "--fast",
@@ -224,7 +234,7 @@ def main():
 
     # Apply --fast flag to use smaller model
     if args.fast:
-        args.model_id = "Qwen/Qwen2.5-3B-Instruct"
+        args.base_model_id = "Qwen/Qwen2.5-3B-Instruct"
         print("⚡ FAST MODE: Using Qwen2.5-3B-Instruct for faster iteration")
 
     # Determine which configs to run
@@ -238,16 +248,16 @@ def main():
     print("\n" + "=" * 80)
     print("🔬 POWER LAWS EXPERIMENT: Compute vs. Insight")
     print("=" * 80)
-    print(f"\nTotal Steps: {args.steps}")
-    print(f"Groups/Step: {args.groups}")
-    print(f"Learning Rate: {args.lr}")
-    print(f"Model: {args.model_id}")
+    print(f"\nTotal Steps: {args.total_steps}")
+    print(f"Groups/Step: {args.num_groups_per_step}")
+    print(f"Learning Rate: {args.learning_rate}")
+    print(f"Model: {args.base_model_id}")
     print(f"Parallel: {args.parallel}")
     print(f"Detach: {args.detach}")
     print("\nConfigurations to run:")
 
     for config in configs_to_show:
-        sim_years = config.total_simulated_years(args.groups, args.steps)
+        sim_years = config.total_simulated_years(args.num_groups_per_step, args.total_steps)
         print(f"  [{config.name}] {config.description}")
         print(
             f"       Horizon: {config.rollout_horizon_years} | Samples: {config.samples_per_group}"
@@ -269,10 +279,10 @@ def main():
     if args.detach:
         # Fire and forget
         handle = sweep_fn.spawn(
-            total_steps=args.steps,
-            num_groups_per_step=args.groups,
-            learning_rate=args.lr,
-            model_id=args.model_id,
+            total_steps=args.total_steps,
+            num_groups_per_step=args.num_groups_per_step,
+            learning_rate=args.learning_rate,
+            model_id=args.base_model_id,
             run_configs=run_configs,
             parallel=args.parallel,
         )
@@ -290,10 +300,10 @@ def main():
 
     try:
         result = sweep_fn.remote(
-            total_steps=args.steps,
-            num_groups_per_step=args.groups,
-            learning_rate=args.lr,
-            model_id=args.model_id,
+            total_steps=args.total_steps,
+            num_groups_per_step=args.num_groups_per_step,
+            learning_rate=args.learning_rate,
+            model_id=args.base_model_id,
             run_configs=run_configs,
             parallel=args.parallel,
         )

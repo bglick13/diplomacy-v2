@@ -4,7 +4,7 @@ Training is too slow to run experiments and learn anything meaningful at a reaso
 ## Last training run
 - `python scripts/benchmark_training.py --full --steps 20 --groups 32 --samples 2 --lr 1e-5 --horizon 4`
 - ~1 hour to run 20 steps (≈180 s/step). Rollouts alone take 70‑130 s and the trainer GPU never exceeds ~40‑50 % utilization.
-- `train_grpo_benchmark` already implements double-buffered rollouts, so the remaining latency is real work (game sim + inference + dual forward in the loss).
+- `train_grpo` already implements double-buffered rollouts, so the remaining latency is real work (game sim + inference + dual forward in the loss).
 
 ## Observed bottlenecks
 1. **Rollout throughput** (`app.py::run_rollout`)
@@ -87,7 +87,7 @@ Training is too slow to run experiments and learn anything meaningful at a reaso
 2. Split `GRPOLoss` into two modules: `PolicyForward` (LoRA enabled, grad) and `ReferenceForward` (base model only, compiled). Share embeddings/output head to avoid duplication.
 3. Experiment with `torch.compile(policy_model, mode="max-autotune")` after we remove adapter toggling from the compiled graph (possible if we keep separate policy/ref models).
 4. Increase `chunk_size` adaptively by measuring max sequence length; log actual tokens per batch and adjust at runtime.
-5. Evaluate gradient accumulation vs larger physical batch to keep GPU busy but within VRAM budget; add CLI flag to `train_grpo_benchmark` for quick sweeps.
+5. Evaluate gradient accumulation vs larger physical batch to keep GPU busy but within VRAM budget; add CLI flag to `train_grpo` for quick sweeps.
 
 ### 4. Trajectory processing & data plumbing
 **Opportunities**
@@ -102,12 +102,12 @@ Training is too slow to run experiments and learn anything meaningful at a reaso
 
 ### 5. Scheduling & resource usage
 **Opportunities**
-- Multi-step rollout buffer: always keep 2‑3 steps of rollouts queued ahead of the trainer. Already partially implemented in `train_grpo_benchmark`; port it to `train_grpo`.
+- Multi-step rollout buffer: always keep 2‑3 steps of rollouts queued ahead of the trainer. Already partially implemented in `train_grpo`; port it to `train_grpo`.
 - Autoscale rollout workers based on trainer demand; use Modal `Function.starmap` with `concurrency_limit` per region.
 - Separate warm pool for inference vs rollouts (cold start cost differs).
 
 **Implementation next steps**
-1. Refactor `train_grpo` to share the double-buffer logic from `train_grpo_benchmark`, but generalize to `buffer_depth` flag and integrate the continuous rollout queue.
+1. Refactor `train_grpo` to share the double-buffer logic from `train_grpo`, but generalize to `buffer_depth` flag and integrate the continuous rollout queue.
 2. Introduce a small controller process that monitors outstanding rollouts and spins up/down workers (Modal `Function.allow_concurrent_inputs`).
 3. Add CLI knobs in `scripts/benchmark_training.py` to explore `buffer_depth`, `num_groups`, `samples`, and `horizon` quickly.
 

@@ -7,27 +7,31 @@ and logs results + visualizations to WandB.
 
 Usage:
     # Evaluate a specific checkpoint
-    python scripts/run_eval.py --checkpoint "benchmark-20251205/adapter_v50"
+    python scripts/run_eval.py --checkpoint-path "benchmark-20251205/adapter_v50"
 
     # Evaluate against specific opponents
-    python scripts/run_eval.py --checkpoint "..." --opponents random chaos
+    python scripts/run_eval.py --checkpoint-path "..." --opponents random chaos
 
     # More games for statistical significance
-    python scripts/run_eval.py --checkpoint "..." --games 20
+    python scripts/run_eval.py --checkpoint-path "..." --games-per-opponent 20
 
     # Quick smoke test
-    python scripts/run_eval.py --checkpoint "..." --games 2 --smoke
+    python scripts/run_eval.py --checkpoint-path "..." --smoke
 
     # List available checkpoints
     python scripts/run_eval.py --list-checkpoints
 
     # Fire and forget (detach after launching)
-    python scripts/run_eval.py --checkpoint "..." --detach
+    python scripts/run_eval.py --checkpoint-path "..." --detach
 """
+
+from __future__ import annotations
 
 import argparse
 
 import modal
+
+from src.utils.config import EvalConfig, add_config_args, config_from_args
 
 volume = modal.Volume.from_name("diplomacy-data")
 
@@ -44,6 +48,10 @@ def list_checkpoints():
         run_files = volume.listdir(run_path)
         for file in run_files:
             checkpoints.append(file.path)
+
+    for ckpt in sorted(checkpoints):
+        print(f"  {ckpt}")
+
     return sorted(checkpoints)
 
 
@@ -53,67 +61,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        help="Checkpoint path relative to /data/models (e.g., 'benchmark-20251205/adapter_v50')",
-    )
-    parser.add_argument(
-        "--opponents",
-        nargs="+",
-        default=["random", "chaos"],
-        help="Opponent types to evaluate against (default: random chaos)",
-    )
-    parser.add_argument(
-        "--games",
-        type=int,
-        default=10,
-        help="Number of games per opponent (default: 10)",
-    )
-    parser.add_argument(
-        "--max-years",
-        type=int,
-        default=10,
-        help="Maximum game length in years (default: 10)",
-    )
-    parser.add_argument(
-        "--powers",
-        nargs="+",
-        default=None,
-        help="Powers for checkpoint to play (default: FRANCE)",
-    )
-    parser.add_argument(
-        "--model-id",
-        type=str,
-        default="Qwen/Qwen2.5-7B-Instruct",
-        help="Base model ID (default: Qwen/Qwen2.5-7B-Instruct)",
-    )
-    parser.add_argument(
-        "--no-viz",
-        action="store_true",
-        help="Disable visualization generation",
-    )
-    parser.add_argument(
-        "--viz-rate",
-        type=float,
-        default=0.3,
-        help="Fraction of games to visualize (default: 0.3)",
-    )
-    parser.add_argument(
-        "--no-wandb",
-        action="store_true",
-        help="Disable WandB logging",
-    )
-    parser.add_argument(
-        "--wandb-name",
-        type=str,
-        default=None,
-        help="Custom WandB run name",
-    )
+
+    # Add EvalConfig args (auto-generated from Pydantic model)
+    add_config_args(parser, EvalConfig)
+
+    # Add script-specific args
     parser.add_argument(
         "--smoke",
         action="store_true",
-        help="Quick smoke test (2 games, no viz)",
+        help="Quick smoke test (2 games, no visualizations)",
     )
     parser.add_argument(
         "--detach",
@@ -134,26 +90,30 @@ def main():
         return
 
     # Require checkpoint for evaluation
-    if not args.checkpoint:
-        parser.error("--checkpoint is required (use --list-checkpoints to see available)")
+    if not hasattr(args, "checkpoint_path") or not args.checkpoint_path:
+        parser.error("--checkpoint-path is required (use --list-checkpoints to see available)")
 
     # Apply smoke test overrides
     if args.smoke:
-        args.games = 2
-        args.no_viz = True
+        args.games_per_opponent = 2
+        args.visualize = False
         print("🔬 Smoke test mode: 2 games, no visualizations")
+
+    # Build config from args
+    cfg = config_from_args(args, EvalConfig)  # type: ignore[type-var]
+    assert isinstance(cfg, EvalConfig)
 
     # Print config
     print("\n" + "=" * 60)
     print("🎯 CHECKPOINT EVALUATION")
     print("=" * 60)
-    print(f"Checkpoint: {args.checkpoint}")
-    print(f"Opponents: {args.opponents}")
-    print(f"Games per opponent: {args.games}")
-    print(f"Max years: {args.max_years}")
-    print(f"Eval powers: {args.powers or ['FRANCE']}")
-    print(f"Visualize: {not args.no_viz} (rate: {args.viz_rate})")
-    print(f"WandB: {not args.no_wandb}")
+    print(f"Checkpoint: {cfg.checkpoint_path}")
+    print(f"Opponents: {cfg.opponents}")
+    print(f"Games per opponent: {cfg.games_per_opponent}")
+    print(f"Max years: {cfg.max_years}")
+    print(f"Eval powers: {cfg.eval_powers}")
+    print(f"Visualize: {cfg.visualize} (rate: {cfg.visualize_sample_rate})")
+    print(f"WandB: {cfg.log_to_wandb}")
     print()
 
     # Get the evaluation function
@@ -162,16 +122,16 @@ def main():
     if args.detach:
         # Fire and forget
         handle = run_evaluation.spawn(
-            checkpoint_path=args.checkpoint,
-            opponents=args.opponents,
-            games_per_opponent=args.games,
-            max_years=args.max_years,
-            eval_powers=args.powers,
-            model_id=args.model_id,
-            visualize=not args.no_viz,
-            visualize_sample_rate=args.viz_rate,
-            log_to_wandb=not args.no_wandb,
-            wandb_run_name=args.wandb_name,
+            checkpoint_path=cfg.checkpoint_path,
+            opponents=cfg.opponents,
+            games_per_opponent=cfg.games_per_opponent,
+            max_years=cfg.max_years,
+            eval_powers=cfg.eval_powers,
+            model_id=cfg.base_model_id,
+            visualize=cfg.visualize,
+            visualize_sample_rate=cfg.visualize_sample_rate,
+            log_to_wandb=cfg.log_to_wandb,
+            wandb_run_name=cfg.wandb_run_name,
         )
         print(f"✅ Evaluation launched! Function ID: {handle.object_id}")
         print("\nTo check status later:")
@@ -185,16 +145,16 @@ def main():
     print()
 
     result = run_evaluation.remote(
-        checkpoint_path=args.checkpoint,
-        opponents=args.opponents,
-        games_per_opponent=args.games,
-        max_years=args.max_years,
-        eval_powers=args.powers,
-        model_id=args.model_id,
-        visualize=not args.no_viz,
-        visualize_sample_rate=args.viz_rate,
-        log_to_wandb=not args.no_wandb,
-        wandb_run_name=args.wandb_name,
+        checkpoint_path=cfg.checkpoint_path,
+        opponents=cfg.opponents,
+        games_per_opponent=cfg.games_per_opponent,
+        max_years=cfg.max_years,
+        eval_powers=cfg.eval_powers,
+        model_id=cfg.base_model_id,
+        visualize=cfg.visualize,
+        visualize_sample_rate=cfg.visualize_sample_rate,
+        log_to_wandb=cfg.log_to_wandb,
+        wandb_run_name=cfg.wandb_run_name,
     )
 
     # Print results

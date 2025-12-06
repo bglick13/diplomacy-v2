@@ -602,386 +602,8 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
 
 
 # ==============================================================================
-# 5. TRAINER (THE LEARNER)
+# 5. TRAINER (THE LEARNER) - Consolidated from train_grpo and train_grpo_benchmark
 # ==============================================================================
-
-
-@app.function(
-    image=gpu_image,
-    gpu="H100",  # Need high VRAM for Training + Reference Model
-    volumes={str(VOLUME_PATH): volume, str(TRACE_PATH): trace_volume},
-    timeout=86400,
-    secrets=[
-        modal.Secret.from_name("axiom-secrets"),
-        modal.Secret.from_name("wandb-secret"),
-    ],
-)
-def train_grpo():
-    """
-    Main GRPO training loop.
-
-    Architecture:
-    1. Load base model + LoRA adapter (policy)
-    2. For each step:
-       a. Save adapter for inference workers
-       b. Launch parallel rollouts (E-step)
-       c. Process trajectories and compute advantages
-       d. Update policy with GRPO loss (M-step)
-       e. Log metrics to Axiom + WandB
-    """
-    import asyncio
-    import time
-
-    import torch
-    import wandb
-    from peft import LoraConfig, get_peft_model
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    from src.training.loss import GRPOLoss
-    from src.training.trainer import process_trajectories
-    from src.utils.config import ExperimentConfig
-    from src.utils.observability import (
-        GPUStatsLogger,
-        axiom,
-        log_checkpoint_saved,
-        log_training_complete,
-        log_training_error,
-        log_training_start,
-        log_training_step,
-        log_trajectory_processing,
-        logger,
-        stopwatch,
-    )
-
-    # ==========================================================================
-    # Configuration
-    # ==========================================================================
-    cfg = ExperimentConfig()
-    model_id = "Qwen/Qwen2.5-7B-Instruct"
-    learning_rate = 1e-5
-    max_grad_norm = 1.0  # Gradient clipping threshold
-    chunk_size = 4  # Mini-batch size for gradient accumulation
-
-    gpu_logger = GPUStatsLogger()
-    gpu_logger.start(context=f"train_grpo:{cfg.run_name}")
-
-    training_start_time = time.time()
-    current_step = 0
-
-    # ==========================================================================
-    # Initialize WandB
-    # ==========================================================================
-    wandb.init(
-        project="diplomacy-grpo",
-        name=cfg.run_name,
-        config={
-            "model_id": model_id,
-            "learning_rate": learning_rate,
-            "lora_rank": cfg.lora_rank,
-            "total_steps": cfg.total_steps,
-            "num_groups_per_step": cfg.num_groups_per_step,
-            "samples_per_group": cfg.samples_per_group,
-            "rollout_horizon_years": cfg.rollout_horizon_years,
-            "max_grad_norm": max_grad_norm,
-            "chunk_size": chunk_size,
-        },
-    )
-
-    try:
-        # ======================================================================
-        # 1. Load Models
-        # ======================================================================
-        logger.info(f"🚀 Starting GRPO Loop: {cfg.run_name}")
-
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        tokenizer.pad_token = tokenizer.eos_token
-
-        logger.info("Loading Base Model...")
-        base_model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            attn_implementation="sdpa",  # PyTorch native scaled dot product attention
-        )
-
-        # Create LoRA Adapter (The Policy)
-        peft_config = LoraConfig(
-            r=cfg.lora_rank,
-            lora_alpha=cfg.lora_rank * 2,  # Common heuristic: alpha = 2 * rank
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # Full attention
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        policy_model = get_peft_model(base_model, peft_config)
-        policy_model.print_trainable_parameters()
-
-        # Enable gradient checkpointing to reduce memory (trades compute for memory)
-        policy_model.gradient_checkpointing_enable()  # type: ignore[attr-defined]
-        logger.info("✅ Gradient checkpointing enabled")
-
-        # NOTE: torch.compile() with reduce-overhead mode uses CUDA graphs which
-        # conflict with LoRA's dynamic tensor operations. Disabling for now.
-        # See: https://github.com/huggingface/peft/issues/1043
-
-        # Initialize optimizer and loss
-        optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate)
-        loss_fn = GRPOLoss(policy_model, beta=0.04)  # type: ignore[arg-type]
-
-        # Log training start
-        log_training_start(
-            run_name=cfg.run_name,
-            total_steps=cfg.total_steps,
-            num_groups_per_step=cfg.num_groups_per_step,
-            samples_per_group=cfg.samples_per_group,
-            model_id=model_id,
-            lora_rank=cfg.lora_rank,
-            learning_rate=learning_rate,
-        )
-
-        # ======================================================================
-        # 2. Training Loop
-        # ======================================================================
-        for step in range(cfg.total_steps):
-            current_step = step
-
-            # ==================================================================
-            # A. Save Current Policy for Rollout Workers
-            # ==================================================================
-            # On step 0, we haven't trained yet so use base model (no LoRA)
-            # On subsequent steps, use the trained adapter
-            lora_name_for_rollout = None
-            if step > 0:
-                # Save adapter to volume
-                adapter_rel_path = f"{cfg.run_name}/adapter_v{step}"
-                adapter_full_path = MODELS_PATH / cfg.run_name / f"adapter_v{step}"
-                policy_model.save_pretrained(str(adapter_full_path))
-                volume.commit()
-                # Pass relative name for vLLM's filesystem resolver
-                lora_name_for_rollout = adapter_rel_path
-
-                log_checkpoint_saved(
-                    step=step,
-                    adapter_path=str(adapter_full_path),
-                    run_name=cfg.run_name,
-                )
-                logger.info(
-                    f"\n{'=' * 60}\n Step {step}/{cfg.total_steps}: {adapter_full_path}\n{'=' * 60}"
-                )
-            else:
-                logger.info(
-                    f"\n{'=' * 60}\n Step {step}/{cfg.total_steps}: Using base model (no LoRA)\n{'=' * 60}"
-                )
-
-            # ==================================================================
-            # B. Launch Rollouts (E-Step: Expectation/Sampling)
-            # ==================================================================
-            rollout_start = time.time()
-
-            with stopwatch(f"Rollout_Step_{step}"):
-                rollout_futures = run_rollout.map(
-                    [cfg.model_dump()] * cfg.num_groups_per_step,
-                    kwargs={"lora_name": lora_name_for_rollout},
-                )
-
-                raw_trajectories = []
-                for res in rollout_futures:
-                    raw_trajectories.extend(res)
-
-            rollout_duration_ms = int((time.time() - rollout_start) * 1000)
-            logger.info(f"Collected {len(raw_trajectories)} trajectories")
-
-            # Skip step if no trajectories (all rollouts failed)
-            if not raw_trajectories:
-                logger.warning(f"⚠️ Step {step}: No trajectories collected, skipping update")
-                wandb.log({"step": step, "skipped": True, "reason": "no_trajectories"})
-                continue
-
-            # ==================================================================
-            # C. Process Trajectories (Compute Advantages)
-            # ==================================================================
-            batch_data, traj_stats = process_trajectories(raw_trajectories, tokenizer)
-
-            log_trajectory_processing(
-                step=step,
-                total_trajectories=traj_stats.total_trajectories,
-                total_groups=traj_stats.total_groups,
-                skipped_single_sample_groups=traj_stats.skipped_single_sample_groups,
-                reward_mean=traj_stats.reward_mean,
-                reward_std=traj_stats.reward_std,
-                avg_completion_tokens=traj_stats.avg_completion_tokens,
-            )
-
-            # Skip if no valid training data after processing
-            if not batch_data:
-                logger.warning(f"⚠️ Step {step}: No valid batches after processing")
-                wandb.log({"step": step, "skipped": True, "reason": "no_valid_batches"})
-                continue
-
-            # ==================================================================
-            # D. Update Policy (M-Step: Maximization)
-            # ==================================================================
-            training_start = time.time()
-
-            with stopwatch(f"Training_Step_{step}"):
-                optimizer.zero_grad()
-
-                # Gradient accumulation over mini-batches
-                accum_loss = 0.0
-                accum_pg_loss = 0.0
-                accum_kl = 0.0
-                accum_logprob = 0.0
-                accum_ref_logprob = 0.0
-                accum_advantage = 0.0
-                accum_advantage_std = 0.0
-                num_chunks = 0
-
-                for i in range(0, len(batch_data), chunk_size):
-                    chunk = batch_data[i : i + chunk_size]
-                    if not chunk:
-                        break
-
-                    # Compute GRPO loss (tensors moved to device inside loss_fn)
-                    loss_output = loss_fn.compute_loss(chunk)
-
-                    # Scale loss for gradient accumulation
-                    scaled_loss = loss_output.loss / max(1, len(batch_data) // chunk_size)
-                    scaled_loss.backward()
-
-                    # Accumulate metrics
-                    accum_loss += loss_output.loss.item()
-                    accum_pg_loss += loss_output.pg_loss
-                    accum_kl += loss_output.kl
-                    accum_logprob += loss_output.mean_completion_logprob
-                    accum_ref_logprob += loss_output.mean_ref_logprob
-                    accum_advantage += loss_output.mean_advantage
-                    accum_advantage_std += loss_output.advantage_std
-                    num_chunks += 1
-
-                # Gradient clipping for stability
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    policy_model.parameters(), max_grad_norm
-                ).item()
-
-                optimizer.step()
-
-            training_duration_ms = int((time.time() - training_start) * 1000)
-
-            # ==================================================================
-            # E. Compute and Log Metrics
-            # ==================================================================
-            # Average metrics across chunks
-            avg_loss = accum_loss / max(1, num_chunks)
-            avg_pg_loss = accum_pg_loss / max(1, num_chunks)
-            avg_kl = accum_kl / max(1, num_chunks)
-            avg_logprob = accum_logprob / max(1, num_chunks)
-            avg_ref_logprob = accum_ref_logprob / max(1, num_chunks)
-            avg_advantage = accum_advantage / max(1, num_chunks)
-            avg_advantage_std = accum_advantage_std / max(1, num_chunks)
-
-            # Log to Axiom
-            log_training_step(
-                step=step,
-                loss=avg_loss,
-                pg_loss=avg_pg_loss,
-                kl=avg_kl,
-                grad_norm=grad_norm,
-                learning_rate=learning_rate,
-                reward_mean=traj_stats.reward_mean,
-                reward_std=traj_stats.reward_std,
-                reward_min=traj_stats.reward_min,
-                reward_max=traj_stats.reward_max,
-                num_trajectories=traj_stats.total_trajectories,
-                num_groups=traj_stats.total_groups,
-                skipped_groups=traj_stats.skipped_single_sample_groups,
-                mean_completion_logprob=avg_logprob,
-                mean_ref_logprob=avg_ref_logprob,
-                mean_advantage=avg_advantage,
-                advantage_std=avg_advantage_std,
-                rollout_duration_ms=rollout_duration_ms,
-                training_duration_ms=training_duration_ms,
-                total_tokens=traj_stats.total_tokens,
-            )
-
-            # Log to WandB (rich visualizations)
-            wandb.log(
-                {
-                    "step": step,
-                    # Core metrics
-                    "loss/total": avg_loss,
-                    "loss/policy_gradient": avg_pg_loss,
-                    "loss/kl_divergence": avg_kl,
-                    "training/grad_norm": grad_norm,
-                    "training/learning_rate": learning_rate,
-                    # Reward distribution
-                    "reward/mean": traj_stats.reward_mean,
-                    "reward/std": traj_stats.reward_std,
-                    "reward/min": traj_stats.reward_min,
-                    "reward/max": traj_stats.reward_max,
-                    # LogProb analysis (policy drift monitoring)
-                    "logprob/policy": avg_logprob,
-                    "logprob/reference": avg_ref_logprob,
-                    "logprob/ratio": avg_logprob - avg_ref_logprob,
-                    # Advantage stats
-                    "advantage/mean": avg_advantage,
-                    "advantage/std": avg_advantage_std,
-                    # Data stats
-                    "data/num_trajectories": traj_stats.total_trajectories,
-                    "data/num_groups": traj_stats.total_groups,
-                    "data/skipped_groups": traj_stats.skipped_single_sample_groups,
-                    "data/total_tokens": traj_stats.total_tokens,
-                    "data/avg_completion_tokens": traj_stats.avg_completion_tokens,
-                    # Timing
-                    "timing/rollout_ms": rollout_duration_ms,
-                    "timing/training_ms": training_duration_ms,
-                    "timing/tokens_per_second": (
-                        traj_stats.total_tokens / (training_duration_ms / 1000)
-                        if training_duration_ms > 0
-                        else 0
-                    ),
-                }
-            )
-
-            # Flush Axiom events periodically
-            if step % 5 == 0:
-                asyncio.run(axiom.flush())
-
-            logger.info(
-                f"✅ Step {step} complete: loss={avg_loss:.4f} | kl={avg_kl:.4f} | "
-                f"grad_norm={grad_norm:.4f} | reward_mean={traj_stats.reward_mean:.2f}"
-            )
-
-        # ======================================================================
-        # 3. Training Complete
-        # ======================================================================
-        total_duration_ms = int((time.time() - training_start_time) * 1000)
-        log_training_complete(
-            run_name=cfg.run_name,
-            total_steps=cfg.total_steps,
-            total_duration_ms=total_duration_ms,
-        )
-
-        # Save final checkpoint
-        final_adapter_path = MODELS_PATH / cfg.run_name / "adapter_final"
-        policy_model.save_pretrained(str(final_adapter_path))
-        volume.commit()
-
-        wandb.log(
-            {
-                "training_complete": True,
-                "total_duration_hours": total_duration_ms / (1000 * 60 * 60),
-            }
-        )
-
-    except Exception as e:
-        log_training_error(run_name=cfg.run_name, step=current_step, error=str(e))
-        wandb.log({"error": str(e), "error_step": current_step})
-        raise
-
-    finally:
-        gpu_logger.stop()
-        asyncio.run(axiom.flush())
-        wandb.finish()
 
 
 # ==============================================================================
@@ -1012,7 +634,7 @@ def persist_profile_snapshot(profile_name: str, payload: dict):
 
 
 # ==============================================================================
-# 6. BENCHMARK TRAINER (FOR DEBUGGING/PROFILING)
+# 6. MAIN TRAINER FUNCTION
 # ==============================================================================
 
 
@@ -1020,39 +642,41 @@ def persist_profile_snapshot(profile_name: str, payload: dict):
     image=gpu_image,
     gpu="H100",
     volumes={str(VOLUME_PATH): volume, str(TRACE_PATH): trace_volume},
-    timeout=60 * 60 * 12,  # 2 hours max for benchmarks
+    timeout=60 * 60 * 24,  # 24 hours max
     secrets=[
         modal.Secret.from_name("axiom-secrets"),
         modal.Secret.from_name("wandb-secret"),
     ],
 )
-def train_grpo_benchmark(
-    total_steps: int = 2,
-    num_groups_per_step: int = 2,
-    samples_per_group: int = 4,
-    rollout_horizon_years: int = 1,
-    rollout_visualize_chance: float = 0.0,
-    learning_rate: float = 1e-5,
-    profiling_mode: str | None = None,
-    profile_run_name: str | None = None,
-    compact_prompts: bool = False,
-    model_id: str = "Qwen/Qwen2.5-7B-Instruct",
-    experiment_tag: str | None = None,
-) -> dict:
+def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
     """
-    Benchmark version of GRPO training with configurable parameters.
+    Main GRPO training function.
 
-    Returns detailed metrics for profiling and debugging.
+    This is the unified training entrypoint that supports both production runs
+    and profiling/benchmarking. All parameters come from ExperimentConfig.
 
     Args:
-        total_steps: Number of training steps to run
-        num_groups_per_step: Number of rollout groups per step
-        samples_per_group: Samples per group (clones at fork point)
-        rollout_horizon_years: Years to simulate per rollout
-        learning_rate: Learning rate for AdamW optimizer
+        config_dict: Optional dict of ExperimentConfig values. If provided,
+                    these take precedence over kwargs.
+        **kwargs: Individual config overrides (matched to ExperimentConfig fields).
+                 Common overrides:
+                 - total_steps: Number of training steps
+                 - num_groups_per_step: Rollout groups per step (G in GRPO)
+                 - samples_per_group: Samples per group (N in GRPO)
+                 - rollout_horizon_years: Years to simulate per rollout
+                 - learning_rate: Learning rate for AdamW optimizer
+                 - profiling_mode: "rollout", "trainer", or "e2e" for profiling
+                 - experiment_tag: Tag for grouping runs in WandB
 
     Returns:
         Dict with timing, throughput, and training metrics
+
+    Example:
+        # From CLI via Modal
+        modal run app.py::train_grpo --total-steps 10 --learning-rate 1e-5
+
+        # From Python
+        train_grpo.remote(config_dict={"total_steps": 10, "learning_rate": 1e-5})
     """
     import asyncio
     import time
@@ -1068,33 +692,24 @@ def train_grpo_benchmark(
     from src.utils.config import ExperimentConfig
     from src.utils.observability import GPUStatsLogger, axiom, logger, stopwatch
 
-    # Build config with benchmark parameters
-    run_name = f"benchmark-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    from src.utils.config import ProfilingMode
+    # Build config from dict or kwargs
+    # Priority: config_dict > kwargs > defaults
+    config_values = {}
+    if config_dict:
+        config_values.update(config_dict)
+    config_values.update({k: v for k, v in kwargs.items() if v is not None})
 
-    cfg = ExperimentConfig(
-        run_name=run_name,
-        base_model_id=model_id,
-        total_steps=total_steps,
-        num_groups_per_step=num_groups_per_step,
-        samples_per_group=samples_per_group,
-        rollout_horizon_years=rollout_horizon_years,
-        rollout_visualize_chance=rollout_visualize_chance,
-        profiling_mode=profiling_mode if profiling_mode is None else ProfilingMode(profiling_mode),  # type: ignore[arg-type]
-        profile_run_name=profile_run_name or run_name,
-        compact_prompts=compact_prompts,
-        experiment_tag=experiment_tag,
-    )
+    # Generate run_name if not provided
+    if "run_name" not in config_values or config_values["run_name"] == "diplomacy-grpo-v1":
+        config_values["run_name"] = f"grpo-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+    cfg = ExperimentConfig(**config_values)
 
     # Pre-compute simulated years metrics for power law analysis
     sim_years_per_step = cfg.simulated_years_per_step
 
-    # learning_rate is now a parameter
-    max_grad_norm = 1.0
-    # chunk_size=8 balances GPU utilization vs memory
-    # (each chunk does 2 forward passes: policy + reference)
-    chunk_size = 8
-    profile_enabled = profiling_mode in {"trainer", "e2e"}
+    # Profiling setup
+    profile_enabled = cfg.profiling_mode in {"trainer", "e2e"}
     profile_snapshots: list[dict[str, float]] = []
 
     from contextlib import contextmanager
@@ -1137,7 +752,7 @@ def train_grpo_benchmark(
     trace_subdir = None
     if profile_enabled:
         traces_root = TRACE_PATH / "trainer"
-        trace_subdir = traces_root / (cfg.profile_run_name or cfg.run_name)
+        trace_subdir = traces_root / (cfg.profile_run_name or cfg.run_name)  # type: ignore[arg-type]
         trace_subdir.mkdir(parents=True, exist_ok=True)
         profiler = torch_profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -1154,14 +769,14 @@ def train_grpo_benchmark(
         )
         profiler.__enter__()
 
-    # Initialize WandB with benchmark tag
-    wandb_tags = ["benchmark"]
-    if experiment_tag:
-        wandb_tags.append(experiment_tag)
+    # Initialize WandB
+    wandb_tags = []
+    if cfg.experiment_tag:
+        wandb_tags.append(cfg.experiment_tag)
     wandb.init(
-        project="diplomacy-grpo",
-        name=run_name,
-        tags=wandb_tags,
+        project=cfg.wandb_project,
+        name=cfg.run_name,
+        tags=wandb_tags if wandb_tags else None,
         config={
             **cfg.model_dump(),
             "simulated_years_per_step": sim_years_per_step,
@@ -1173,7 +788,7 @@ def train_grpo_benchmark(
         # ==========================================================================
         # 1. Model Loading (Timed)
         # ==========================================================================
-        logger.info(f"🔬 Starting Benchmark: {run_name}")
+        logger.info(f"🚀 Starting GRPO Training: {cfg.run_name}")
 
         model_load_start = time.time()
 
@@ -1205,7 +820,7 @@ def train_grpo_benchmark(
         # conflict with LoRA's dynamic tensor operations. Disabling for now.
         # See: https://github.com/huggingface/peft/issues/1043
 
-        optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate)
+        optimizer = torch.optim.AdamW(policy_model.parameters(), lr=cfg.learning_rate)
         loss_fn = GRPOLoss(policy_model, beta=0.04)  # type: ignore[arg-type]
 
         model_load_time = time.time() - model_load_start
@@ -1334,15 +949,15 @@ def train_grpo_benchmark(
             accum_kl = 0.0
             num_chunks = 0
 
-            for i in range(0, len(batch_data), chunk_size):
-                chunk = batch_data[i : i + chunk_size]
+            for i in range(0, len(batch_data), cfg.chunk_size):
+                chunk = batch_data[i : i + cfg.chunk_size]
                 if not chunk:
                     break
 
                 section_profile = step_profile if step_profile is not None else {}
                 with profile_section(section_profile, "loss_forward"):
                     loss_output = loss_fn.compute_loss(chunk)
-                scaled_loss = loss_output.loss / max(1, len(batch_data) // chunk_size)
+                scaled_loss = loss_output.loss / max(1, len(batch_data) // cfg.chunk_size)
                 with profile_section(section_profile, "backward"):
                     scaled_loss.backward()
 
@@ -1353,7 +968,7 @@ def train_grpo_benchmark(
             section_profile = step_profile if step_profile is not None else {}
             with profile_section(section_profile, "optimizer_step"):
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    policy_model.parameters(), max_grad_norm
+                    policy_model.parameters(), cfg.max_grad_norm
                 ).item()
                 optimizer.step()
 
@@ -1454,7 +1069,7 @@ def train_grpo_benchmark(
             "reward_max": max(all_rewards) if all_rewards else 0,
             "pipeline_overlap_total_s": total_pipeline_overlap,
             "run_name": cfg.run_name,
-            "profiling_mode": profiling_mode,
+            "profiling_mode": cfg.profiling_mode,
             "profile_snapshots": profile_snapshots if profile_enabled else None,
             "trace_dir": str(trace_subdir) if trace_subdir else None,
         }
@@ -1616,16 +1231,18 @@ def run_power_laws_sweep(
         )
 
         try:
-            result = train_grpo_benchmark.remote(
-                total_steps=total_steps,
-                num_groups_per_step=num_groups_per_step,
-                samples_per_group=config["samples_per_group"],
-                rollout_horizon_years=config["rollout_horizon_years"],
-                learning_rate=learning_rate,
-                rollout_visualize_chance=0.0,
-                compact_prompts=True,
-                experiment_tag=config["tag"],
-                model_id=model_id,
+            result = train_grpo.remote(
+                config_dict={
+                    "total_steps": total_steps,
+                    "num_groups_per_step": num_groups_per_step,
+                    "samples_per_group": config["samples_per_group"],
+                    "rollout_horizon_years": config["rollout_horizon_years"],
+                    "learning_rate": learning_rate,
+                    "rollout_visualize_chance": 0.0,
+                    "compact_prompts": True,
+                    "experiment_tag": config["tag"],
+                    "base_model_id": model_id,
+                }
             )
 
             duration = time.time() - config_start
@@ -1674,16 +1291,18 @@ def run_power_laws_sweep(
         handles = [
             (
                 config,
-                train_grpo_benchmark.spawn(
-                    total_steps=total_steps,
-                    num_groups_per_step=num_groups_per_step,
-                    samples_per_group=config["samples_per_group"],
-                    rollout_horizon_years=config["rollout_horizon_years"],
-                    learning_rate=learning_rate,
-                    rollout_visualize_chance=0.0,
-                    compact_prompts=True,
-                    experiment_tag=config["tag"],
-                    model_id=model_id,
+                train_grpo.spawn(
+                    config_dict={
+                        "total_steps": total_steps,
+                        "num_groups_per_step": num_groups_per_step,
+                        "samples_per_group": config["samples_per_group"],
+                        "rollout_horizon_years": config["rollout_horizon_years"],
+                        "learning_rate": learning_rate,
+                        "rollout_visualize_chance": 0.0,
+                        "compact_prompts": True,
+                        "experiment_tag": config["tag"],
+                        "base_model_id": model_id,
+                    }
                 ),
                 time.time(),
             )
