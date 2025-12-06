@@ -303,6 +303,7 @@ def run_full_training_benchmark(
     compact_prompts: bool = False,
     rollout_visualize_chance: float = 0.01,
     model_id: str = "Qwen/Qwen2.5-7B-Instruct",
+    experiment_tag: str | None = None,
 ) -> BenchmarkResult:
     """
     Run the FULL training pipeline including model updates.
@@ -342,6 +343,7 @@ def run_full_training_benchmark(
         compact_prompts=compact_prompts,
         rollout_visualize_chance=rollout_visualize_chance,
         model_id=model_id,
+        experiment_tag=experiment_tag,
     )
 
     training_duration = time.time() - training_start
@@ -452,6 +454,12 @@ def main():
         default="Qwen/Qwen2.5-7B-Instruct",
         help="Model ID (default: Qwen/Qwen2.5-7B-Instruct)",
     )
+    parser.add_argument(
+        "--experiment-tag",
+        type=str,
+        default=None,
+        help="Tag for grouping related runs in WandB (e.g., 'power-laws')",
+    )
 
     args = parser.parse_args()
 
@@ -483,6 +491,7 @@ def main():
             compact_prompts=args.compact_prompts,
             rollout_visualize_chance=args.rollout_visualize_chance,
             model_id=args.model_id,
+            experiment_tag=args.experiment_tag,
         )
     else:
         result = run_benchmark(
