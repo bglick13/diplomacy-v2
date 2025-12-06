@@ -99,6 +99,10 @@ class ExperimentConfig(BaseModel):
     compact_prompts: bool = Field(
         default=True, description="Use compact prompt format (reduces token count)"
     )
+    prefix_cache_optimized: bool = Field(
+        default=True,
+        description="Optimize prompt structure for vLLM prefix caching",
+    )
     compute_ref_logprobs_in_rollout: bool = Field(
         default=True,
         description=(
