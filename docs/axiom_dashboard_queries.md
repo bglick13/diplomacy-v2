@@ -309,3 +309,65 @@ Set up Axiom monitors for:
 4. **Power Laws: Run Divergence**
    - Condition: Reward variance across configs > threshold after step 50
    - This indicates one config is significantly outperforming others
+
+---
+
+## Evaluation Queries
+
+These queries help monitor checkpoint evaluation results.
+
+### 17. Recent Evaluations
+
+```apl
+['diplomacy']
+| where event in ("evaluation_start", "evaluation_complete")
+| project _time, event, checkpoint_path, opponents, total_duration_s
+| order by _time desc
+| take 20
+```
+
+### 18. Evaluation Results by Checkpoint
+
+```apl
+['diplomacy']
+| where event == "evaluation_complete"
+| mv-expand results
+| extend opponent = results.opponent, win_rate = results.win_rate, survival_rate = results.survival_rate
+| summarize 
+    avg_win_rate = avg(todouble(win_rate)),
+    avg_survival_rate = avg(todouble(survival_rate))
+  by checkpoint_path
+| order by avg_win_rate desc
+```
+
+### 19. Win Rate Trends Over Time
+
+```apl
+['diplomacy']
+| where event == "evaluation_complete"
+| mv-expand results
+| extend opponent = tostring(results.opponent), win_rate = todouble(results.win_rate)
+| summarize avg_win_rate = avg(win_rate) by bin(_time, 1d), opponent
+| order by _time
+```
+
+### 20. Evaluation Performance Summary
+
+```apl
+['diplomacy']
+| where event == "evaluation_complete"
+| where _time > ago(7d)
+| mv-expand results
+| extend 
+    opponent = tostring(results.opponent),
+    win_rate = todouble(results.win_rate),
+    survival_rate = todouble(results.survival_rate),
+    avg_centers = todouble(results.avg_centers)
+| summarize 
+    evaluations = count(),
+    avg_win_rate = avg(win_rate),
+    avg_survival = avg(survival_rate),
+    avg_centers = avg(avg_centers)
+  by checkpoint_path, opponent
+| order by avg_win_rate desc
+```

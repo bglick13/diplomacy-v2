@@ -45,10 +45,45 @@ Preload the next adapter while current step trains.
 - [ ] Gradient accumulation scaling issue → we divide by num_chunks but might need adjustment for larger batches
 
 ## Level 5: Evaluation & Polish
-- [ ] **Tactical Gym**: Implement `evals/scenarios/` with 5 simple tactical puzzles.
-- [ ] **League Eval**: Create a periodic job to play against `RandomBot`, `ChaosBot`, previous checkpoints
-- [ ] **Visualization**: Add HTML export of game logs to Weights & Biases.
+
+### Core Evaluation Infrastructure ✅
+- [x] **Evaluation Framework**: `evals/evaluator.py` with EvalConfig, EvalResult dataclasses
+- [x] **League Module**: `evals/league.py` for running against multiple opponents
+- [x] **Modal Function**: `run_evaluation` in app.py for cloud-based evals
+- [x] **Evaluation CLI**: `scripts/run_eval.py` for easy checkpoint evaluation
+- [x] **WandB Integration**: HTML visualizations logged as artifacts + inline replays
+- [x] **Metrics Tracking**: Win rate, survival rate, avg centers per opponent
+
+### Usage
+```bash
+# Evaluate a checkpoint from a training run
+python scripts/run_eval.py --checkpoint "benchmark-20251205/adapter_v50"
+
+# Evaluate against specific opponents
+python scripts/run_eval.py --checkpoint "..." --opponents random chaos
+
+# More games for statistical significance
+python scripts/run_eval.py --checkpoint "..." --games 20
+
+# Fire and forget
+python scripts/run_eval.py --checkpoint "..." --detach
+
+# List available checkpoints
+python scripts/run_eval.py --list-checkpoints
+```
+
+### Remaining Evaluation Tasks
+- [ ] **Tactical Gym**: Implement `evals/scenarios/` with 5 simple tactical puzzles
+  - Stalemate line detection
+  - Support cut scenarios  
+  - Convoy interception
+  - Bounce prediction
+  - Build/disband optimization
+- [ ] **Checkpoint vs Checkpoint**: Full support for evaluating two checkpoints against each other
+- [ ] **ELO Rating System**: Track relative strength of checkpoints over time
+- [ ] **Periodic Eval Job**: Auto-run evals every N training steps
 - [ ] **Tracing**: Integrate with @weave for model input/output tracing in Weights & Biases
+- [ ] **Eval Dashboard**: Axiom queries for monitoring eval results over time
 
 ## Level 6: Full press
 - [ ] Add support for messaging phase in engine and training
