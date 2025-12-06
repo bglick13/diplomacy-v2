@@ -73,11 +73,12 @@ def run_simulation(
             lora_name=checkpoint,
         )
 
-        # Parse responses
-        for idx, (response, power) in enumerate(
+        # Parse responses (handle rich response format with token data)
+        for idx, (response_data, power) in enumerate(
             zip(raw_responses, inputs["power_names"], strict=True)
         ):
-            orders = extract_orders(response)
+            response_text = response_data["text"]
+            orders = extract_orders(response_text)
             expected_count = len(inputs["valid_moves"][idx])
 
             all_orders.extend(orders)

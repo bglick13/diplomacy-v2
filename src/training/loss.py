@@ -24,6 +24,9 @@ class GRPOLossOutput:
     advantage_std: float
     num_tokens: int
 
+    # Optimization tracking
+    used_cached_ref_logprobs: bool = False
+
 
 class GRPOLoss:
     """
@@ -31,14 +34,18 @@ class GRPOLoss:
     since we generate data externally.
 
     CRITICAL: This class expects a PeftModel and uses `disable_adapter()`
-    context manager to compute reference logprobs from the base model.
+    context manager to compute reference logprobs from the base model,
+    UNLESS pre-computed reference logprobs are provided in the batch.
+
+    Optimization: When 'ref_logprobs' is present in batch items, skip the
+    reference forward pass entirely. This saves ~50% of compute.
     """
 
     def __init__(self, model: "PeftModel", beta: float = 0.04, epsilon: float = 1e-4):
         """
         Args:
             model: A PeftModel (LoRA-wrapped model). Reference logprobs are computed
-                   by disabling the adapter temporarily.
+                   by disabling the adapter temporarily, unless pre-computed.
             beta: KL penalty coefficient.
             epsilon: Small constant for numerical stability.
         """
@@ -56,6 +63,8 @@ class GRPOLoss:
                 - 'attention_mask': Tensor of shape (seq_len,)
                 - 'labels': Tensor of shape (seq_len,) with -100 for prompt tokens
                 - 'advantages': Float, the normalized advantage
+                - 'ref_logprobs': Float (optional) - pre-computed reference logprobs
+                    If ALL items have this key, skip reference forward pass.
 
         Returns:
             GRPOLossOutput with loss tensor and detailed metrics.
@@ -93,19 +102,31 @@ class GRPOLoss:
         # Sum log probs over the completion length per sequence
         completion_log_probs = token_log_probs.sum(dim=1)
 
-        # 5. Forward Pass (Reference Policy) for KL
-        # CRITICAL: Use disable_adapter() to get base model logprobs
-        with torch.no_grad():
-            with self.model.disable_adapter():
-                ref_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-            ref_logits = ref_outputs.logits[:, :-1, :]
+        # 5. Reference LogProbs: Use cached or compute via forward pass
+        # Check if ALL batch items have pre-computed reference logprobs
+        all_have_ref_logprobs = all("ref_logprobs" in b for b in batch)
+        used_cached_ref = False
 
-            # Compute Reference LogProbs
-            ref_per_token_loss = F.cross_entropy(
-                ref_logits.transpose(1, 2), shifted_labels, reduction="none"
+        if all_have_ref_logprobs:
+            # OPTIMIZATION: Use pre-computed reference logprobs (skip forward pass!)
+            ref_completion_log_probs = torch.tensor(
+                [b["ref_logprobs"] for b in batch], dtype=torch.float32, device=device
             )
-            ref_token_log_probs = -ref_per_token_loss * token_mask
-            ref_completion_log_probs = ref_token_log_probs.sum(dim=1)
+            used_cached_ref = True
+        else:
+            # Fallback: Forward Pass (Reference Policy) for KL
+            # CRITICAL: Use disable_adapter() to get base model logprobs
+            with torch.no_grad():
+                with self.model.disable_adapter():
+                    ref_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                ref_logits = ref_outputs.logits[:, :-1, :]
+
+                # Compute Reference LogProbs
+                ref_per_token_loss = F.cross_entropy(
+                    ref_logits.transpose(1, 2), shifted_labels, reduction="none"
+                )
+                ref_token_log_probs = -ref_per_token_loss * token_mask
+                ref_completion_log_probs = ref_token_log_probs.sum(dim=1)
 
         # 6. KL Divergence Approximation (Schulman's estimator)
         # http://joschu.net/blog/kl-approx.html
@@ -126,4 +147,5 @@ class GRPOLoss:
             mean_advantage=advantages.mean().item(),
             advantage_std=advantages.std().item() if len(advantages) > 1 else 0.0,
             num_tokens=int(num_completion_tokens),
+            used_cached_ref_logprobs=used_cached_ref,
         )
