@@ -145,10 +145,10 @@ class InferenceEngine:
         engine_args = AsyncEngineArgs(
             model=self.model_id,
             enable_lora=True,
-            max_loras=4,
+            max_loras=8,  # League training: up to 7 opponents + 1 hero
             max_lora_rank=16,  # Must match training LoRA rank
-            gpu_memory_utilization=0.92,  # Higher utilization for better throughput
-            max_num_seqs=512,  # Allow more concurrent sequences for better batching
+            gpu_memory_utilization=0.85,  # Lower for multi-LoRA memory overhead
+            max_num_seqs=256,  # Reduced for multi-LoRA stability
             enable_prefix_caching=True,
             disable_log_stats=False,
             logits_processors=[DiplomacyLogitsProcessor],
@@ -498,15 +498,27 @@ CURRENT_ROLLOUT_LORA: str | None = None
     secrets=[modal.Secret.from_name("axiom-secrets")],
     volumes={str(VOLUME_PATH): volume},
 )
-async def run_rollout(config_dict: dict, lora_name: str | None = None):
+async def run_rollout(
+    config_dict: dict,
+    lora_name: str | None = None,
+    *,
+    power_adapters: dict[str, str | None] | None = None,
+    hero_power: str | None = None,
+):
     """
     Run a single rollout (game simulation) with the given config.
 
     Args:
         config_dict: ExperimentConfig as dict
-        lora_name: Name of the LoRA adapter (relative to /data/models).
-                   e.g., "benchmark-20251130/adapter_v1"
-                   The vLLM filesystem resolver will find and load it.
+        lora_name: (DEPRECATED) Name of the LoRA adapter for ALL powers.
+                   Use power_adapters instead for league training.
+        power_adapters: Mapping of power name to adapter. Values can be:
+                       - "random_bot" or "chaos_bot": Use baseline bot (no LLM)
+                       - None or "base_model": Use base LLM (no LoRA)
+                       - str: LoRA adapter path (e.g., "run/adapter_v50")
+                       If None, falls back to using lora_name for all powers.
+        hero_power: Which power's trajectories to collect for training.
+                   If None, collects trajectories for ALL powers (original behavior).
     """
     import os
     import random
@@ -515,6 +527,7 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
     import cloudpickle
 
     from src.agents import LLMAgent, PromptConfig
+    from src.agents.baselines import ChaosBot, RandomBot
     from src.engine.wrapper import DiplomacyWrapper
     from src.utils.config import ExperimentConfig
     from src.utils.observability import (
@@ -531,28 +544,59 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
     from src.utils.scoring import calculate_final_scores
     from src.utils.vis import GameVisualizer
 
+    # Baseline bot instances (stateless, can be shared)
+    BASELINE_BOTS = {
+        "random_bot": RandomBot(),
+        "chaos_bot": ChaosBot(),
+    }
+
+    # Build power_adapters from legacy lora_name if not provided
+    POWERS = ["AUSTRIA", "ENGLAND", "FRANCE", "GERMANY", "ITALY", "RUSSIA", "TURKEY"]
+    if power_adapters is None:
+        # Legacy mode: same adapter for all powers
+        power_adapters = dict.fromkeys(POWERS, lora_name)
+
     # NOTE: We use vLLM's lora_filesystem_resolver to load adapters dynamically
     # The resolver looks in VLLM_LORA_RESOLVER_CACHE_DIR (/data/models) for the adapter
     # We just need to reload the volume to see newly committed adapter files
     volume_reload_time = 0.0
-    if lora_name:
-        logger.info(f"📂 Using LoRA adapter: {lora_name}")
+
+    # Collect unique LoRA adapters that need to be loaded
+    unique_loras = {
+        adapter
+        for adapter in power_adapters.values()
+        if adapter is not None and adapter not in BASELINE_BOTS and adapter != "base_model"
+    }
+
+    # Reload volume if there are any LoRAs to load
+    if unique_loras:
+        logger.info(f"📂 Using LoRA adapters: {unique_loras}")
         global CURRENT_ROLLOUT_LORA
-        if CURRENT_ROLLOUT_LORA != lora_name:
+
+        # Check if we need to reload (any new adapter not seen before)
+        needs_reload = any(
+            adapter != CURRENT_ROLLOUT_LORA and not os.path.exists(f"/data/models/{adapter}")
+            for adapter in unique_loras
+        )
+
+        if needs_reload:
             reload_start = time.time()
             volume.reload()  # Ensure we see the latest adapter files
             volume_reload_time = time.time() - reload_start
             logger.info(f"⏱️ Volume reload took {volume_reload_time:.2f}s")
 
-            full_path = f"/data/models/{lora_name}"
+        # Verify all adapters exist
+        for adapter in unique_loras:
+            full_path = f"/data/models/{adapter}"
             if os.path.exists(full_path):
                 files = os.listdir(full_path)
                 logger.info(f"✅ LoRA adapter found at {full_path}. Files: {files}")
-                CURRENT_ROLLOUT_LORA = lora_name
             else:
                 logger.error(f"❌ LoRA adapter NOT found at: {full_path}")
-        else:
-            logger.info(f"📂 Adapter already cached locally: {lora_name}")
+
+        # Track the "main" adapter (for backwards compat in reference logprob logic)
+        if unique_loras:
+            CURRENT_ROLLOUT_LORA = next(iter(unique_loras))
 
     rollout_start_time = time.time()
     rollout_id = ""
@@ -595,47 +639,82 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
         logger.info(f"🔥 Starting Warmup: {warmup_phases} phases")
 
         # Play through warmup
+        # NOTE: Warmup uses base model for LLM powers (not per-power adapters)
+        # This is fine since warmup is just for generating diverse game states
         for i in range(warmup_phases):
             if main_game.is_done():
                 break
 
-            with stopwatch(f"Warmup Inference {i + 1}/{warmup_phases}"):
-                inputs = main_game.get_all_inputs(agent=agent)
-                metrics.inference_calls += 1
-
-                raw_responses = await InferenceEngine(
-                    model_id=cfg.base_model_id
-                ).generate.remote.aio(
-                    prompts=inputs["prompts"],
-                    valid_moves=inputs["valid_moves"],
-                    lora_name=lora_name,
-                )
-
-            # Parse & Execute with observability
             all_orders = []
             phase = main_game.get_current_phase()
 
-            for idx, (response_data, power) in enumerate(
-                zip(raw_responses, inputs["power_names"], strict=True)
-            ):
-                # Extract text from rich response (warmup doesn't need token data)
-                response_text = response_data["text"]
-                orders = extract_orders(response_text)
+            # Get inputs for all powers
+            inputs = main_game.get_all_inputs(agent=agent)
+
+            # Separate baseline bots from LLM powers
+            baseline_indices = []
+            llm_indices = []
+            for idx, power in enumerate(inputs["power_names"]):
+                adapter = power_adapters.get(power)
+                if adapter in BASELINE_BOTS:
+                    baseline_indices.append(idx)
+                else:
+                    llm_indices.append(idx)
+
+            # 1. Handle baseline bots directly (no LLM)
+            for idx in baseline_indices:
+                power = inputs["power_names"][idx]
+                adapter = power_adapters.get(power)
+                assert adapter is not None and adapter in BASELINE_BOTS
+                bot = BASELINE_BOTS[adapter]
+                orders = bot.get_orders(main_game, power)
                 expected_count = len(inputs["valid_moves"][idx])
 
-                # Log extraction result
                 log_orders_extracted(
                     rollout_id=rollout_id,
                     power_name=power,
                     orders_count=len(orders),
                     expected_count=expected_count,
-                    raw_response_length=len(response_text),
+                    raw_response_length=0,
                     phase=phase,
-                    raw_response=response_text,
+                    raw_response="[BASELINE BOT]",
                 )
                 metrics.record_extraction(len(orders), expected_count)
-
                 all_orders.extend(orders)
+
+            # 2. Handle LLM powers with batched inference
+            if llm_indices:
+                llm_prompts = [inputs["prompts"][idx] for idx in llm_indices]
+                llm_valid_moves = [inputs["valid_moves"][idx] for idx in llm_indices]
+
+                with stopwatch(f"Warmup Inference {i + 1}/{warmup_phases}"):
+                    metrics.inference_calls += 1
+                    raw_responses = await InferenceEngine(
+                        model_id=cfg.base_model_id
+                    ).generate.remote.aio(
+                        prompts=llm_prompts,
+                        valid_moves=llm_valid_moves,
+                        lora_name=None,  # Use base model for warmup
+                    )
+
+                for resp_idx, game_idx in enumerate(llm_indices):
+                    response_data = raw_responses[resp_idx]
+                    power = inputs["power_names"][game_idx]
+                    response_text = response_data["text"]
+                    orders = extract_orders(response_text)
+                    expected_count = len(inputs["valid_moves"][game_idx])
+
+                    log_orders_extracted(
+                        rollout_id=rollout_id,
+                        power_name=power,
+                        orders_count=len(orders),
+                        expected_count=expected_count,
+                        raw_response_length=len(response_text),
+                        phase=phase,
+                        raw_response=response_text,
+                    )
+                    metrics.record_extraction(len(orders), expected_count)
+                    all_orders.extend(orders)
 
             main_game.step(all_orders)
 
@@ -681,33 +760,82 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
 
                 # Get inputs for all powers in this game
                 inputs = game.get_all_inputs(agent=agent)
-
-                # Submit inference request for all powers concurrently
-                with stopwatch(
-                    f"Game {g_idx} Step {step_count} (Batch Size: {len(inputs['prompts'])})"
-                ):
-                    metrics.inference_calls += 1
-                    responses = await InferenceEngine(
-                        model_id=cfg.base_model_id
-                    ).generate.remote.aio(
-                        prompts=inputs["prompts"],
-                        valid_moves=inputs["valid_moves"],
-                        lora_name=lora_name,
-                    )
-
-                # Parse responses and collect orders concurrently
-                all_orders = []
                 phase = game.get_current_phase()
 
-                for idx, (response_data, power) in enumerate(
-                    zip(responses, inputs["power_names"], strict=True)
-                ):
-                    # Extract text and token data from rich response
+                # Results will be populated as we process each power
+                # Format: {power_idx: {"orders": [...], "response_data": {...}}}
+                power_results: dict[int, dict] = {}
+
+                # 1. Handle baseline bots (no LLM inference needed)
+                for idx, power in enumerate(inputs["power_names"]):
+                    adapter = power_adapters.get(power)
+                    if adapter in BASELINE_BOTS:
+                        bot = BASELINE_BOTS[adapter]
+                        orders = bot.get_orders(game, power)
+                        power_results[idx] = {
+                            "orders": orders,
+                            "response_data": {
+                                "text": "[BASELINE BOT]",
+                                "prompt_token_ids": [],
+                                "token_ids": [],
+                                "completion_logprobs": [],
+                            },
+                        }
+
+                # 2. Group LLM powers by adapter for batched inference
+                # Map adapter -> list of (original_idx, prompt, valid_moves)
+                adapter_groups: dict[str | None, list[tuple[int, str, dict]]] = {}
+                for idx, power in enumerate(inputs["power_names"]):
+                    if idx in power_results:
+                        continue  # Already handled by baseline bot
+
+                    adapter = power_adapters.get(power)
+                    # Normalize adapter: None and "base_model" both mean no LoRA
+                    adapter_key = None if adapter in (None, "base_model") else adapter
+
+                    if adapter_key not in adapter_groups:
+                        adapter_groups[adapter_key] = []
+                    adapter_groups[adapter_key].append(
+                        (idx, inputs["prompts"][idx], inputs["valid_moves"][idx])
+                    )
+
+                # 3. Run batched inference for each adapter group
+                for adapter_key, group_items in adapter_groups.items():
+                    group_indices = [item[0] for item in group_items]
+                    group_prompts = [item[1] for item in group_items]
+                    group_valid_moves = [item[2] for item in group_items]
+
+                    with stopwatch(
+                        f"Game {g_idx} Step {step_count} Adapter={adapter_key} (Batch: {len(group_prompts)})"
+                    ):
+                        metrics.inference_calls += 1
+                        responses = await InferenceEngine(
+                            model_id=cfg.base_model_id
+                        ).generate.remote.aio(
+                            prompts=group_prompts,
+                            valid_moves=group_valid_moves,
+                            lora_name=adapter_key,
+                        )
+
+                    # Map responses back to original indices
+                    for resp_idx, orig_idx in enumerate(group_indices):
+                        response_data = responses[resp_idx]
+                        response_text = response_data["text"]
+                        orders = extract_orders(response_text)
+                        power_results[orig_idx] = {
+                            "orders": orders,
+                            "response_data": response_data,
+                        }
+
+                # 4. Collect all orders and log metrics
+                all_orders = []
+                for idx, power in enumerate(inputs["power_names"]):
+                    result = power_results[idx]
+                    orders = result["orders"]
+                    response_data = result["response_data"]
                     response_text = response_data["text"]
-                    orders = extract_orders(response_text)
                     expected_count = len(inputs["valid_moves"][idx])
 
-                    # Log extraction result
                     log_orders_extracted(
                         rollout_id=rollout_id,
                         power_name=power,
@@ -719,12 +847,15 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
                     )
                     metrics.record_extraction(len(orders), expected_count)
 
-                    # Store fork data on first step (includes token data for trainer optimization)
-                    if step_count == 1:
+                    # Store fork data on first step for hero power only
+                    # (or all powers if hero_power is None for backwards compat)
+                    should_collect = (hero_power is None) or (power == hero_power)
+                    is_baseline = power_adapters.get(power) in BASELINE_BOTS
+
+                    if step_count == 1 and should_collect and not is_baseline:
                         game_fork_data[power] = {
                             "prompt": inputs["prompts"][idx],
                             "completion": response_text,
-                            # Token data for skipping tokenization and reference forward pass
                             "prompt_token_ids": response_data.get("prompt_token_ids", []),
                             "completion_token_ids": response_data.get("token_ids", []),
                             "completion_logprobs": response_data.get("completion_logprobs", []),
@@ -762,7 +893,18 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
         # This adds ~1 forward pass to rollouts but saves ~1 forward pass in trainer
         ref_logprobs_map: dict[tuple[int, str], float | None] = {}
 
-        if cfg.compute_ref_logprobs_in_rollout and lora_name is not None:
+        # Check if any hero power uses a LoRA adapter (need ref logprobs)
+        hero_uses_lora = False
+        if hero_power:
+            hero_adapter = power_adapters.get(hero_power)
+            hero_uses_lora = (
+                hero_adapter not in (None, "base_model") and hero_adapter not in BASELINE_BOTS
+            )
+        else:
+            # Legacy mode: check if any unique LoRA is used
+            hero_uses_lora = bool(unique_loras)
+
+        if cfg.compute_ref_logprobs_in_rollout and hero_uses_lora:
             # Only needed when generating with LoRA (step > 0)
             # For step 0 (no LoRA), generation logprobs ARE reference logprobs
             with stopwatch("Reference Logprob Scoring"):
@@ -804,7 +946,12 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
         trajectories = []
 
         for g_idx, game in enumerate(games):
-            final_scores = calculate_final_scores(game)
+            # Use win_bonus from config for scoring
+            final_scores = calculate_final_scores(
+                game,
+                win_bonus=cfg.win_bonus,
+                winner_threshold_sc=cfg.winner_threshold_sc,
+            )
 
             for power, data in fork_data[g_idx].items():
                 if power in final_scores:
@@ -812,7 +959,12 @@ async def run_rollout(config_dict: dict, lora_name: str | None = None):
                     ref_logprobs = ref_logprobs_map.get((g_idx, power))
 
                     # If no LoRA used (step 0), generation logprobs ARE reference logprobs
-                    if ref_logprobs is None and lora_name is None:
+                    power_adapter = power_adapters.get(power)
+                    power_uses_lora = (
+                        power_adapter not in (None, "base_model")
+                        and power_adapter not in BASELINE_BOTS
+                    )
+                    if ref_logprobs is None and not power_uses_lora:
                         completion_logprobs = data.get("completion_logprobs", [])
                         if completion_logprobs:
                             ref_logprobs = sum(completion_logprobs)
