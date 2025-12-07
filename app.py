@@ -94,9 +94,9 @@ TRACE_PATH = Path("/traces")
         str(HF_CACHE_PATH): hf_cache_volume,  # Cache HuggingFace models
     },
     scaledown_window=60 * 10,  # 10 minutes - longer to prevent churn
-    allow_concurrent_inputs=128,  # Queue depth for continuous batching
     buffer_containers=1,
 )
+@modal.concurrent(max_inputs=256, target_inputs=200)
 class InferenceEngine:
     model_id: str = modal.parameter(default="Qwen/Qwen2.5-7B-Instruct")
 
@@ -381,6 +381,28 @@ class InferenceEngine:
         except Exception as e:
             error_msg = f"GPU Inference Failed: {type(e).__name__}: {str(e)}"
             print(error_msg)
+
+            # Detect fatal vLLM errors that leave the engine in an unrecoverable state
+            # Force container exit so Modal spins up a fresh one
+            error_str = str(e).lower()
+            error_type = type(e).__name__
+            is_fatal = (
+                "enginedeaderror" in error_type.lower()
+                or "enginedead" in error_str
+                or "engine" in error_str
+                and "dead" in error_str
+                or "cuda" in error_str
+                and "out of memory" in error_str
+                or "cudnn" in error_str
+                and "error" in error_str
+            )
+
+            if is_fatal:
+                import os
+
+                print("💀 FATAL: vLLM engine is dead. Killing container for fresh restart...")
+                os._exit(1)  # Force immediate exit, bypasses finally blocks
+
             raise RuntimeError(error_msg) from None
 
     @modal.method()
@@ -465,6 +487,25 @@ class InferenceEngine:
 
             except Exception as e:
                 print(f"❌ Scoring Error: {e}")
+
+                # Detect fatal vLLM errors that leave the engine unrecoverable
+                error_str = str(e).lower()
+                error_type = type(e).__name__
+                is_fatal = (
+                    "enginedeaderror" in error_type.lower()
+                    or "enginedead" in error_str
+                    or "engine" in error_str
+                    and "dead" in error_str
+                    or "cuda" in error_str
+                    and "out of memory" in error_str
+                )
+
+                if is_fatal:
+                    import os
+
+                    print("💀 FATAL: vLLM engine is dead. Killing container for fresh restart...")
+                    os._exit(1)
+
                 # Return empty logprob on error - trainer will fall back to computing
                 return {"ref_completion_logprobs": None}
 
@@ -1735,6 +1776,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     # Rollout timing breakdown (diagnose spikes)
                     "rollout/max_volume_reload_s": max_volume_reload_s,
                     "rollout/max_total_s": max_rollout_total_s,
+                    "rollout/failed_count": failed_rollouts,
                     # Order extraction metrics (monitor prompt structure regressions)
                     "extraction/rate": step_extraction_stats["extraction_rate"],
                     "extraction/orders_expected": step_extraction_stats["orders_expected"],
