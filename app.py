@@ -1399,9 +1399,41 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
 
             logger.info("🏆 League training enabled - initializing registry and matchmaker")
 
-            # Initialize or load league registry
-            registry_path = Path(cfg.league_registry_path)
+            # Initialize or load league registry (default: per-run file)
+            if cfg.league_registry_path:
+                registry_path = Path(cfg.league_registry_path)
+            else:
+                # Per-run league file to avoid key collisions across runs
+                registry_path = Path(f"/data/league_{cfg.run_name}.json")
+
+            logger.info(f"📂 League registry path: {registry_path}")
             league_registry = LeagueRegistry(registry_path, run_name=cfg.run_name)
+
+            # Optionally inherit opponents from a previous run (for curriculum learning)
+            if cfg.league_inherit_from:
+                inherit_path = Path(f"/data/league_{cfg.league_inherit_from}.json")
+                if inherit_path.exists():
+                    logger.info(f"📚 Inheriting opponents from {cfg.league_inherit_from}")
+                    parent_registry = LeagueRegistry(inherit_path, run_name=cfg.league_inherit_from)
+                    inherited_count = 0
+                    for agent in parent_registry.get_checkpoints():
+                        # Copy checkpoint as opponent (keep original key for path lookup)
+                        if agent.name not in [a.name for a in league_registry.get_all_agents()]:
+                            # Only copy if we have required fields (path, step)
+                            if agent.path and agent.step is not None:
+                                league_registry.add_checkpoint(
+                                    name=agent.name,
+                                    path=agent.path,
+                                    step=agent.step,
+                                    parent=agent.parent,
+                                    initial_elo=agent.elo,
+                                )
+                                inherited_count += 1
+                    logger.info(
+                        f"✅ Inherited {inherited_count} checkpoints from {cfg.league_inherit_from}"
+                    )
+                else:
+                    logger.warning(f"⚠️ Inherit league not found: {inherit_path}")
 
             # Configure PFSP with weights from config
             pfsp_config = PFSPConfig(
@@ -1642,15 +1674,21 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     if cfg.league_training and league_registry is not None:
                         from src.league import should_add_to_league
 
-                        checkpoint_name = f"adapter_v{step}"
+                        # Use full path as key to ensure uniqueness across runs
+                        # Format: "{run_name}/adapter_v{step}" e.g., "grpo-20251206/adapter_v50"
+                        checkpoint_key = adapter_rel_path  # Already "{run_name}/adapter_v{step}"
+                        parent_key = (
+                            f"{cfg.run_name}/adapter_v{step - 1}" if step > 1 else "base_model"
+                        )
+
                         if should_add_to_league(step, league_registry):
                             league_registry.add_checkpoint(
-                                name=checkpoint_name,
+                                name=checkpoint_key,
                                 path=adapter_rel_path,
                                 step=step,
-                                parent=f"adapter_v{step - 1}" if step > 1 else "base_model",
+                                parent=parent_key,
                             )
-                            logger.info(f"🏆 Added checkpoint {checkpoint_name} to league")
+                            logger.info(f"🏆 Added checkpoint {checkpoint_key} to league")
 
                     # Always use the adapter path directly for rollouts
                     # (checkpoint registry is for Elo tracking, not adapter loading)

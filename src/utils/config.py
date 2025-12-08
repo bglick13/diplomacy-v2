@@ -99,9 +99,13 @@ class ExperimentConfig(BaseModel):
         default=False,
         description="Enable league training with PFSP opponent sampling",
     )
-    league_registry_path: str = Field(
-        default="/data/league.json",
-        description="Path to league registry JSON file on Modal volume",
+    league_registry_path: str | None = Field(
+        default=None,
+        description="Path to league registry JSON file. Defaults to /data/league_{run_name}.json",
+    )
+    league_inherit_from: str | None = Field(
+        default=None,
+        description="Run name to inherit league opponents from (for curriculum). Copies checkpoints as opponents.",
     )
     checkpoint_every_n_steps: int = Field(
         default=10,
