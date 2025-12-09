@@ -337,11 +337,19 @@ class TestOpponentType:
 
     def test_opponent_type_values(self):
         """OpponentType should have expected values."""
-        assert OpponentType.RANDOM.value == "random_bot"
-        assert OpponentType.CHAOS.value == "chaos_bot"
+        assert OpponentType.RANDOM.value == "random"
+        assert OpponentType.CHAOS.value == "chaos"
         assert OpponentType.BASE_MODEL.value == "base_model"
         assert OpponentType.CHECKPOINT.value == "checkpoint"
         assert OpponentType.SELF.value == "self"
+
+    def test_opponent_to_agent_name(self):
+        """Should convert OpponentType to agent registry name."""
+        from src.league import opponent_type_to_agent_name
+
+        assert opponent_type_to_agent_name(OpponentType.RANDOM) == "random_bot"
+        assert opponent_type_to_agent_name(OpponentType.CHAOS) == "chaos_bot"
+        assert opponent_type_to_agent_name(OpponentType.BASE_MODEL) == "base_model"
 
 
 class TestHelperFunctions:

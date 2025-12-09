@@ -28,6 +28,7 @@ from src.league.registry import (
 )
 from src.league.types import (
     DEFAULT_BASELINES,
+    OPPONENT_TO_AGENT_NAME,
     AgentInfo,
     AgentType,
     LeagueMetadata,
@@ -44,6 +45,7 @@ __all__ = [
     "MatchResult",
     "LeagueMetadata",
     "DEFAULT_BASELINES",
+    "OPPONENT_TO_AGENT_NAME",
     "opponent_type_to_agent_name",
     # Registry
     "LeagueRegistry",
