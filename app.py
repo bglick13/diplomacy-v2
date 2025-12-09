@@ -1299,22 +1299,52 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
         # Training State Checkpointing Helpers
         # ==========================================================================
         def save_training_state(step: int) -> None:
-            """Save full training state for resume capability."""
-            state_path = MODELS_PATH / cfg.run_name / f"training_state_v{step}.pt"
+            """Save full training state for resume capability with atomic writes."""
+            import tempfile
+
+            run_path = MODELS_PATH / cfg.run_name
+            run_path.mkdir(parents=True, exist_ok=True)
+            state_path = run_path / f"training_state_v{step}.pt"
+
             state = {
                 "step": step,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": cfg.model_dump(),
+                "seed": cfg.seed,  # Save seed for reproducibility
             }
             # Save wandb run ID if wandb is initialized (for resume)
             if wandb.run is not None:
                 state["wandb_run_id"] = wandb.run.id
-            torch.save(state, str(state_path))
+
+            # Atomic write: write to temp file first, then rename
+            # This prevents corruption if save is interrupted
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=str(run_path), delete=False, suffix=".tmp"
+            ) as tmp_file:
+                tmp_path = tmp_file.name
+                torch.save(state, tmp_path)
+
+            # Atomic rename (should work on most filesystems)
+            import os
+
+            os.rename(tmp_path, str(state_path))
             volume.commit()
             logger.info(f"💾 Saved training state to {state_path}")
 
-        def load_training_state(run_name: str, step: int | None = None) -> tuple[int, str | None]:
-            """Load training state and return the step to resume from and wandb run ID (if available)."""
+        def load_training_state(
+            run_name: str, step: int | None = None, allow_fallback: bool = True
+        ) -> tuple[int, str | None]:
+            """
+            Load training state and return the step to resume from and wandb run ID (if available).
+
+            Args:
+                run_name: Name of the run to load from
+                step: Specific step to load (None = latest)
+                allow_fallback: If True, try earlier checkpoints if latest is corrupted
+
+            Returns:
+                Tuple of (step, wandb_run_id)
+            """
             import glob
 
             run_path = MODELS_PATH / run_name
@@ -1333,33 +1363,115 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                         steps.append(s)
                     except ValueError:
                         pass
+                if not steps:
+                    raise FileNotFoundError(f"No valid training states found in {run_path}")
                 step = max(steps)
 
             # At this point step is guaranteed to be an int (either passed in or from max(steps))
             assert step is not None, "step should be set by now"
 
-            state_path = run_path / f"training_state_v{step}.pt"
-            if not state_path.exists():
-                raise FileNotFoundError(f"Training state not found: {state_path}")
-
-            state = torch.load(str(state_path), weights_only=False)
-            optimizer.load_state_dict(state["optimizer_state_dict"])
-
-            # Load the adapter for this step
-            adapter_path = run_path / f"adapter_v{step}"
-            if adapter_path.exists():
-                policy_model.load_adapter(str(adapter_path), adapter_name="default")
-                logger.info(f"📂 Loaded adapter from {adapter_path}")
-            else:
-                logger.warning(
-                    f"⚠️ Adapter not found at {adapter_path}, continuing with current weights"
+            # Try loading checkpoint, with fallback to earlier ones if corrupted
+            attempts = [step]
+            if allow_fallback:
+                # Get all available steps sorted descending
+                pattern = str(run_path / "training_state_v*.pt")
+                all_files = glob.glob(pattern)
+                all_steps = sorted(
+                    [
+                        int(f.split("_v")[-1].replace(".pt", ""))
+                        for f in all_files
+                        if f.split("_v")[-1].replace(".pt", "").isdigit()
+                    ],
+                    reverse=True,
                 )
+                # Add earlier steps as fallbacks (up to 3 attempts)
+                attempts.extend([s for s in all_steps if s < step][:2])
 
-            # Extract wandb run ID if available (for resume)
-            wandb_run_id = state.get("wandb_run_id")
+            last_error = None
+            for attempt_step in attempts:
+                state_path = run_path / f"training_state_v{attempt_step}.pt"
+                if not state_path.exists():
+                    continue
 
-            logger.info(f"✅ Resumed from step {step} (run: {run_name})")
-            return step, wandb_run_id
+                try:
+                    # Load and validate checkpoint
+                    state = torch.load(str(state_path), weights_only=False)
+
+                    # Validate required keys exist
+                    required_keys = ["step", "optimizer_state_dict", "config"]
+                    missing_keys = [k for k in required_keys if k not in state]
+                    if missing_keys:
+                        raise ValueError(f"Checkpoint missing required keys: {missing_keys}")
+
+                    # Verify step matches filename
+                    if state["step"] != attempt_step:
+                        logger.warning(
+                            f"⚠️ Step mismatch in checkpoint: filename={attempt_step}, "
+                            f"state={state['step']}"
+                        )
+
+                    # Load optimizer state
+                    optimizer.load_state_dict(state["optimizer_state_dict"])
+
+                    # Load the adapter for this step
+                    adapter_path = run_path / f"adapter_v{attempt_step}"
+                    if adapter_path.exists():
+                        policy_model.load_adapter(str(adapter_path), adapter_name="default")
+                        logger.info(f"📂 Loaded adapter from {adapter_path}")
+                    else:
+                        logger.warning(
+                            f"⚠️ Adapter not found at {adapter_path}, continuing with current weights"
+                        )
+
+                    # Extract wandb run ID if available (for resume)
+                    wandb_run_id = state.get("wandb_run_id")
+
+                    # Restore random seed if saved
+                    saved_seed = state.get("seed")
+                    if saved_seed is not None:
+                        import random
+
+                        import numpy as np
+
+                        random.seed(saved_seed)
+                        np.random.seed(saved_seed)
+                        torch.manual_seed(saved_seed)
+                        logger.info(f"🌱 Restored random seed: {saved_seed}")
+
+                    # Warn about config mismatches (non-critical)
+                    saved_config = state.get("config", {})
+                    current_config = cfg.model_dump()
+                    config_diff = {
+                        k: (saved_config.get(k), current_config.get(k))
+                        for k in set(saved_config.keys()) | set(current_config.keys())
+                        if saved_config.get(k) != current_config.get(k)
+                        and k not in ["run_name"]  # run_name can differ when forking
+                    }
+                    if config_diff:
+                        logger.warning(
+                            f"⚠️ Config differences detected (non-critical): {list(config_diff.keys())}"
+                        )
+
+                    if attempt_step != step:
+                        logger.warning(
+                            f"⚠️ Loaded checkpoint from step {attempt_step} "
+                            f"(requested {step} was corrupted/unavailable)"
+                        )
+
+                    logger.info(f"✅ Resumed from step {attempt_step} (run: {run_name})")
+                    return attempt_step, wandb_run_id
+
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"⚠️ Failed to load checkpoint at step {attempt_step}: {e}")
+                    if attempt_step == step:
+                        logger.warning("   Will try earlier checkpoints if available...")
+                    continue
+
+            # All attempts failed
+            raise FileNotFoundError(
+                f"Failed to load any valid checkpoint from {run_path}. Last error: {last_error}"
+            )
 
         # Resume from checkpoint if specified OR if checkpoints exist for this run
         start_step = 0
