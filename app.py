@@ -1121,6 +1121,7 @@ def persist_profile_snapshot(profile_name: str, payload: dict):
     gpu="H100",
     volumes={str(VOLUME_PATH): volume, str(TRACE_PATH): trace_volume},
     timeout=60 * 60 * 24,  # 24 hours max
+    retries=0,  # CRITICAL: Don't auto-retry training - would restart from scratch
     secrets=[
         modal.Secret.from_name("axiom-secrets"),
         modal.Secret.from_name("wandb-secret"),
@@ -1369,18 +1370,40 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             logger.info(f"✅ Resumed from step {step} (run: {run_name})")
             return step
 
-        # Resume from checkpoint if specified
+        # Resume from checkpoint if specified OR if checkpoints exist for this run
         start_step = 0
+        volume.reload()  # Ensure we see latest files
+
         if cfg.resume_from_run:
+            # Explicit resume from another run
             try:
-                volume.reload()  # Ensure we have latest files
                 start_step = load_training_state(cfg.resume_from_run, cfg.resume_from_step)
-                # If resuming to a different run_name, we start fresh from there
                 if cfg.resume_from_run != cfg.run_name:
                     logger.info(f"📦 Forking from {cfg.resume_from_run} to new run {cfg.run_name}")
             except FileNotFoundError as e:
                 logger.error(f"❌ Resume failed: {e}")
                 raise
+        elif not cfg.disable_auto_resume:
+            # Auto-resume: Check if this run has existing checkpoints (crash recovery)
+            import glob
+
+            run_path = MODELS_PATH / cfg.run_name
+            pattern = str(run_path / "training_state_v*.pt")
+            existing_states = glob.glob(pattern)
+
+            if existing_states:
+                # Found existing checkpoints - auto-resume from latest
+                logger.warning(
+                    f"⚠️ Found {len(existing_states)} existing checkpoints for {cfg.run_name}"
+                )
+                logger.warning(
+                    "🔄 AUTO-RESUMING from crash (use --disable-auto-resume to start fresh)"
+                )
+                try:
+                    start_step = load_training_state(cfg.run_name, cfg.resume_from_step)
+                except FileNotFoundError as e:
+                    logger.error(f"❌ Auto-resume failed: {e}, starting fresh")
+                    start_step = 0
 
         model_load_time = time.time() - model_load_start
         metrics["timing"]["model_load_s"] = model_load_time

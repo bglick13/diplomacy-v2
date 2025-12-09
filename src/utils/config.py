@@ -143,6 +143,10 @@ class ExperimentConfig(BaseModel):
         default=None,
         description="Specific step to resume from (defaults to latest if not specified)",
     )
+    disable_auto_resume: bool = Field(
+        default=False,
+        description="Disable auto-resume from crash. If True, always starts fresh even if checkpoints exist.",
+    )
 
     # =========================================================================
     # Training Loop
