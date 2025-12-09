@@ -125,6 +125,22 @@ class ExperimentConfig(BaseModel):
     )
 
     # =========================================================================
+    # Checkpointing & Resume
+    # =========================================================================
+    save_state_every_n_steps: int = Field(
+        default=10,
+        description="Save full training state (optimizer, step) every N steps for resume capability",
+    )
+    resume_from_run: str | None = Field(
+        default=None,
+        description="Run name to resume from (e.g., 'grpo-20251206-133229'). Will load latest checkpoint.",
+    )
+    resume_from_step: int | None = Field(
+        default=None,
+        description="Specific step to resume from (defaults to latest if not specified)",
+    )
+
+    # =========================================================================
     # Training Loop
     # =========================================================================
     total_steps: int = Field(default=10, description="Total number of training steps")

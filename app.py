@@ -1268,6 +1268,79 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
         optimizer = torch.optim.AdamW(policy_model.parameters(), lr=cfg.learning_rate)
         loss_fn = GRPOLoss(policy_model, beta=0.04)  # type: ignore[arg-type]
 
+        # ==========================================================================
+        # Training State Checkpointing Helpers
+        # ==========================================================================
+        def save_training_state(step: int) -> None:
+            """Save full training state for resume capability."""
+            state_path = MODELS_PATH / cfg.run_name / f"training_state_v{step}.pt"
+            state = {
+                "step": step,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "config": cfg.model_dump(),
+            }
+            torch.save(state, str(state_path))
+            volume.commit()
+            logger.info(f"💾 Saved training state to {state_path}")
+
+        def load_training_state(run_name: str, step: int | None = None) -> int:
+            """Load training state and return the step to resume from."""
+            import glob
+
+            run_path = MODELS_PATH / run_name
+
+            # Find latest checkpoint if step not specified
+            if step is None:
+                pattern = str(run_path / "training_state_v*.pt")
+                state_files = glob.glob(pattern)
+                if not state_files:
+                    raise FileNotFoundError(f"No training states found in {run_path}")
+                # Extract step numbers and find max
+                steps = []
+                for f in state_files:
+                    try:
+                        s = int(f.split("_v")[-1].replace(".pt", ""))
+                        steps.append(s)
+                    except ValueError:
+                        pass
+                step = max(steps)
+
+            # At this point step is guaranteed to be an int (either passed in or from max(steps))
+            assert step is not None, "step should be set by now"
+
+            state_path = run_path / f"training_state_v{step}.pt"
+            if not state_path.exists():
+                raise FileNotFoundError(f"Training state not found: {state_path}")
+
+            state = torch.load(str(state_path), weights_only=False)
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+
+            # Load the adapter for this step
+            adapter_path = run_path / f"adapter_v{step}"
+            if adapter_path.exists():
+                policy_model.load_adapter(str(adapter_path), adapter_name="default")
+                logger.info(f"📂 Loaded adapter from {adapter_path}")
+            else:
+                logger.warning(
+                    f"⚠️ Adapter not found at {adapter_path}, continuing with current weights"
+                )
+
+            logger.info(f"✅ Resumed from step {step} (run: {run_name})")
+            return step
+
+        # Resume from checkpoint if specified
+        start_step = 0
+        if cfg.resume_from_run:
+            try:
+                volume.reload()  # Ensure we have latest files
+                start_step = load_training_state(cfg.resume_from_run, cfg.resume_from_step)
+                # If resuming to a different run_name, we start fresh from there
+                if cfg.resume_from_run != cfg.run_name:
+                    logger.info(f"📦 Forking from {cfg.resume_from_run} to new run {cfg.run_name}")
+            except FileNotFoundError as e:
+                logger.error(f"❌ Resume failed: {e}")
+                raise
+
         model_load_time = time.time() - model_load_start
         metrics["timing"]["model_load_s"] = model_load_time
         logger.info(f"✅ Model loaded in {model_load_time:.2f}s")
@@ -1415,16 +1488,24 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
 
         # Each entry is (handles_list, hero_adapter_path)
         rollout_buffer: deque[tuple[list, str | None]] = deque()
+
+        # Determine initial adapter for buffer (use resumed adapter if applicable)
+        initial_adapter: str | None = None
+        if start_step > 0:
+            # Resuming: use the adapter from the resumed step
+            initial_adapter = f"{cfg.run_name}/adapter_v{start_step}"
+            logger.info(f"📦 Resuming - buffer will use adapter: {initial_adapter}")
+
         for _ in range(buffer_depth):
-            handles = spawn_rollouts_batch(hero_adapter_path=None)  # Use base model initially
-            rollout_buffer.append((handles, None))
+            handles = spawn_rollouts_batch(hero_adapter_path=initial_adapter)
+            rollout_buffer.append((handles, initial_adapter))
 
         total_in_flight = buffer_depth * cfg.num_groups_per_step
         logger.info(
             f"📦 Buffer initialized: {buffer_depth} batches ({total_in_flight} rollouts) in flight"
         )
 
-        for step in range(cfg.total_steps):
+        for step in range(start_step, cfg.total_steps):
             step_start = time.time()
             step_metrics: dict[str, Any] = {"step": step}
             step_profile: dict[str, Any] | None = {"step": step} if profile_enabled else None
@@ -1446,8 +1527,18 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 max_volume_reload_s = 0.0
                 max_rollout_total_s = 0.0
 
+                failed_rollouts = 0
                 for handle in current_handles:
-                    result = handle.get()  # Block until this rollout completes
+                    try:
+                        result = handle.get()  # Block until this rollout completes
+                    except Exception as e:
+                        # Log the failure but continue with other rollouts
+                        failed_rollouts += 1
+                        logger.warning(
+                            f"⚠️ Rollout failed (will continue with others): {type(e).__name__}: {e}"
+                        )
+                        continue
+
                     # Unpack new return format: {"trajectories": [...], "extraction_stats": {...}, "timing": {...}}
                     raw_trajectories.extend(result["trajectories"])
                     # Aggregate extraction stats
@@ -1462,6 +1553,11 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                         max_volume_reload_s, timing.get("volume_reload_s", 0.0)
                     )
                     max_rollout_total_s = max(max_rollout_total_s, timing.get("total_s", 0.0))
+
+                if failed_rollouts > 0:
+                    logger.warning(
+                        f"⚠️ Step {step}: {failed_rollouts}/{len(current_handles)} rollouts failed"
+                    )
 
                 # Compute step-level extraction rate
                 orders_expected = step_extraction_stats["orders_expected"]
@@ -1479,6 +1575,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 len(rollout_buffer) + 1
             )  # +1 for the one we just popped
             step_metrics["extraction_stats"] = step_extraction_stats
+            step_metrics["failed_rollouts"] = failed_rollouts
             # Track slowest rollout timing (identifies bottlenecks)
             step_metrics["max_volume_reload_s"] = max_volume_reload_s
             step_metrics["max_rollout_total_s"] = max_rollout_total_s
@@ -1652,6 +1749,10 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             )
             if profiler is not None:
                 profiler.step()
+
+            # Periodic checkpoint save for resume capability
+            if cfg.save_state_every_n_steps > 0 and (step + 1) % cfg.save_state_every_n_steps == 0:
+                save_training_state(step + 1)
 
         # Save final adapter
         final_adapter_path = MODELS_PATH / cfg.run_name / f"adapter_v{cfg.total_steps}"
