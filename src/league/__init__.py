@@ -1,0 +1,59 @@
+"""
+League Training Module for Diplomacy GRPO.
+
+This module provides infrastructure for:
+- Agent registry (baselines + checkpoints)
+- Multi-player Elo computation
+- Opponent sampling (PFSP)
+- Match history tracking
+
+Usage:
+    from src.league import LeagueRegistry, should_add_to_league
+    from src.league.elo import update_elo_multiplayer
+    from src.league.types import AgentInfo, OpponentType
+"""
+
+from src.league.elo import (
+    batch_update_elo,
+    calculate_expected_score,
+    elo_diff_for_win_rate,
+    estimate_win_probability,
+    update_elo_from_match,
+    update_elo_multiplayer,
+)
+from src.league.registry import (
+    LeagueRegistry,
+    get_checkpoint_name,
+    should_add_to_league,
+)
+from src.league.types import (
+    DEFAULT_BASELINES,
+    AgentInfo,
+    AgentType,
+    LeagueMetadata,
+    MatchResult,
+    OpponentType,
+    opponent_type_to_agent_name,
+)
+
+__all__ = [
+    # Types
+    "OpponentType",
+    "AgentType",
+    "AgentInfo",
+    "MatchResult",
+    "LeagueMetadata",
+    "DEFAULT_BASELINES",
+    "opponent_type_to_agent_name",
+    # Registry
+    "LeagueRegistry",
+    "should_add_to_league",
+    "get_checkpoint_name",
+    # Elo
+    "update_elo_multiplayer",
+    "update_elo_from_match",
+    "batch_update_elo",
+    "calculate_expected_score",
+    "estimate_win_probability",
+    "elo_diff_for_win_rate",
+]
