@@ -1248,21 +1248,6 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
         )
         profiler.__enter__()
 
-    # Initialize WandB
-    wandb_tags = []
-    if cfg.experiment_tag:
-        wandb_tags.append(cfg.experiment_tag)
-    wandb.init(
-        project=cfg.wandb_project,
-        name=cfg.run_name,
-        tags=wandb_tags if wandb_tags else None,
-        config={
-            **cfg.model_dump(),
-            "simulated_years_per_step": sim_years_per_step,
-            "total_simulated_years": cfg.total_simulated_years,
-        },
-    )
-
     try:
         # ==========================================================================
         # 0. Pre-warm Inference Containers via Autoscaler
@@ -1321,12 +1306,15 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": cfg.model_dump(),
             }
+            # Save wandb run ID if wandb is initialized (for resume)
+            if wandb.run is not None:
+                state["wandb_run_id"] = wandb.run.id
             torch.save(state, str(state_path))
             volume.commit()
             logger.info(f"💾 Saved training state to {state_path}")
 
-        def load_training_state(run_name: str, step: int | None = None) -> int:
-            """Load training state and return the step to resume from."""
+        def load_training_state(run_name: str, step: int | None = None) -> tuple[int, str | None]:
+            """Load training state and return the step to resume from and wandb run ID (if available)."""
             import glob
 
             run_path = MODELS_PATH / run_name
@@ -1367,19 +1355,27 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     f"⚠️ Adapter not found at {adapter_path}, continuing with current weights"
                 )
 
+            # Extract wandb run ID if available (for resume)
+            wandb_run_id = state.get("wandb_run_id")
+
             logger.info(f"✅ Resumed from step {step} (run: {run_name})")
-            return step
+            return step, wandb_run_id
 
         # Resume from checkpoint if specified OR if checkpoints exist for this run
         start_step = 0
+        wandb_run_id: str | None = None
         volume.reload()  # Ensure we see latest files
 
         if cfg.resume_from_run:
             # Explicit resume from another run
             try:
-                start_step = load_training_state(cfg.resume_from_run, cfg.resume_from_step)
+                start_step, wandb_run_id = load_training_state(
+                    cfg.resume_from_run, cfg.resume_from_step
+                )
                 if cfg.resume_from_run != cfg.run_name:
                     logger.info(f"📦 Forking from {cfg.resume_from_run} to new run {cfg.run_name}")
+                    # When forking, don't reuse the old wandb run ID
+                    wandb_run_id = None
             except FileNotFoundError as e:
                 logger.error(f"❌ Resume failed: {e}")
                 raise
@@ -1400,10 +1396,43 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     "🔄 AUTO-RESUMING from crash (use --disable-auto-resume to start fresh)"
                 )
                 try:
-                    start_step = load_training_state(cfg.run_name, cfg.resume_from_step)
+                    start_step, wandb_run_id = load_training_state(
+                        cfg.run_name, cfg.resume_from_step
+                    )
                 except FileNotFoundError as e:
                     logger.error(f"❌ Auto-resume failed: {e}, starting fresh")
                     start_step = 0
+                    wandb_run_id = None
+
+        # Initialize WandB (after training state loading to support resume)
+        wandb_tags = []
+        if cfg.experiment_tag:
+            wandb_tags.append(cfg.experiment_tag)
+
+        # Resume existing wandb run if auto-resuming from crash
+        wandb_init_kwargs: dict[str, Any] = {
+            "project": cfg.wandb_project,
+            "name": cfg.run_name,
+            "tags": wandb_tags if wandb_tags else None,
+            "config": {
+                **cfg.model_dump(),
+                "simulated_years_per_step": sim_years_per_step,
+                "total_simulated_years": cfg.total_simulated_years,
+            },
+        }
+
+        # If we have a wandb run ID from auto-resume, reuse that run
+        if wandb_run_id:
+            wandb_init_kwargs["id"] = wandb_run_id
+            wandb_init_kwargs["resume"] = "must"
+            logger.info(f"🔄 Resuming existing WandB run: {wandb_run_id}")
+        elif start_step > 0:
+            # Auto-resuming but no run ID saved (backward compatibility)
+            # Try to resume by name, but allow creating new if not found
+            wandb_init_kwargs["resume"] = "allow"
+            logger.info("🔄 Attempting to resume WandB run by name (fallback)")
+
+        wandb.init(**wandb_init_kwargs)
 
         model_load_time = time.time() - model_load_start
         metrics["timing"]["model_load_s"] = model_load_time
