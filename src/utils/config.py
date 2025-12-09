@@ -145,10 +145,12 @@ class ExperimentConfig(BaseModel):
     # =========================================================================
     total_steps: int = Field(default=10, description="Total number of training steps")
     num_groups_per_step: int = Field(
-        default=8, description="Number of rollout groups per step (G in GRPO)"
+        default=8,
+        description="Number of rollout groups per step (G in GRPO). I.e., how many different game states to start from",
     )
     samples_per_group: int = Field(
-        default=8, description="Number of trajectory samples per group (N in GRPO)"
+        default=8,
+        description="Number of trajectory samples per group (N in GRPO). I.e., how many different forked games to simulate for each starting state",
     )
     buffer_depth: int = Field(
         default=4,
