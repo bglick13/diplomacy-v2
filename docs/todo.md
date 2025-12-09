@@ -85,5 +85,11 @@ python scripts/run_eval.py --list-checkpoints
 - [ ] **Tracing**: Integrate with @weave for model input/output tracing in Weights & Biases
 - [ ] **Eval Dashboard**: Axiom queries for monitoring eval results over time
 
+### Training optimizations
+- [] Mixed Horizon Strategy (Recommended)
+ - Train on both short and long horizons:
+    - 70% short (3 years) - Fast iteration, tactical learning
+    - 30% long (7 years) - Win bonus achievable, strategic learning
+
 ## Level 6: Full press
 - [ ] Add support for messaging phase in engine and training

@@ -21,6 +21,13 @@ from src.league.elo import (
     update_elo_from_match,
     update_elo_multiplayer,
 )
+from src.league.logging import (
+    create_elo_table,
+    create_matchup_heatmap,
+    log_elo_rankings,
+    log_elo_update,
+    log_league_summary,
+)
 from src.league.matchmaker import (
     MatchmakingResult,
     PFSPConfig,
@@ -67,4 +74,10 @@ __all__ = [
     "calculate_expected_score",
     "estimate_win_probability",
     "elo_diff_for_win_rate",
+    # Logging
+    "log_elo_update",
+    "log_league_summary",
+    "log_elo_rankings",
+    "create_elo_table",
+    "create_matchup_heatmap",
 ]

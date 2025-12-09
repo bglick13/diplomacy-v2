@@ -111,6 +111,14 @@ class ExperimentConfig(BaseModel):
         default=10,
         description="Save checkpoint to league every N steps (for recent curriculum)",
     )
+    elo_eval_every_n_steps: int = Field(
+        default=50,
+        description="Run async Elo evaluation every N steps (0 to disable)",
+    )
+    elo_eval_games_per_opponent: int = Field(
+        default=3,
+        description="Games per gatekeeper during Elo evaluation",
+    )
     pfsp_self_play_weight: float = Field(
         default=0.30,
         description="PFSP: Weight for self-play (current policy)",

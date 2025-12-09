@@ -1713,6 +1713,29 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                             )
                             logger.info(f"🏆 Added checkpoint {checkpoint_key} to league")
 
+                            # Spawn async Elo evaluation if enabled
+                            if (
+                                cfg.elo_eval_every_n_steps > 0
+                                and step % cfg.elo_eval_every_n_steps == 0
+                            ):
+                                logger.info(f"🎯 Spawning Elo evaluation for {checkpoint_key}")
+                                # Get league registry path
+                                registry_path_str = str(
+                                    f"/data/league_{cfg.run_name}.json"
+                                    if not cfg.league_registry_path
+                                    else cfg.league_registry_path
+                                )
+                                # Spawn async - doesn't block training
+                                evaluate_league.spawn(
+                                    challenger_path=adapter_rel_path,
+                                    league_registry_path=registry_path_str,
+                                    games_per_opponent=cfg.elo_eval_games_per_opponent,
+                                    max_years=cfg.rollout_horizon_years,
+                                    model_id=cfg.base_model_id,
+                                    wandb_run_id=wandb.run.id if wandb.run else None,
+                                    training_step=step,
+                                )
+
                     # Always use the adapter path directly for rollouts
                     # (checkpoint registry is for Elo tracking, not adapter loading)
                     new_hero_agent = adapter_rel_path
@@ -2263,6 +2286,273 @@ def run_power_laws_sweep(
 # ==============================================================================
 
 EVALS_PATH = VOLUME_PATH / "evals"
+
+
+# ------------------------------------------------------------------------------
+# 9.1 Async Elo Evaluator (runs in background during training)
+# ------------------------------------------------------------------------------
+
+
+@app.function(
+    image=cpu_image,
+    timeout=60 * 60,  # 1 hour max per evaluation
+    retries=0,  # Don't retry - if it fails, training continues
+    secrets=[
+        modal.Secret.from_name("axiom-secrets"),
+        modal.Secret.from_name("wandb-secret"),
+    ],
+    volumes={str(VOLUME_PATH): volume},
+)
+async def evaluate_league(
+    challenger_path: str,
+    league_registry_path: str,
+    games_per_opponent: int = 3,
+    max_years: int = 5,
+    model_id: str = "Qwen/Qwen2.5-7B-Instruct",
+    wandb_run_id: str | None = None,
+    training_step: int = 0,
+) -> dict:
+    """
+    Run Elo evaluation for a new checkpoint against gatekeepers.
+
+    This function is spawned asynchronously during training to update Elo
+    ratings without blocking the training loop.
+
+    Gatekeepers are:
+    - All baseline bots (random_bot, chaos_bot)
+    - Top N checkpoints by Elo from the registry
+
+    Args:
+        challenger_path: Path to the new checkpoint (e.g., "run-name/adapter_v50")
+        league_registry_path: Path to league.json
+        games_per_opponent: Games per gatekeeper (default 3 for speed)
+        max_years: Max years per game
+        model_id: Base model ID
+        wandb_run_id: WandB run ID to log to (from training)
+        training_step: Current training step (for logging)
+
+    Returns:
+        Dict with Elo updates and match results
+    """
+    import random
+    import time
+    from pathlib import Path
+
+    import wandb
+
+    from src.agents import LLMAgent, PromptConfig
+    from src.agents.baselines import ChaosBot, RandomBot
+    from src.engine.wrapper import DiplomacyWrapper
+    from src.league import LeagueRegistry, update_elo_from_match
+    from src.utils.observability import axiom, logger
+    from src.utils.parsing import extract_orders
+    from src.utils.scoring import calculate_final_scores
+
+    eval_start = time.time()
+    logger.info(f"🏆 Starting Elo evaluation for {challenger_path}")
+
+    # Load league registry
+    volume.reload()
+    registry = LeagueRegistry(Path(league_registry_path))
+
+    # Get gatekeepers: baselines + top checkpoints
+    baselines = registry.get_baselines()
+    checkpoints = registry.get_checkpoints()
+
+    # Select top 3 checkpoints by Elo (excluding the challenger itself)
+    top_checkpoints = sorted(
+        [c for c in checkpoints if c.path != challenger_path],
+        key=lambda x: x.elo,
+        reverse=True,
+    )[:3]
+
+    gatekeepers = baselines + top_checkpoints
+    logger.info(f"📊 Gatekeepers: {[g.name for g in gatekeepers]}")
+
+    # Baseline bots
+    BASELINE_BOTS = {
+        "random_bot": RandomBot(),
+        "chaos_bot": ChaosBot(),
+        "base_model": None,  # Placeholder for base model
+    }
+
+    POWERS = ["AUSTRIA", "ENGLAND", "FRANCE", "GERMANY", "ITALY", "RUSSIA", "TURKEY"]
+
+    # Initialize agents
+    prompt_config = PromptConfig(compact_mode=True, prefix_cache_optimized=True)
+    llm_agent = LLMAgent(config=prompt_config)
+
+    # Track all matches for Elo updates
+    all_matches = []
+    match_results = []
+
+    for gatekeeper in gatekeepers:
+        logger.info(f"  vs {gatekeeper.name}...")
+
+        for game_idx in range(games_per_opponent):
+            # Randomly assign challenger to a power
+            challenger_power = random.choice(POWERS)
+            opponent_powers = [p for p in POWERS if p != challenger_power]
+
+            # Build power_adapters
+            power_adapters: dict[str, str | None] = {}
+            power_adapters[challenger_power] = challenger_path
+
+            # Assign gatekeeper to all other powers
+            for p in opponent_powers:
+                if gatekeeper.agent_type.value == "baseline":
+                    power_adapters[p] = gatekeeper.name  # "random_bot" or "chaos_bot"
+                else:
+                    power_adapters[p] = gatekeeper.path  # Checkpoint path
+
+            # Run game
+            game = DiplomacyWrapper(horizon=max_years * 2)
+
+            while not game.is_done():
+                all_orders = []
+                for power in POWERS:
+                    adapter = power_adapters.get(power)
+
+                    # Get orders based on adapter type
+                    if adapter in BASELINE_BOTS and adapter is not None:
+                        bot = BASELINE_BOTS[adapter]
+                        if bot:
+                            orders = bot.get_orders(game, power)
+                        else:
+                            orders = []  # Base model - skip for now
+                    else:
+                        # LLM power - generate via InferenceEngine
+                        prompt, valid_moves = llm_agent.build_prompt(game, power)
+                        if valid_moves:
+                            responses = await InferenceEngine(
+                                model_id=model_id
+                            ).generate.remote.aio(
+                                prompts=[prompt],
+                                valid_moves=[valid_moves],
+                                lora_name=adapter,
+                            )
+                            orders = extract_orders(responses[0]["text"])
+                        else:
+                            orders = []
+
+                    all_orders.extend(orders)
+
+                game.step(all_orders)
+
+            # Compute final scores
+            final_scores = calculate_final_scores(game)
+
+            # Build power_agents mapping
+            power_agents = {p: power_adapters[p] or "base_model" for p in POWERS}
+
+            # Record match
+            match_data = {
+                "power_agents": power_agents,
+                "power_scores": final_scores,
+            }
+            all_matches.append(match_data)
+
+            # Track for summary
+            challenger_score = final_scores[challenger_power]
+            gatekeeper_avg = sum(
+                final_scores[p]
+                for p in opponent_powers
+                if power_adapters[p] == gatekeeper.path or power_adapters[p] == gatekeeper.name
+            ) / len(opponent_powers)
+
+            match_results.append(
+                {
+                    "gatekeeper": gatekeeper.name,
+                    "game_idx": game_idx,
+                    "challenger_score": challenger_score,
+                    "gatekeeper_avg_score": gatekeeper_avg,
+                    "win": challenger_score > gatekeeper_avg,
+                }
+            )
+
+            logger.info(
+                f"    Game {game_idx + 1}: Challenger {challenger_score:.1f} vs Gatekeeper avg {gatekeeper_avg:.1f}"
+            )
+
+    # Compute Elo updates from all matches
+    logger.info("📈 Computing Elo updates...")
+
+    # Get current Elos
+    all_agents = registry.get_all_agents()
+    current_elos = {a.name: a.elo for a in all_agents}
+
+    # Add challenger if not in registry yet (use parent's Elo or 1000)
+    if challenger_path not in current_elos:
+        # Find parent checkpoint
+        parent_elo = 1000.0
+        for agent in checkpoints:
+            if agent.path == challenger_path:
+                parent_name = agent.parent
+                if parent_name and parent_name in current_elos:
+                    parent_elo = current_elos[parent_name]
+                break
+        current_elos[challenger_path] = parent_elo
+
+    # Apply Elo updates
+    for match in all_matches:
+        current_elos = update_elo_from_match(
+            power_agents=match["power_agents"],
+            power_scores=match["power_scores"],
+            agent_elos=current_elos,
+            k=32.0,
+        )
+
+    # Update registry
+    registry.bulk_update_elos(current_elos)
+    volume.commit()
+
+    # Compute summary stats
+    challenger_new_elo = current_elos.get(challenger_path, 1000.0)
+    wins = sum(1 for m in match_results if m["win"])
+    total_games = len(match_results)
+    win_rate = wins / total_games if total_games > 0 else 0.0
+
+    eval_duration = time.time() - eval_start
+
+    logger.info(f"✅ Elo evaluation complete in {eval_duration:.1f}s")
+    logger.info(f"   Challenger Elo: {challenger_new_elo:.0f}")
+    logger.info(f"   Win rate: {win_rate:.1%} ({wins}/{total_games})")
+
+    # Log to WandB if run ID provided
+    if wandb_run_id:
+        try:
+            wandb.init(id=wandb_run_id, resume="allow", project="diplomacy-grpo")
+            wandb.log(
+                {
+                    "elo/challenger": challenger_new_elo,
+                    "elo/win_rate": win_rate,
+                    "elo/games_played": total_games,
+                    "elo/evaluation_step": training_step,
+                }
+            )
+            # Log Elo for all tracked agents
+            for agent_name, elo in current_elos.items():
+                if agent_name in [a.name for a in all_agents]:
+                    safe_name = agent_name.replace("/", "_")
+                    wandb.log({f"elo/{safe_name}": elo})
+        except Exception as e:
+            logger.warning(f"Failed to log to WandB: {e}")
+
+    await axiom.flush()
+
+    return {
+        "challenger_path": challenger_path,
+        "challenger_elo": challenger_new_elo,
+        "win_rate": win_rate,
+        "games_played": total_games,
+        "elo_updates": current_elos,
+        "duration_s": eval_duration,
+    }
+
+
+# ------------------------------------------------------------------------------
+# 9.2 Standard Evaluation Runner
+# ------------------------------------------------------------------------------
 
 
 @app.function(
