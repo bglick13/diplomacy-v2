@@ -85,6 +85,46 @@ class ExperimentConfig(BaseModel):
     )
 
     # =========================================================================
+    # League Training Settings
+    # =========================================================================
+    # NOTE: League training collects trajectories only for the "hero" power,
+    # reducing trajectories per rollout by 7x compared to self-play.
+    #
+    # Recommended compensations:
+    #   - Increase num_groups_per_step from 8 to 48-56 (6-7x more rollouts)
+    #   - OR lower learning_rate from 1e-5 to 2e-6 (5x lower)
+    #   - OR increase samples_per_group from 8 to 24 (3x more forks)
+    # =========================================================================
+    league_training: bool = Field(
+        default=False,
+        description="Enable league training with PFSP opponent sampling",
+    )
+    league_registry_path: str = Field(
+        default="/data/league.json",
+        description="Path to league registry JSON file on Modal volume",
+    )
+    checkpoint_every_n_steps: int = Field(
+        default=10,
+        description="Save checkpoint to league every N steps (for recent curriculum)",
+    )
+    pfsp_self_play_weight: float = Field(
+        default=0.30,
+        description="PFSP: Weight for self-play (current policy)",
+    )
+    pfsp_peer_weight: float = Field(
+        default=0.40,
+        description="PFSP: Weight for peer opponents (similar Elo)",
+    )
+    pfsp_exploitable_weight: float = Field(
+        default=0.20,
+        description="PFSP: Weight for exploitable opponents (weaker)",
+    )
+    pfsp_baseline_weight: float = Field(
+        default=0.10,
+        description="PFSP: Weight for baseline opponents (RandomBot, ChaosBot)",
+    )
+
+    # =========================================================================
     # Training Loop
     # =========================================================================
     total_steps: int = Field(default=10, description="Total number of training steps")
@@ -114,8 +154,9 @@ class ExperimentConfig(BaseModel):
     compact_prompts: bool = Field(
         default=True, description="Use compact prompt format (reduces token count)"
     )
+    # Leave this off for now - it seems to tank extraction rates. TODO: investigate.
     prefix_cache_optimized: bool = Field(
-        default=True,
+        default=False,
         description="Optimize prompt structure for vLLM prefix caching",
     )
     compute_ref_logprobs_in_rollout: bool = Field(
