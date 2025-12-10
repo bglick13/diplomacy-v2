@@ -94,9 +94,9 @@ TRACE_PATH = Path("/traces")
         str(HF_CACHE_PATH): hf_cache_volume,  # Cache HuggingFace models
     },
     scaledown_window=60 * 10,  # 10 minutes - longer to prevent churn
-    buffer_containers=1,
+    buffer_containers=3,  # Increased from 1: keep more containers warm for higher throughput
 )
-@modal.concurrent(max_inputs=256, target_inputs=200)
+@modal.concurrent(max_inputs=512, target_inputs=400)  # Increased from 256/200 for higher throughput
 class InferenceEngine:
     model_id: str = modal.parameter(default="Qwen/Qwen2.5-7B-Instruct")
 
@@ -142,23 +142,41 @@ class InferenceEngine:
         # vLLM v1: Pass logits_processors at engine initialization
         # The processor is loaded once and handles all requests at batch level
         # NOTE: max_lora_rank must match or exceed the rank used during training
+
+        # Performance tuning parameters (optimized for throughput)
+        # These values balance memory usage with throughput for A100 GPUs
+        gpu_memory_util = (
+            0.92  # Increased from 0.85: more aggressive memory use for higher throughput
+        )
+        max_num_seqs = 512  # Increased from 256: allow larger batches for better GPU utilization
+        max_num_batched_tokens = 16384  # Token-level batching limit (critical for throughput)
+        # Higher value = better throughput but more memory
+        # 16384 = ~64 tokens per request at max batch size (good for Diplomacy prompts)
+
         engine_args = AsyncEngineArgs(
             model=self.model_id,
             enable_lora=True,
             max_loras=8,  # League training: up to 7 opponents + 1 hero
             max_lora_rank=16,  # Must match training LoRA rank
-            gpu_memory_utilization=0.85,  # Lower for multi-LoRA memory overhead
-            max_num_seqs=256,  # Reduced for multi-LoRA stability
-            enable_prefix_caching=True,
+            gpu_memory_utilization=gpu_memory_util,
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,  # Critical for throughput
+            enable_prefix_caching=True,  # Prefix caching already optimized for shared prompt prefixes
             disable_log_stats=False,
             logits_processors=[DiplomacyLogitsProcessor],
             # Optimization: Use cached model location
             download_dir=str(HF_CACHE_PATH / "hub"),
             # Optimization: Prefer safetensors (faster loading than pickle)
             load_format="auto",  # Auto-detects best format (safetensors preferred)
-            # Optimization: Skip warmup if not needed (set to False for production stability)
-            # Note: Warmup helps with first-request latency but adds to startup time
-            # disable_log_requests=True,  # Reduces logging overhead during startup
+            # Optional: Enable FP8 quantization for memory efficiency (uncomment if needed)
+            # quantization="fp8",  # Reduces memory by ~2x, allows larger batches
+            # Note: Requires model support and may have slight accuracy impact
+        )
+
+        print(
+            f"⚙️  vLLM Config: max_num_seqs={max_num_seqs}, "
+            f"max_num_batched_tokens={max_num_batched_tokens}, "
+            f"gpu_memory_util={gpu_memory_util}"
         )
         self.engine = AsyncLLM.from_engine_args(engine_args)
 
@@ -205,6 +223,14 @@ class InferenceEngine:
 
         batch_size = len(prompts)
         request_start = time.time()
+
+        # Detailed timing breakdown for tracing
+        timing_breakdown = {
+            "adapter_load_time_s": 0.0,
+            "generation_time_s": 0.0,
+            "total_time_s": 0.0,
+        }
+
         log_inference_request(
             rollout_id="inference-engine",
             batch_size=batch_size,
@@ -213,6 +239,7 @@ class InferenceEngine:
         )
 
         try:
+            adapter_load_start = time.time()
             lora_req = None
             if lora_name:
                 full_path = f"/data/models/{lora_name}"
@@ -272,6 +299,8 @@ class InferenceEngine:
                 lora_req = LoRARequest(lora_name, lora_int_id, full_path)
                 print(f"🔧 Created LoRARequest: name={lora_name}, id={lora_int_id}")
 
+            timing_breakdown["adapter_load_time_s"] = time.time() - adapter_load_start
+
             async def _generate_single(prompt: str, moves: dict) -> dict[str, object]:
                 """Generate for a single prompt. Allows concurrent execution."""
                 request_id = str(uuid.uuid4())
@@ -285,15 +314,21 @@ class InferenceEngine:
                     logprobs=1,  # type: ignore[arg-type]  # Return logprobs for ref model opt
                 )
                 try:
+                    gen_start = time.time()
                     generator = self.engine.generate(
                         prompt=prompt,
                         sampling_params=sampling_params,
                         request_id=request_id,
                         lora_request=lora_req,
                     )
+                    first_token_time = None
                     final_output = None
                     async for output in generator:
+                        if first_token_time is None and output.outputs:
+                            first_token_time = time.time() - gen_start
                         final_output = output
+
+                    # generation_time tracked but not used per-request (tracked at batch level)
 
                     text = ""
                     token_ids: list[int] = []
@@ -348,11 +383,15 @@ class InferenceEngine:
 
             # CRITICAL: Await all generators concurrently for proper batching
             # Old code awaited sequentially, killing vLLM's continuous batching
+            generation_start = time.time()
             responses = await asyncio.gather(
                 *[_generate_single(p, m) for p, m in zip(prompts, valid_moves, strict=True)]
             )
+            timing_breakdown["generation_time_s"] = time.time() - generation_start
 
             duration_ms = int((time.time() - request_start) * 1000)
+            timing_breakdown["total_time_s"] = duration_ms / 1000.0
+
             total_tokens = sum(
                 int(token_count)
                 if isinstance(token_count := resp.get("token_count"), int | str)
@@ -360,6 +399,8 @@ class InferenceEngine:
                 for resp in responses
             )
             tokens_per_second = total_tokens / (duration_ms / 1000) if duration_ms > 0 else None
+
+            # Enhanced logging with timing breakdown
             log_inference_response(
                 rollout_id="inference-engine",
                 batch_size=batch_size,
@@ -367,6 +408,31 @@ class InferenceEngine:
                 tokens_generated=total_tokens,
                 tokens_per_second=tokens_per_second,
             )
+
+            # Log detailed timing breakdown to Axiom for analysis
+            from src.utils.observability import axiom
+
+            axiom.log(
+                {
+                    "event": "inference_timing_breakdown",
+                    "batch_size": batch_size,
+                    "lora_name": lora_name,
+                    "adapter_load_time_s": timing_breakdown["adapter_load_time_s"],
+                    "generation_time_s": timing_breakdown["generation_time_s"],
+                    "total_time_s": timing_breakdown["total_time_s"],
+                    "tokens_generated": total_tokens,
+                    "tokens_per_second": tokens_per_second,
+                }
+            )
+
+            # Debug logging for slow batches
+            if timing_breakdown["total_time_s"] > 2.0:
+                print(
+                    f"⏱️  Slow inference batch: {timing_breakdown['total_time_s']:.3f}s "
+                    f"(adapter_load: {timing_breakdown['adapter_load_time_s']:.3f}s, "
+                    f"generation: {timing_breakdown['generation_time_s']:.3f}s, "
+                    f"batch_size={batch_size})"
+                )
 
             # Return rich response structure with token data for trainer optimization
             return [
@@ -2548,9 +2614,21 @@ async def evaluate_league(
 
             # Run game
             game = DiplomacyWrapper(horizon=max_years * 2)
+            step_count = 0
+            step_timings = []  # Track timing per step for analysis
 
             while not game.is_done():
+                step_start = time.time()
+                step_count += 1
                 all_orders = []
+
+                # OPTIMIZATION: Batch inference calls by adapter (like run_rollout does)
+                # This dramatically speeds up LLM vs LLM matchups
+                adapter_groups: dict[str | None, list[tuple[str, str, dict]]] = {}
+                baseline_orders: dict[str, list[str]] = {}
+
+                # Phase 1: Collect prompts and group by adapter
+                prompt_start = time.time()
                 for power in POWERS:
                     adapter = power_adapters.get(power)
 
@@ -2559,29 +2637,122 @@ async def evaluate_league(
                         bot = BASELINE_BOTS[adapter]
                         if bot:
                             orders = bot.get_orders(game, power)
+                            baseline_orders[power] = orders
                         else:
-                            orders = []  # Base model - skip for now
+                            baseline_orders[power] = []
                     else:
-                        # LLM power - generate via InferenceEngine
+                        # LLM power - collect prompt for batching
                         prompt, valid_moves = llm_agent.build_prompt(game, power)
                         if valid_moves:
-                            responses = await InferenceEngine(
-                                model_id=model_id
-                            ).generate.remote.aio(
-                                prompts=[prompt],
-                                valid_moves=[valid_moves],
-                                lora_name=adapter,
-                            )
-                            orders = extract_orders(responses[0]["text"])
+                            adapter_key = adapter or "base_model"
+                            if adapter_key not in adapter_groups:
+                                adapter_groups[adapter_key] = []
+                            adapter_groups[adapter_key].append((power, prompt, valid_moves))
                         else:
-                            orders = []
+                            baseline_orders[power] = []
 
-                    all_orders.extend(orders)
+                prompt_time = time.time() - prompt_start
 
+                # Phase 2: Batch inference for each adapter group
+                inference_start = time.time()
+                inference_results: dict[str, list[str]] = {}  # power -> orders
+
+                for adapter_key, group_items in adapter_groups.items():
+                    group_powers = [item[0] for item in group_items]
+                    group_prompts = [item[1] for item in group_items]
+                    group_valid_moves = [item[2] for item in group_items]
+
+                    # Batch inference call (much faster than sequential)
+                    batch_start = time.time()
+                    responses = await InferenceEngine(model_id=model_id).generate.remote.aio(
+                        prompts=group_prompts,
+                        valid_moves=group_valid_moves,
+                        lora_name=adapter_key if adapter_key != "base_model" else None,
+                    )
+                    batch_time = time.time() - batch_start
+
+                    # Extract orders for each power
+                    for power, response_data in zip(group_powers, responses, strict=True):
+                        orders = extract_orders(response_data["text"])
+                        inference_results[power] = orders
+
+                    # Log batch timing
+                    logger.debug(
+                        f"  Batch inference: adapter={adapter_key}, "
+                        f"batch_size={len(group_prompts)}, time={batch_time:.3f}s"
+                    )
+
+                inference_time = time.time() - inference_start
+
+                # Phase 3: Combine all orders
+                combine_start = time.time()
+                for power in POWERS:
+                    if power in baseline_orders:
+                        all_orders.extend(baseline_orders[power])
+                    elif power in inference_results:
+                        all_orders.extend(inference_results[power])
+                combine_time = time.time() - combine_start
+
+                # Phase 4: Step game
+                step_game_start = time.time()
                 game.step(all_orders)
+                step_game_time = time.time() - step_game_start
+
+                step_total = time.time() - step_start
+                step_timings.append(
+                    {
+                        "step": step_count,
+                        "prompt_time_s": prompt_time,
+                        "inference_time_s": inference_time,
+                        "combine_time_s": combine_time,
+                        "step_game_time_s": step_game_time,
+                        "total_time_s": step_total,
+                        "num_llm_powers": len(sum(adapter_groups.values(), [])),
+                        "num_baseline_powers": len(baseline_orders),
+                    }
+                )
+
+                # Log every 5 steps to avoid spam
+                if step_count % 5 == 0:
+                    logger.info(
+                        f"  Step {step_count}: {step_total:.3f}s total "
+                        f"(prompt: {prompt_time:.3f}s, inference: {inference_time:.3f}s, "
+                        f"game: {step_game_time:.3f}s)"
+                    )
 
             # Compute final scores
             final_scores = calculate_final_scores(game)
+
+            # Log timing summary for this game
+            if step_timings:
+                total_time = sum(s["total_time_s"] for s in step_timings)
+                avg_inference_time = sum(s["inference_time_s"] for s in step_timings) / len(
+                    step_timings
+                )
+                avg_prompt_time = sum(s["prompt_time_s"] for s in step_timings) / len(step_timings)
+                avg_game_time = sum(s["step_game_time_s"] for s in step_timings) / len(step_timings)
+
+                logger.info(
+                    f"  Game {game_idx} complete: {step_count} steps, {total_time:.2f}s total "
+                    f"(avg: prompt={avg_prompt_time:.3f}s, inference={avg_inference_time:.3f}s, "
+                    f"game={avg_game_time:.3f}s)"
+                )
+
+                # Log to Axiom for analysis
+                axiom.log(
+                    {
+                        "event": "league_eval_game_timing",
+                        "challenger_path": challenger_path,
+                        "gatekeeper": gatekeeper.name,
+                        "game_idx": game_idx,
+                        "total_steps": step_count,
+                        "total_time_s": total_time,
+                        "avg_prompt_time_s": avg_prompt_time,
+                        "avg_inference_time_s": avg_inference_time,
+                        "avg_game_time_s": avg_game_time,
+                        "num_llm_powers": step_timings[-1]["num_llm_powers"] if step_timings else 0,
+                    }
+                )
 
             # Build power_agents mapping
             power_agents = {p: power_adapters[p] or "base_model" for p in POWERS}
@@ -2590,6 +2761,7 @@ async def evaluate_league(
             match_data = {
                 "power_agents": power_agents,
                 "power_scores": final_scores,
+                "step_timings": step_timings,  # Include timing data
             }
             all_matches.append(match_data)
 
