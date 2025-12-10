@@ -90,6 +90,19 @@ class LeagueRegistry:
         else:
             self._metadata = LeagueMetadata(run_name="unknown-run")
 
+    def reload(self) -> None:
+        """
+        Reload registry from disk to get latest updates.
+
+        This is useful when other processes (e.g., evaluate_league) have updated
+        the registry file and we want to refresh our in-memory state.
+        """
+        if self.path.exists() and self.path.stat().st_size > 0:
+            self._load()
+            logger.debug(f"Reloaded league registry from {self.path}")
+        else:
+            logger.warning(f"Registry file {self.path} does not exist or is empty, skipping reload")
+
     def _save(self) -> None:
         """Save registry to JSON file."""
         # Ensure parent directory exists
