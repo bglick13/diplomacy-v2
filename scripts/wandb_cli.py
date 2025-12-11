@@ -461,6 +461,46 @@ def export_cmd(
     click.echo(json.dumps(result, indent=2, default=str))
 
 
+@cli.command("get-cache-stats")
+@click.option(
+    "--run-id",
+    "-r",
+    required=True,
+    help="WandB run ID or display name",
+)
+@click.option(
+    "--project",
+    "-p",
+    default="diplomacy-grpo",
+    help="WandB project name",
+    show_default=True,
+)
+@click.option("--entity", "-e", default=None, help="WandB entity (team/username)")
+@click.option(
+    "--output-format",
+    "-o",
+    type=click.Choice(["json", "table"]),
+    default="json",
+    help="Output format",
+    show_default=True,
+)
+def get_cache_stats_cmd(
+    run_id: str,
+    project: str,
+    entity: str | None,
+    output_format: str,
+) -> None:
+    """Get prefix cache statistics for a run."""
+    result = get_cache_stats(
+        run_id=run_id,
+        project=project,
+        entity=entity,
+        output_format=output_format,
+    )
+    if output_format == "json":
+        click.echo(json.dumps(result, indent=2, default=str))
+
+
 # ============================================================================
 # Core functions (unchanged logic, but now use resolve_run for lookups)
 # ============================================================================
@@ -1018,6 +1058,129 @@ def export_run(
         "output_path": str(output_file.absolute()),
         "file_size": output_file.stat().st_size,
     }
+
+
+def get_cache_stats(
+    run_id: str,
+    project: str,
+    entity: str | None = None,
+    output_format: str = "json",
+) -> dict[str, Any]:
+    """
+    Get prefix cache statistics for a run.
+
+    Args:
+        run_id: WandB run ID or display name
+        project: WandB project name
+        entity: WandB entity (team/username)
+        output_format: Output format (table, json)
+
+    Returns:
+        Dictionary with cache statistics
+    """
+    api = wandb.Api()
+    run = resolve_run(api, run_id, project, entity)
+
+    # Get history for cache metrics
+    history = run.history(x_axis="_step")
+
+    # Cache metrics to look for
+    cache_metrics = [
+        "cache/hit_rate",
+        "cache/total_queries",
+        "cache/total_hits",
+        "cache/prompt_tokens",
+        "cache/batches",
+    ]
+
+    result: dict[str, Any] = {
+        "run_id": run.id,
+        "run_name": run.name,
+        "cache_enabled": False,
+        "metrics": {},
+        "summary": {},
+    }
+
+    # Check if cache metrics exist
+    available_cols = [col for col in history.columns if col.startswith("cache/")]
+    if not available_cols:
+        result["cache_enabled"] = False
+        result["message"] = "No cache metrics found. Run may not have prefix caching enabled."
+        if output_format == "table":
+            click.echo(f"\n⚠️ No cache metrics found for run: {run.name}")
+            click.echo("   Run may not have prefix caching enabled (prefix_cache_optimized=False)")
+        return result
+
+    result["cache_enabled"] = True
+
+    # Extract cache metrics
+    for metric in cache_metrics:
+        if metric in history.columns:
+            values = history[metric].dropna().tolist()
+            if values:
+                result["metrics"][metric] = {
+                    "data_points": len(values),
+                    "first": values[0] if values else None,
+                    "last": values[-1] if values else None,
+                    "min": float(min(values)),
+                    "max": float(max(values)),
+                    "mean": float(sum(values) / len(values)),
+                }
+
+    # Calculate summary statistics
+    if "cache/hit_rate" in result["metrics"]:
+        hit_rate_data = result["metrics"]["cache/hit_rate"]
+        result["summary"]["avg_hit_rate"] = hit_rate_data["mean"]
+        result["summary"]["final_hit_rate"] = hit_rate_data["last"]
+        result["summary"]["peak_hit_rate"] = hit_rate_data["max"]
+
+    if "cache/prompt_tokens" in result["metrics"]:
+        tokens_data = result["metrics"]["cache/prompt_tokens"]
+        result["summary"]["total_prompt_tokens"] = tokens_data["last"]
+
+    if "cache/total_hits" in result["metrics"] and "cache/total_queries" in result["metrics"]:
+        hits = result["metrics"]["cache/total_hits"]["last"]
+        queries = result["metrics"]["cache/total_queries"]["last"]
+        if queries and queries > 0:
+            result["summary"]["overall_hit_rate"] = hits / queries
+            result["summary"]["total_cache_hits"] = hits
+            result["summary"]["total_cache_queries"] = queries
+
+    # Estimate tokens saved (rough calculation)
+    if "cache/hit_rate" in result["metrics"] and "cache/prompt_tokens" in result["metrics"]:
+        avg_hit_rate = result["metrics"]["cache/hit_rate"]["mean"]
+        total_tokens = result["metrics"]["cache/prompt_tokens"]["last"]
+        if total_tokens:
+            result["summary"]["estimated_tokens_saved"] = int(total_tokens * avg_hit_rate)
+
+    if output_format == "table":
+        click.echo(f"\n📊 Prefix Cache Stats for: {run.name} ({run.id})")
+        click.echo("-" * 60)
+
+        if result["summary"]:
+            click.echo("\nSummary:")
+            if "avg_hit_rate" in result["summary"]:
+                click.echo(f"  Average Hit Rate: {result['summary']['avg_hit_rate'] * 100:.1f}%")
+            if "final_hit_rate" in result["summary"]:
+                click.echo(f"  Final Hit Rate: {result['summary']['final_hit_rate'] * 100:.1f}%")
+            if "peak_hit_rate" in result["summary"]:
+                click.echo(f"  Peak Hit Rate: {result['summary']['peak_hit_rate'] * 100:.1f}%")
+            if "total_cache_hits" in result["summary"]:
+                click.echo(f"  Total Cache Hits: {result['summary']['total_cache_hits']:,}")
+            if "estimated_tokens_saved" in result["summary"]:
+                click.echo(f"  Est. Tokens Saved: {result['summary']['estimated_tokens_saved']:,}")
+
+        click.echo("\nMetrics over time:")
+        for metric_name, metric_data in result["metrics"].items():
+            click.echo(f"\n  {metric_name}:")
+            click.echo(f"    Data points: {metric_data['data_points']}")
+            click.echo(f"    First → Last: {metric_data['first']:.4f} → {metric_data['last']:.4f}")
+            if "hit_rate" in metric_name:
+                click.echo(f"    Mean: {metric_data['mean'] * 100:.1f}%")
+            else:
+                click.echo(f"    Mean: {metric_data['mean']:.2f}")
+
+    return result
 
 
 def main() -> None:

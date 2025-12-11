@@ -44,20 +44,44 @@ class PromptConfig:
 # =============================================================================
 # These are placed at the START of prompts so vLLM can cache the KV values
 # and reuse them across all requests. Keep these IDENTICAL across all powers.
+#
+# Design principles:
+# 1. Clear task description upfront
+# 2. Rules and format hints (but NO closing tags in example to avoid confusion)
+# 3. Dynamic content (power, phase, moves) comes AFTER the static prefix
+# 4. Final prompt ends with '<orders>\n' to prime generation
+#
+# IMPORTANT: Do NOT include '</orders>' in the prefix - model gets confused!
 
-MOVEMENT_PREFIX = (
-    "You are playing Diplomacy. "
-    "Output one order per unit using EXACT strings from valid moves. "
-    "Format: one order per line inside <orders> tags. "
-    "Valid moves and game state follow.\n"
-)
+MOVEMENT_PREFIX = """\
+### DIPLOMACY MOVEMENT PHASE ###
 
-ADJUSTMENT_PREFIX = (
-    "You are playing Diplomacy adjustment phase. "
-    "Output adjustment orders using EXACT strings from valid options. "
-    "Format: one order per line inside <orders> tags. "
-    "Valid options and game state follow.\n"
-)
+You are playing Diplomacy. Your task: output exactly one order per unit.
+
+RULES:
+- Copy-paste EXACT move strings from the valid moves list below
+- One order per line inside <orders> tags
+- Movement: "A PAR - BUR" means Army Paris moves to Burgundy
+- Hold: "A PAR H" means Army Paris holds
+- Support: "A PAR S A BUR - MAR" means Paris supports Burgundy to Marseilles
+- Convoy: "F NTH C A LON - NWY" means Fleet convoys Army from London to Norway
+
+"""
+
+ADJUSTMENT_PREFIX = """\
+### DIPLOMACY ADJUSTMENT PHASE ###
+
+You are playing Diplomacy in the adjustment phase. Output build or disband orders.
+
+RULES:
+- Copy-paste EXACT order strings from the valid options below
+- One order per line inside <orders> tags
+- Build Army: "A PAR B"
+- Build Fleet: "F BRE B"
+- Disband: "A PAR D"
+- Waive a build: "WAIVE"
+
+"""
 
 
 @dataclass
@@ -176,10 +200,15 @@ class LLMAgent:
         if self.config.compact_mode:
             if self.config.prefix_cache_optimized:
                 # Prefix-optimized: static instructions FIRST, then dynamic content
+                # Keep format simple: prefix -> game state -> valid moves -> prime with <orders>
                 prompt = (
                     f"{MOVEMENT_PREFIX}"
-                    f"Power:{power_name} Phase:{phase} Units:{unit_count}\n"
-                    f"Moves:{moves_display}\n"
+                    f"GAME STATE:\n"
+                    f"Power: {power_name}\n"
+                    f"Phase: {phase}\n"
+                    f"You have {unit_count} units.\n\n"
+                    f"VALID MOVES:\n{moves_display}\n\n"
+                    f"Output {unit_count} orders (one per unit):\n"
                     "<orders>\n"
                 )
             else:
@@ -267,10 +296,15 @@ WAIVE
         if self.config.compact_mode:
             if self.config.prefix_cache_optimized:
                 # Prefix-optimized: static instructions FIRST, then dynamic content
+                # Keep format simple: prefix -> game state -> valid moves -> prime with <orders>
                 prompt = (
                     f"{ADJUSTMENT_PREFIX}"
-                    f"Power:{power_name} Phase:{phase} Action:{action} Count:{order_count}\n"
-                    f"Options:{moves_display}\n"
+                    f"GAME STATE:\n"
+                    f"Power: {power_name}\n"
+                    f"Phase: {phase}\n"
+                    f"Action: {action} {order_count} unit(s)\n\n"
+                    f"VALID OPTIONS:\n{moves_display}\n\n"
+                    f"Output {order_count} order(s):\n"
                     "<orders>\n"
                 )
             else:

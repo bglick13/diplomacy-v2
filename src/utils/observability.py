@@ -58,6 +58,10 @@ class EventType(str, Enum):
     # Health Checks
     HEALTH_CHECK = "health_check"
 
+    # Prefix Cache Events
+    PREFIX_CACHE_STATS = "prefix_cache_stats"
+    PREFIX_CACHE_BATCH = "prefix_cache_batch"
+
     # Training Events
     TRAINING_STEP = "training_step"
     TRAINING_START = "training_start"
@@ -314,16 +318,110 @@ def log_inference_response(
     duration_ms: int,
     tokens_generated: int | None = None,
     tokens_per_second: float | None = None,
+    # Prefix cache stats
+    prefix_cache_hit_rate: float | None = None,
+    prefix_cache_queries: int | None = None,
+    prefix_cache_hits: int | None = None,
 ):
     """Log inference response received."""
+    event_data = {
+        "event": EventType.INFERENCE_RESPONSE,
+        "rollout_id": rollout_id,
+        "batch_size": batch_size,
+        "duration_ms": duration_ms,
+        "tokens_generated": tokens_generated,
+        "tokens_per_second": tokens_per_second,
+    }
+    # Add cache stats if available
+    if prefix_cache_hit_rate is not None:
+        event_data["prefix_cache_hit_rate"] = prefix_cache_hit_rate
+        event_data["prefix_cache_queries"] = prefix_cache_queries
+        event_data["prefix_cache_hits"] = prefix_cache_hits
+    axiom.log(event_data)
+
+
+def log_prefix_cache_stats(
+    batch_id: str,
+    hit_rate: float,
+    queries: int,
+    hits: int,
+    prompt_tokens_total: int,
+    prompt_tokens_cached: int,
+    cache_utilization: float | None = None,
+):
+    """
+    Log prefix cache performance for a batch.
+
+    Args:
+        batch_id: Identifier for the batch
+        hit_rate: Fraction of queries that hit cache (0.0 - 1.0)
+        queries: Total cache queries
+        hits: Cache hits
+        prompt_tokens_total: Total prompt tokens in batch
+        prompt_tokens_cached: Prompt tokens served from cache
+        cache_utilization: KV cache memory utilization (0.0 - 1.0)
+    """
+    cache_efficiency = (
+        prompt_tokens_cached / prompt_tokens_total if prompt_tokens_total > 0 else 0.0
+    )
+
+    # Console log for visibility
+    if hit_rate > 0.5:
+        console_logger.info(
+            f"🎯 Prefix Cache: {hit_rate * 100:.1f}% hit rate | "
+            f"{prompt_tokens_cached}/{prompt_tokens_total} tokens cached ({cache_efficiency * 100:.1f}%)"
+        )
+    else:
+        console_logger.warning(
+            f"⚠️ Prefix Cache: {hit_rate * 100:.1f}% hit rate (low!) | "
+            f"{prompt_tokens_cached}/{prompt_tokens_total} tokens cached"
+        )
+
     axiom.log(
         {
-            "event": EventType.INFERENCE_RESPONSE,
-            "rollout_id": rollout_id,
-            "batch_size": batch_size,
-            "duration_ms": duration_ms,
-            "tokens_generated": tokens_generated,
-            "tokens_per_second": tokens_per_second,
+            "event": EventType.PREFIX_CACHE_STATS,
+            "batch_id": batch_id,
+            "hit_rate": hit_rate,
+            "queries": queries,
+            "hits": hits,
+            "prompt_tokens_total": prompt_tokens_total,
+            "prompt_tokens_cached": prompt_tokens_cached,
+            "cache_efficiency": cache_efficiency,
+            "cache_utilization": cache_utilization,
+        }
+    )
+
+
+def log_prefix_cache_batch_summary(
+    step: int,
+    batches_processed: int,
+    avg_hit_rate: float,
+    total_prompt_tokens: int,
+    total_cached_tokens: int,
+):
+    """
+    Log aggregated prefix cache stats for a training step.
+
+    This is logged once per step to WandB for easy visualization.
+    """
+    cache_efficiency = total_cached_tokens / total_prompt_tokens if total_prompt_tokens > 0 else 0.0
+
+    console_logger.info(
+        f"📊 Step {step} Cache Summary: "
+        f"avg_hit_rate={avg_hit_rate * 100:.1f}%, "
+        f"cache_efficiency={cache_efficiency * 100:.1f}%, "
+        f"tokens_saved={total_cached_tokens:,}"
+    )
+
+    axiom.log(
+        {
+            "event": EventType.PREFIX_CACHE_BATCH,
+            "step": step,
+            "batches_processed": batches_processed,
+            "avg_hit_rate": avg_hit_rate,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_cached_tokens": total_cached_tokens,
+            "cache_efficiency": cache_efficiency,
         }
     )
 

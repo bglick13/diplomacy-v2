@@ -37,8 +37,8 @@ Get time-series data for core training metrics:
 
 ```bash
 python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-grpo \
-    --metrics benchmark/loss benchmark/kl benchmark/reward_mean benchmark/reward_std \
-    benchmark/grad_norm --output-format json
+    -m benchmark/loss -m benchmark/kl -m benchmark/reward_mean -m benchmark/reward_std \
+    -m benchmark/grad_norm --output-format json
 ```
 
 **Analysis focus:**
@@ -54,8 +54,8 @@ Check throughput and efficiency:
 
 ```bash
 python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-grpo \
-    --metrics benchmark/rollout_time_s benchmark/training_time_s benchmark/pipeline_overlap_s \
-    benchmark/trajectories --output-format json
+    -m benchmark/rollout_time_s -m benchmark/training_time_s -m benchmark/pipeline_overlap_s \
+    -m benchmark/trajectories --output-format json
 ```
 
 **Analysis focus:**
@@ -70,8 +70,8 @@ Monitor parsing/extraction reliability:
 
 ```bash
 python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-grpo \
-    --metrics extraction/rate extraction/orders_expected extraction/orders_extracted \
-    extraction/empty_responses extraction/partial_responses --output-format json
+    -m extraction/rate -m extraction/orders_expected -m extraction/orders_extracted \
+    -m extraction/empty_responses -m extraction/partial_responses --output-format json
 ```
 
 **Analysis focus:**
@@ -86,7 +86,7 @@ Check for infrastructure issues:
 
 ```bash
 python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-grpo \
-    --metrics rollout/max_volume_reload_s rollout/max_total_s rollout/failed_count --output-format json
+    -m rollout/max_volume_reload_s -m rollout/max_total_s -m rollout/failed_count --output-format json
 ```
 
 **Analysis focus:**
@@ -94,14 +94,38 @@ python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-
 - **Volume reload time**: `rollout/max_volume_reload_s` spikes suggest volume I/O bottlenecks
 - **Total rollout time**: Compare `rollout/max_total_s` to expected values. Large spikes may indicate hanging games
 
-### 6. Analyze Power Law Scaling
+### 6. Analyze Prefix Cache Performance
+
+Check if prefix caching is enabled and how effective it is:
+
+```bash
+# Quick cache stats summary
+python scripts/wandb_cli.py get-cache-stats --run-id <run_name> --project diplomacy-grpo --output-format table
+
+# Detailed cache metrics over time
+python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-grpo \
+    -m cache/hit_rate -m cache/total_hits -m cache/prompt_tokens --output-format json
+```
+
+**Analysis focus:**
+- **Hit rate**: `cache/hit_rate` should be >50% after warmup. Higher is better for cost savings
+- **Hit rate trend**: Should increase as the static prefix gets cached
+- **Tokens saved**: Estimate from `cache/hit_rate * cache/prompt_tokens`
+- **Cache enabled**: If no `cache/*` metrics exist, prefix caching may be disabled
+
+**Cost impact:**
+- 50% hit rate → ~50% inference speedup
+- 70% hit rate → significant cost reduction
+- If hit rate is low (<30%), check prompt structure (static prefix should come FIRST)
+
+### 7. Analyze Power Law Scaling
 
 For power law experiments, check scaling behavior:
 
 ```bash
 python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-grpo \
-    --metrics power_law/cumulative_simulated_years power_law/simulated_years_per_step \
-    power_law/reward_at_compute --output-format json
+    -m power_law/cumulative_simulated_years -m power_law/simulated_years_per_step \
+    -m power_law/reward_at_compute --output-format json
 ```
 
 **Analysis focus:**
@@ -109,14 +133,14 @@ python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-
 - **Compute per step**: `power_law/simulated_years_per_step` should be consistent
 - **Reward scaling**: Plot `power_law/reward_at_compute` vs `power_law/cumulative_simulated_years` to check for power law scaling
 
-### 7. Analyze League Training (if enabled)
+### 8. Analyze League Training (if enabled)
 
 If league training is enabled, check Elo progression:
 
 ```bash
 python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-grpo \
-    --metrics elo/challenger elo/win_rate elo/games_played league/num_checkpoints \
-    league/best_elo --output-format json
+    -m elo/challenger -m elo/win_rate -m elo/games_played -m league/num_checkpoints \
+    -m league/best_elo --output-format json
 ```
 
 **Analysis focus:**
@@ -126,7 +150,7 @@ python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-
 - **Best Elo**: Track `league/best_elo` to see peak performance
 - **Evaluation frequency**: Check `elo/games_played` to ensure sufficient evaluation games
 
-### 8. Analyze Evaluation Results (if available)
+### 10. Analyze Evaluation Results (if available)
 
 Check evaluation artifacts and metrics:
 
@@ -139,7 +163,7 @@ Look for:
 - **Evaluation metrics**: Check for `eval/vs_{opponent}/win_rate`, `eval/vs_{opponent}/survival_rate`, `eval/vs_{opponent}/avg_centers`
 - **Summary tables**: `eval/summary_table` provides opponent-by-opponent breakdown
 
-### 9. Compare with Other Runs
+### 11. Compare with Other Runs
 
 Compare this run against similar experiments:
 
@@ -159,7 +183,7 @@ python scripts/wandb_cli.py compare --run-ids <run1> <run2> <run3> --project dip
 - **Training efficiency**: Compare trajectories per second, total training time
 - **Convergence speed**: Compare steps to reach target metrics
 
-### 10. Export Complete Data for Deep Analysis
+### 12. Export Complete Data for Deep Analysis
 
 Export full run data for offline analysis:
 
@@ -187,7 +211,7 @@ This creates a complete JSON file with:
 ```bash
 # Get loss and grad norm over time
 python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-grpo \
-    --metrics benchmark/loss benchmark/grad_norm benchmark/reward_mean --output-format json
+    -m benchmark/loss -m benchmark/grad_norm -m benchmark/reward_mean --output-format json
 ```
 
 **Hypothesis generation:**
@@ -206,7 +230,7 @@ python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-
 ```bash
 # Check reward and Elo progression
 python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-grpo \
-    --metrics benchmark/reward_mean elo/challenger benchmark/loss --x-axis _timestamp --output-format json
+    -m benchmark/reward_mean -m elo/challenger -m benchmark/loss --x-axis _timestamp --output-format json
 ```
 
 **Hypothesis generation:**
@@ -226,8 +250,8 @@ python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-
 ```bash
 # Check rollout metrics
 python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-grpo \
-    --metrics rollout/max_total_s rollout/max_volume_reload_s rollout/failed_count \
-    benchmark/pipeline_overlap_s --output-format json
+    -m rollout/max_total_s -m rollout/max_volume_reload_s -m rollout/failed_count \
+    -m benchmark/pipeline_overlap_s --output-format json
 ```
 
 **Hypothesis generation:**
@@ -246,8 +270,8 @@ python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-
 ```bash
 # Check extraction and reward metrics
 python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-grpo \
-    --metrics extraction/rate extraction/empty_responses benchmark/reward_mean \
-    benchmark/loss --output-format json
+    -m extraction/rate -m extraction/empty_responses -m benchmark/reward_mean \
+    -m benchmark/loss --output-format json
 ```
 
 **Hypothesis generation:**
@@ -265,7 +289,7 @@ python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-
 ```bash
 # Get power law metrics
 python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-grpo \
-    --metrics power_law/cumulative_simulated_years power_law/reward_at_compute \
+    -m power_law/cumulative_simulated_years -m power_law/reward_at_compute \
     --x-axis _timestamp --output-format json
 
 # Compare with other power law runs
@@ -277,6 +301,29 @@ python scripts/wandb_cli.py search --project diplomacy-grpo --tag power-laws --o
 - Compare scaling exponents across different model sizes
 - Identify optimal compute budget for target performance
 
+### Pattern 6: Prefix Cache Inefficiency
+
+**Symptoms:**
+- `cache/hit_rate` < 30% (low cache utilization)
+- `benchmark/rollout_time_s` not improving
+- No cache metrics at all (caching disabled)
+
+**Investigation:**
+```bash
+# Check cache performance
+python scripts/wandb_cli.py get-cache-stats --run-id <run_name> --project diplomacy-grpo --output-format table
+
+# Check cache metrics over time
+python scripts/wandb_cli.py get-metrics --run-id <run_name> --project diplomacy-grpo \
+    -m cache/hit_rate -m cache/prompt_tokens -m benchmark/rollout_time_s --output-format json
+```
+
+**Hypothesis generation:**
+- Cache disabled → enable `prefix_cache_optimized=True`
+- Low hit rate → check prompt structure (static instructions should come FIRST)
+- Hit rate not improving → prompts may be too variable (check valid_moves JSON placement)
+- High hit rate but slow rollouts → bottleneck is elsewhere (training, I/O)
+
 ## Automated Analysis Workflow
 
 For programmatic analysis, use this workflow:
@@ -286,8 +333,9 @@ For programmatic analysis, use this workflow:
 3. **Get performance metrics** → Check throughput and efficiency
 4. **Get extraction metrics** → Verify parsing reliability
 5. **Get rollout metrics** → Check infrastructure health
-6. **Compare with baselines** → Identify improvements/regressions
-7. **Generate hypotheses** → Based on patterns detected
+6. **Get cache stats** → Verify prefix caching efficiency
+7. **Compare with baselines** → Identify improvements/regressions
+8. **Generate hypotheses** → Based on patterns detected
 
 ## Key Metrics Reference
 
@@ -320,6 +368,13 @@ For programmatic analysis, use this workflow:
 - `power_law/cumulative_simulated_years`: Total compute used
 - `power_law/simulated_years_per_step`: Compute per step
 - `power_law/reward_at_compute`: Reward at given compute level
+
+### Prefix Cache Metrics
+- `cache/hit_rate`: KV cache hit rate (0.0-1.0, higher is better)
+- `cache/total_queries`: Total cache queries made
+- `cache/total_hits`: Number of cache hits
+- `cache/prompt_tokens`: Total prompt tokens processed
+- `cache/batches`: Number of inference batches
 
 ## Output Format
 
