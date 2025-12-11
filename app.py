@@ -1898,7 +1898,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
         logger.info(f"Step 0: Pre-launching {buffer_depth} batches of rollouts with base model")
 
         # Helper function to spawn rollouts (handles both legacy and league modes)
-        def spawn_rollouts_batch(hero_adapter_path: str | None) -> list:
+        def spawn_rollouts_batch(hero_adapter_path: str | None) -> tuple[list, list]:
             """
             Spawn a batch of rollouts with appropriate opponent sampling.
 
@@ -1911,6 +1911,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             nonlocal last_registry_reload_step
 
             handles = []
+            step_match_results = []  # Track PFSP sampling for observability
             for _ in range(cfg.num_groups_per_step):
                 if cfg.league_training and pfsp_matchmaker is not None:
                     # League training: hero uses latest adapter, opponents from registry
@@ -1925,13 +1926,24 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                             try:
                                 # CRITICAL: Must reload volume first to see commits from evaluate_league
                                 # Modal Volumes don't auto-sync - each container has a local view
+                                old_best_elo = league_registry.best_elo
                                 volume.reload()
                                 league_registry.reload()
                                 last_registry_reload_step = step
-                                logger.debug(
-                                    f"🔄 Reloaded league registry at step {step} "
-                                    f"(best Elo: {league_registry.best_elo:.0f})"
-                                )
+                                new_best_elo = league_registry.best_elo
+
+                                # Log whether Elo changed (validates sync from evaluate_league)
+                                if new_best_elo != old_best_elo:
+                                    logger.info(
+                                        f"🔄 Registry reloaded at step {step}: "
+                                        f"best_elo {old_best_elo:.0f} → {new_best_elo:.0f} "
+                                        f"(+{new_best_elo - old_best_elo:.0f})"
+                                    )
+                                else:
+                                    logger.debug(
+                                        f"🔄 Registry reloaded at step {step}: "
+                                        f"best_elo unchanged at {new_best_elo:.0f}"
+                                    )
                             except Exception as e:
                                 logger.warning(
                                     f"⚠️ Failed to reload registry: {e}, using cached state"
@@ -1975,13 +1987,14 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                             hero_power=hero_power,
                         )
                     )
+                    step_match_results.append(match_result)
                 else:
                     # Legacy mode: same adapter for all powers
                     handles.append(run_rollout.spawn(cfg.model_dump(), lora_name=hero_adapter_path))
-            return handles
+            return handles, step_match_results
 
-        # Each entry is (handles_list, hero_adapter_path)
-        rollout_buffer: deque[tuple[list, str | None]] = deque()
+        # Each entry is (handles_list, hero_adapter_path, match_results for PFSP tracking)
+        rollout_buffer: deque[tuple[list, str | None, list]] = deque()
 
         # Determine initial adapter for buffer (use resumed adapter if applicable)
         initial_adapter: str | None = None
@@ -1991,8 +2004,8 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             logger.info(f"📦 Resuming - buffer will use adapter: {initial_adapter}")
 
         for _ in range(buffer_depth):
-            handles = spawn_rollouts_batch(hero_adapter_path=initial_adapter)
-            rollout_buffer.append((handles, initial_adapter))
+            handles, match_results = spawn_rollouts_batch(hero_adapter_path=initial_adapter)
+            rollout_buffer.append((handles, initial_adapter, match_results))
 
         total_in_flight = buffer_depth * cfg.num_groups_per_step
         logger.info(
@@ -2005,7 +2018,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             step_profile: dict[str, Any] | None = {"step": step} if profile_enabled else None
 
             # A. Wait for OLDEST rollouts (front of buffer)
-            current_handles, current_lora_name = rollout_buffer.popleft()
+            current_handles, current_lora_name, current_match_results = rollout_buffer.popleft()
             rollout_start = time.time()
             with stopwatch(f"Benchmark_Rollout_{step}"):
                 raw_trajectories = []
@@ -2168,8 +2181,10 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     f"(using {'base model' if not new_hero_agent else new_hero_agent})"
                 )
 
-                new_handles = spawn_rollouts_batch(hero_adapter_path=new_hero_agent)
-                rollout_buffer.append((new_handles, new_hero_agent))
+                new_handles, new_match_results = spawn_rollouts_batch(
+                    hero_adapter_path=new_hero_agent
+                )
+                rollout_buffer.append((new_handles, new_hero_agent, new_match_results))
 
             if not raw_trajectories:
                 logger.warning(f"Step {step}: No trajectories, skipping")
@@ -2349,6 +2364,21 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                         "league/latest_step": league_registry.latest_step,
                     }
                 )
+
+                # Add PFSP distribution metrics (validates matchmaking is working correctly)
+                if current_match_results and pfsp_matchmaker is not None:
+                    pfsp_stats = pfsp_matchmaker.get_sampling_stats(current_match_results)
+                    category_rates = pfsp_stats.get("category_rates", {})
+                    hero_powers = pfsp_stats.get("hero_power_distribution", {})
+
+                    # Log category sampling rates
+                    for category, rate in category_rates.items():
+                        wandb_metrics[f"pfsp/{category}_rate"] = rate
+
+                    # Log hero power distribution (should be roughly uniform)
+                    total_games = sum(hero_powers.values()) or 1
+                    for power, count in hero_powers.items():
+                        wandb_metrics[f"pfsp/hero_{power.lower()}"] = count / total_games
 
             wandb.log(wandb_metrics)
             if profiler is not None:

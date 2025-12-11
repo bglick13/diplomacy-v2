@@ -58,7 +58,7 @@ class ExperimentConfig(BaseModel):
     # Rollout/Environment Settings
     # =========================================================================
     rollout_horizon_years: int = Field(
-        default=2, description="Number of game years to simulate per rollout"
+        default=5, description="Number of game years to simulate per rollout"
     )
     rollout_visualize_chance: float = Field(
         default=0.0,
@@ -73,14 +73,14 @@ class ExperimentConfig(BaseModel):
     # Reward / Scoring Settings
     # =========================================================================
     win_bonus: float = Field(
-        default=5.0,
+        default=10.0,
         description=(
             "Bonus reward for the sole leader when they have >= winner_threshold_sc supply centers. "
             "Creates pressure to WIN outright, breaking cooperative stalemate equilibria."
         ),
     )
     winner_threshold_sc: int = Field(
-        default=10,
+        default=7,
         description="Minimum supply centers required to be eligible for win bonus",
     )
 
@@ -96,7 +96,7 @@ class ExperimentConfig(BaseModel):
     #   - OR increase samples_per_group from 8 to 24 (3x more forks)
     # =========================================================================
     league_training: bool = Field(
-        default=False,
+        default=True,
         description="Enable league training with PFSP opponent sampling",
     )
     league_registry_path: str | None = Field(
@@ -190,7 +190,7 @@ class ExperimentConfig(BaseModel):
     )
     # Leave this off for now - it seems to tank extraction rates. TODO: investigate.
     prefix_cache_optimized: bool = Field(
-        default=False,
+        default=True,
         description="Optimize prompt structure for vLLM prefix caching",
     )
     compute_ref_logprobs_in_rollout: bool = Field(
