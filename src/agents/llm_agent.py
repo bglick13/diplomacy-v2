@@ -68,6 +68,29 @@ RULES:
 
 """
 
+# Minimal prefix for when valid moves are NOT shown in prompt
+# Model relies on logits processor for valid moves, so we give strategic context only
+MOVEMENT_PREFIX_MINIMAL = """\
+### DIPLOMACY MOVEMENT PHASE ###
+
+You are playing Diplomacy. Output exactly one order per unit.
+
+ORDER SYNTAX:
+- Move: "A PAR - BUR" (Army Paris to Burgundy)
+- Hold: "A PAR H" (Army Paris holds)
+- Support move: "A PAR S A BUR - MAR" (Paris supports Burgundy to Marseilles)
+- Support hold: "A PAR S A BUR" (Paris supports Burgundy to hold)
+- Convoy: "F NTH C A LON - NWY" (Fleet convoys Army London to Norway)
+
+ADJACENCIES (use standard Diplomacy geography):
+- Paris borders: Burgundy, Picardy, Gascony, Brest (army can't reach fleets)
+- Fleets can only move to coastal/sea provinces
+- Armies cannot cross water without convoy
+
+Output one order per line inside <orders> tags.
+
+"""
+
 ADJUSTMENT_PREFIX = """\
 ### DIPLOMACY ADJUSTMENT PHASE ###
 
@@ -80,6 +103,24 @@ RULES:
 - Build Fleet: "F BRE B"
 - Disband: "A PAR D"
 - Waive a build: "WAIVE"
+
+"""
+
+ADJUSTMENT_PREFIX_MINIMAL = """\
+### DIPLOMACY ADJUSTMENT PHASE ###
+
+You are playing Diplomacy in the adjustment phase.
+
+ORDER SYNTAX:
+- Build Army: "A <HOME_SC> B" (e.g., "A PAR B")
+- Build Fleet: "F <COASTAL_HOME_SC> B" (e.g., "F BRE B")
+- Disband unit: "<UNIT> D" (e.g., "A MUN D")
+- Waive a build: "WAIVE"
+
+RULES:
+- Can only build in unoccupied home supply centers
+- Must disband if you have more units than supply centers
+- Output one order per line inside <orders> tags
 
 """
 
@@ -192,25 +233,41 @@ class LLMAgent:
 
         When prefix_cache_optimized=True, static instructions come FIRST
         so vLLM can cache and reuse them across all requests.
+
+        When show_valid_moves=False, we only show unit positions (not exhaustive
+        move lists). The logits processor handles validity, so we save tokens.
         """
 
         # Count total units for context
         unit_count = len(valid_moves)
+        unit_list = ", ".join(valid_moves.keys())  # e.g., "A PAR, F BRE, A MAR"
 
         if self.config.compact_mode:
             if self.config.prefix_cache_optimized:
-                # Prefix-optimized: static instructions FIRST, then dynamic content
-                # Keep format simple: prefix -> game state -> valid moves -> prime with <orders>
-                prompt = (
-                    f"{MOVEMENT_PREFIX}"
-                    f"GAME STATE:\n"
-                    f"Power: {power_name}\n"
-                    f"Phase: {phase}\n"
-                    f"You have {unit_count} units.\n\n"
-                    f"VALID MOVES:\n{moves_display}\n\n"
-                    f"Output {unit_count} orders (one per unit):\n"
-                    "<orders>\n"
-                )
+                if self.config.show_valid_moves:
+                    # Full mode: show all valid moves
+                    prompt = (
+                        f"{MOVEMENT_PREFIX}"
+                        f"GAME STATE:\n"
+                        f"Power: {power_name}\n"
+                        f"Phase: {phase}\n"
+                        f"You have {unit_count} units.\n\n"
+                        f"VALID MOVES:\n{moves_display}\n\n"
+                        f"Output {unit_count} orders (one per unit):\n"
+                        "<orders>\n"
+                    )
+                else:
+                    # Minimal mode: just unit positions, rely on logits processor
+                    # Much shorter prompts = better prefix caching + faster inference
+                    prompt = (
+                        f"{MOVEMENT_PREFIX_MINIMAL}"
+                        f"GAME STATE:\n"
+                        f"Power: {power_name}\n"
+                        f"Phase: {phase}\n"
+                        f"Your units: {unit_list}\n\n"
+                        f"Output {unit_count} orders (one per unit):\n"
+                        "<orders>\n"
+                    )
             else:
                 # Legacy compact format (dynamic content first)
                 prompt = (
@@ -221,7 +278,8 @@ class LLMAgent:
                     "<orders>\n"
                 )
         else:
-            prompt = f"""You are playing Diplomacy as {power_name}.
+            if self.config.show_valid_moves:
+                prompt = f"""You are playing Diplomacy as {power_name}.
     Phase: {phase}
     Units: {unit_count}
 
@@ -237,6 +295,16 @@ class LLMAgent:
     F BRE - MAO
     A MAR H
     </orders>
+    """
+            else:
+                prompt = f"""You are playing Diplomacy as {power_name}.
+    Phase: {phase}
+    Your units: {unit_list}
+
+    Output exactly {unit_count} orders, one per line.
+    Use standard Diplomacy notation: A PAR - BUR, F BRE H, A MAR S A PIE - VEN, etc.
+
+    <orders>
     """
 
         if self.config.custom_instructions:
@@ -295,18 +363,30 @@ WAIVE
 
         if self.config.compact_mode:
             if self.config.prefix_cache_optimized:
-                # Prefix-optimized: static instructions FIRST, then dynamic content
-                # Keep format simple: prefix -> game state -> valid moves -> prime with <orders>
-                prompt = (
-                    f"{ADJUSTMENT_PREFIX}"
-                    f"GAME STATE:\n"
-                    f"Power: {power_name}\n"
-                    f"Phase: {phase}\n"
-                    f"Action: {action} {order_count} unit(s)\n\n"
-                    f"VALID OPTIONS:\n{moves_display}\n\n"
-                    f"Output {order_count} order(s):\n"
-                    "<orders>\n"
-                )
+                if self.config.show_valid_moves:
+                    # Full mode: show all valid options
+                    prompt = (
+                        f"{ADJUSTMENT_PREFIX}"
+                        f"GAME STATE:\n"
+                        f"Power: {power_name}\n"
+                        f"Phase: {phase}\n"
+                        f"Action: {action} {order_count} unit(s)\n\n"
+                        f"VALID OPTIONS:\n{moves_display}\n\n"
+                        f"Output {order_count} order(s):\n"
+                        "<orders>\n"
+                    )
+                else:
+                    # Minimal mode: just action info, rely on logits processor
+                    # For adjustment, valid moves list is usually small so savings are modest
+                    prompt = (
+                        f"{ADJUSTMENT_PREFIX_MINIMAL}"
+                        f"GAME STATE:\n"
+                        f"Power: {power_name}\n"
+                        f"Phase: {phase}\n"
+                        f"Action: {action} {order_count} unit(s)\n\n"
+                        f"Output {order_count} order(s):\n"
+                        "<orders>\n"
+                    )
             else:
                 # Legacy compact format (dynamic content first)
                 prompt = (
@@ -316,7 +396,8 @@ WAIVE
                     f"{moves_display}\n<orders>\n"
                 )
         else:
-            prompt = f"""You are playing Diplomacy as {power_name}.
+            if self.config.show_valid_moves:
+                prompt = f"""You are playing Diplomacy as {power_name}.
 Phase: {phase}
 Action: {action} {order_count} unit(s)
 
@@ -336,6 +417,20 @@ Example:
 <orders>
 {example}
 </orders>
+"""
+            else:
+                # Minimal mode for non-compact
+                prompt = f"""You are playing Diplomacy as {power_name}.
+Phase: {phase}
+Action: {action} {order_count} unit(s)
+
+Output exactly {order_count} order(s), one per line.
+- Build Army: A <HOME_SC> B (e.g., A PAR B)
+- Build Fleet: F <COASTAL_HOME_SC> B (e.g., F BRE B)
+- Disband: <UNIT> D (e.g., A MUN D)
+- Skip build: WAIVE
+
+<orders>
 """
 
         if self.config.custom_instructions:

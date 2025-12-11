@@ -303,7 +303,12 @@ class InferenceEngine:
 
     @modal.method()
     async def generate(
-        self, prompts: list[str], valid_moves: list[dict], lora_name: str | None = None
+        self,
+        prompts: list[str],
+        valid_moves: list[dict],
+        lora_name: str | None = None,
+        temperature: float = 0.8,
+        max_new_tokens: int = 256,
     ):
         """
         Generate responses for the given prompts.
@@ -314,6 +319,8 @@ class InferenceEngine:
             lora_name: Name of the LoRA adapter (relative to VLLM_LORA_RESOLVER_CACHE_DIR).
                        e.g., "benchmark-20251130/adapter_v1" will load from
                        /data/models/benchmark-20251130/adapter_v1
+            temperature: Sampling temperature (default 0.8)
+            max_new_tokens: Maximum tokens to generate (default 256)
         """
         import asyncio
         import os
@@ -409,8 +416,8 @@ class InferenceEngine:
                 # vLLM SamplingParams accepts these at runtime but type stubs may be incomplete
                 # logprobs=1 returns per-token log probabilities for the sampled token
                 sampling_params = SamplingParams(  # type: ignore[call-arg, misc]
-                    temperature=0.7,  # type: ignore[arg-type]
-                    max_tokens=200,  # type: ignore[arg-type]
+                    temperature=temperature,  # type: ignore[arg-type]
+                    max_tokens=max_new_tokens,  # type: ignore[arg-type]
                     extra_args={"valid_moves_dict": moves},  # type: ignore[arg-type]
                     stop=["</orders>", "</Orders>"],  # type: ignore[arg-type]
                     logprobs=1,  # type: ignore[arg-type]  # Return logprobs for ref model opt
@@ -881,7 +888,9 @@ async def run_rollout(
 
         # Initialize the LLM agent for prompt generation
         prompt_config = PromptConfig(
-            compact_mode=cfg.compact_prompts, prefix_cache_optimized=cfg.prefix_cache_optimized
+            compact_mode=cfg.compact_prompts,
+            prefix_cache_optimized=cfg.prefix_cache_optimized,
+            show_valid_moves=cfg.show_valid_moves,
         )
         agent = LLMAgent(config=prompt_config)
 
@@ -968,6 +977,8 @@ async def run_rollout(
                         prompts=llm_prompts,
                         valid_moves=llm_valid_moves,
                         lora_name=None,  # Use base model for warmup
+                        temperature=cfg.temperature,
+                        max_new_tokens=cfg.max_new_tokens,
                     )
 
                 for resp_idx, game_idx in enumerate(llm_indices):
@@ -1099,6 +1110,8 @@ async def run_rollout(
                             prompts=group_prompts,
                             valid_moves=group_valid_moves,
                             lora_name=adapter_key,
+                            temperature=cfg.temperature,
+                            max_new_tokens=cfg.max_new_tokens,
                         )
 
                     # Map responses back to original indices
@@ -2161,6 +2174,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                                     else cfg.league_registry_path
                                 )
                                 # Spawn async - doesn't block training
+                                # Pass all prompt/inference settings to ensure eval matches training
                                 evaluate_league.spawn(
                                     challenger_path=adapter_rel_path,
                                     league_registry_path=registry_path_str,
@@ -2169,6 +2183,11 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                                     model_id=cfg.base_model_id,
                                     wandb_run_id=wandb.run.id if wandb.run else None,
                                     training_step=step,
+                                    show_valid_moves=cfg.show_valid_moves,
+                                    compact_prompts=cfg.compact_prompts,
+                                    prefix_cache_optimized=cfg.prefix_cache_optimized,
+                                    temperature=cfg.temperature,
+                                    max_new_tokens=cfg.max_new_tokens,
                                 )
 
                     # Always use the adapter path directly for rollouts
@@ -2819,6 +2838,12 @@ async def evaluate_league(
     model_id: str = "Qwen/Qwen2.5-7B-Instruct",
     wandb_run_id: str | None = None,
     training_step: int = 0,
+    # Prompt/inference settings (should match training config)
+    show_valid_moves: bool = True,
+    compact_prompts: bool = True,
+    prefix_cache_optimized: bool = True,
+    temperature: float = 0.8,
+    max_new_tokens: int = 256,
 ) -> dict:
     """
     Run Elo evaluation for a new checkpoint against gatekeepers.
@@ -2838,6 +2863,11 @@ async def evaluate_league(
         model_id: Base model ID
         wandb_run_id: WandB run ID to log to (from training)
         training_step: Current training step (for logging)
+        show_valid_moves: Include valid moves in prompts (should match training)
+        compact_prompts: Use compact prompt format (should match training)
+        prefix_cache_optimized: Optimize prompts for prefix caching (should match training)
+        temperature: Sampling temperature (should match training)
+        max_new_tokens: Max tokens to generate (should match training)
 
     Returns:
         Dict with Elo updates and match results
@@ -2886,8 +2916,12 @@ async def evaluate_league(
 
     POWERS = ["AUSTRIA", "ENGLAND", "FRANCE", "GERMANY", "ITALY", "RUSSIA", "TURKEY"]
 
-    # Initialize agents
-    prompt_config = PromptConfig(compact_mode=True, prefix_cache_optimized=True)
+    # Initialize agents (use same prompt settings as training)
+    prompt_config = PromptConfig(
+        compact_mode=compact_prompts,
+        prefix_cache_optimized=prefix_cache_optimized,
+        show_valid_moves=show_valid_moves,
+    )
     llm_agent = LLMAgent(config=prompt_config)
 
     # Track all matches for Elo updates
@@ -2974,6 +3008,8 @@ async def evaluate_league(
                         prompts=group_prompts,
                         valid_moves=group_valid_moves,
                         lora_name=adapter_key if adapter_key != "base_model" else None,
+                        temperature=temperature,
+                        max_new_tokens=max_new_tokens,
                     )
                     batch_time = time.time() - batch_start
 
@@ -3266,6 +3302,12 @@ async def run_evaluation(
     visualize_sample_rate: float = 0.3,
     log_to_wandb: bool = True,
     wandb_run_name: str | None = None,
+    # Prompt/inference settings
+    show_valid_moves: bool = True,
+    compact_prompts: bool = True,
+    prefix_cache_optimized: bool = True,
+    temperature: float = 0.8,
+    max_new_tokens: int = 256,
 ) -> dict:
     """
     Evaluate a checkpoint against various opponents.
@@ -3353,8 +3395,12 @@ async def run_evaluation(
             },
         )
 
-    # Initialize LLM agent
-    prompt_config = PromptConfig(compact_mode=True)
+    # Initialize LLM agent with provided settings
+    prompt_config = PromptConfig(
+        compact_mode=compact_prompts,
+        prefix_cache_optimized=prefix_cache_optimized,
+        show_valid_moves=show_valid_moves,
+    )
     llm_agent = LLMAgent(config=prompt_config)
 
     # Results storage
@@ -3426,6 +3472,8 @@ async def run_evaluation(
                         prompts=checkpoint_prompts,
                         valid_moves=checkpoint_valid_moves,
                         lora_name=checkpoint_path,
+                        temperature=temperature,
+                        max_new_tokens=max_new_tokens,
                     )
 
                     for response_data, valid_moves in zip(
