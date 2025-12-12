@@ -188,6 +188,7 @@ class TestLeagueRegistry:
         registry.update_elo("adapter_v10", 1200.0)
 
         agent = registry.get_agent("adapter_v10")
+        assert agent is not None
         assert agent.elo == 1200.0
         assert agent.matches == 1
 
@@ -203,8 +204,12 @@ class TestLeagueRegistry:
 
         registry.bulk_update_elos({"adapter_v10": 1100.0, "adapter_v20": 1200.0})
 
-        assert registry.get_agent("adapter_v10").elo == 1100.0
-        assert registry.get_agent("adapter_v20").elo == 1200.0
+        agent1 = registry.get_agent("adapter_v10")
+        assert agent1 is not None
+        assert agent1.elo == 1100.0
+        agent2 = registry.get_agent("adapter_v20")
+        assert agent2 is not None
+        assert agent2.elo == 1200.0
         assert registry.best_agent == "adapter_v20"
 
     def test_match_history(self, temp_registry_path):

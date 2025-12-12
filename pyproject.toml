@@ -15,6 +15,7 @@ dependencies = [
     "modal>=1.2.4",
     "pandas>=2.3.3",
     "peft>=0.18.0",
+    "prometheus-client>=0.23.1",
     "pydantic>=2.12.5",
     "pytest>=9.0.1",
     "pytest-asyncio>=0.24.0",

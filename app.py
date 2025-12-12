@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import modal
 
@@ -90,6 +90,25 @@ TRACE_PATH = Path("/traces")
 # ==============================================================================
 
 
+class GenerationResponse(TypedDict):
+    """Response from a single generation request."""
+
+    text: str
+    token_count: int
+    token_ids: list[int]
+    prompt_token_ids: list[int]
+    completion_logprobs: list[float]
+
+
+class GenerateBatchResponseItem(TypedDict):
+    """Single item in the batch response from generate() method."""
+
+    text: str
+    token_ids: list[int]
+    prompt_token_ids: list[int]
+    completion_logprobs: list[float]
+
+
 @app.cls(
     image=gpu_image,
     gpu="A100",
@@ -167,20 +186,20 @@ class InferenceEngine:
         # 16384 = ~64 tokens per request at max batch size (good for Diplomacy prompts)
 
         engine_args = AsyncEngineArgs(
-            model=self.model_id,
-            enable_lora=True,
-            max_loras=8,  # League training: up to 7 opponents + 1 hero
-            max_lora_rank=16,  # Must match training LoRA rank
-            gpu_memory_utilization=gpu_memory_util,
-            max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=max_num_batched_tokens,  # Critical for throughput
-            enable_prefix_caching=True,  # Prefix caching already optimized for shared prompt prefixes
-            disable_log_stats=False,
-            logits_processors=[DiplomacyLogitsProcessor],
+            model=self.model_id,  # pyright: ignore[reportCallIssue]
+            enable_lora=True,  # pyright: ignore[reportCallIssue]
+            max_loras=8,  # League training: up to 7 opponents + 1 hero  # pyright: ignore[reportCallIssue]
+            max_lora_rank=16,  # Must match training LoRA rank  # pyright: ignore[reportCallIssue]
+            gpu_memory_utilization=gpu_memory_util,  # pyright: ignore[reportCallIssue]
+            max_num_seqs=max_num_seqs,  # pyright: ignore[reportCallIssue]
+            max_num_batched_tokens=max_num_batched_tokens,  # Critical for throughput  # pyright: ignore[reportCallIssue]
+            enable_prefix_caching=True,  # Prefix caching already optimized for shared prompt prefixes  # pyright: ignore[reportCallIssue]
+            disable_log_stats=False,  # pyright: ignore[reportCallIssue]
+            logits_processors=[DiplomacyLogitsProcessor],  # pyright: ignore[reportCallIssue]
             # Optimization: Use cached model location
-            download_dir=str(HF_CACHE_PATH / "hub"),
+            download_dir=str(HF_CACHE_PATH / "hub"),  # pyright: ignore[reportCallIssue]
             # Optimization: Prefer safetensors (faster loading than pickle)
-            load_format="auto",  # Auto-detects best format (safetensors preferred)
+            load_format="auto",  # Auto-detects best format (safetensors preferred)  # pyright: ignore[reportCallIssue]
             # Optional: Enable FP8 quantization for memory efficiency (uncomment if needed)
             # quantization="fp8",  # Reduces memory by ~2x, allows larger batches
             # Note: Requires model support and may have slight accuracy impact
@@ -196,7 +215,7 @@ class InferenceEngine:
         # Try to access stat loggers for metrics (vLLM v1)
         self._stat_logger_available = False
         try:
-            if hasattr(self.engine, "stat_loggers") and self.engine.stat_loggers:
+            if self.engine.logger_manager:
                 self._stat_logger_available = True
                 print("✅ vLLM stat_loggers available for metrics")
             else:
@@ -247,25 +266,6 @@ class InferenceEngine:
                 hit_rate = hits / queries
                 return {"hit_rate": hit_rate, "queries": queries, "hits": hits}
 
-            # Fallback: Try to access via stat_loggers if prometheus didn't work
-            if hasattr(self.engine, "stat_loggers"):
-                for logger in self.engine.stat_loggers.values():
-                    if hasattr(logger, "metrics"):
-                        metrics = logger.metrics
-                        # Try counter attributes
-                        if hasattr(metrics, "counter_prefix_cache_queries"):
-                            q_counter = metrics.counter_prefix_cache_queries
-                            h_counter = getattr(metrics, "counter_prefix_cache_hits", None)
-                            if hasattr(q_counter, "_value"):
-                                queries = int(q_counter._value.get())
-                                hits = int(h_counter._value.get()) if h_counter else 0
-                                if queries > 0:
-                                    return {
-                                        "hit_rate": hits / queries,
-                                        "queries": queries,
-                                        "hits": hits,
-                                    }
-
         except ImportError:
             # prometheus_client not available
             pass
@@ -309,7 +309,7 @@ class InferenceEngine:
         lora_name: str | None = None,
         temperature: float = 0.8,
         max_new_tokens: int = 256,
-    ):
+    ) -> list[GenerateBatchResponseItem]:
         """
         Generate responses for the given prompts.
 
@@ -410,7 +410,7 @@ class InferenceEngine:
 
             timing_breakdown["adapter_load_time_s"] = time.time() - adapter_load_start
 
-            async def _generate_single(prompt: str, moves: dict) -> dict[str, object]:
+            async def _generate_single(prompt: str, moves: dict) -> GenerationResponse:
                 """Generate for a single prompt. Allows concurrent execution."""
                 request_id = str(uuid.uuid4())
                 # vLLM SamplingParams accepts these at runtime but type stubs may be incomplete
@@ -501,16 +501,11 @@ class InferenceEngine:
             duration_ms = int((time.time() - request_start) * 1000)
             timing_breakdown["total_time_s"] = duration_ms / 1000.0
 
-            total_tokens = sum(
-                int(token_count)
-                if isinstance(token_count := resp.get("token_count"), int | str)
-                else 0
-                for resp in responses
-            )
+            total_tokens = sum(resp["token_count"] for resp in responses)
             tokens_per_second = total_tokens / (duration_ms / 1000) if duration_ms > 0 else None
 
             # Calculate prompt tokens for cache tracking
-            total_prompt_tokens = sum(len(resp.get("prompt_token_ids", [])) for resp in responses)
+            total_prompt_tokens = sum(len(resp["prompt_token_ids"]) for resp in responses)
 
             # Get prefix cache stats from vLLM (may return None if API not accessible)
             cache_stats = self._get_prefix_cache_stats()
@@ -610,10 +605,10 @@ class InferenceEngine:
             # Return rich response structure with token data for trainer optimization
             return [
                 {
-                    "text": str(resp.get("text", "")),
-                    "token_ids": resp.get("token_ids", []),
-                    "prompt_token_ids": resp.get("prompt_token_ids", []),
-                    "completion_logprobs": resp.get("completion_logprobs", []),
+                    "text": resp["text"],
+                    "token_ids": resp["token_ids"],
+                    "prompt_token_ids": resp["prompt_token_ids"],
+                    "completion_logprobs": resp["completion_logprobs"],
                 }
                 for resp in responses
             ]
@@ -971,7 +966,7 @@ async def run_rollout(
 
                 with stopwatch(f"Warmup Inference {i + 1}/{warmup_phases}"):
                     metrics.inference_calls += 1
-                    raw_responses = await InferenceEngine(
+                    raw_responses = await InferenceEngine(  # pyright: ignore[reportCallIssue]
                         model_id=cfg.base_model_id
                     ).generate.remote.aio(
                         prompts=llm_prompts,
@@ -1104,9 +1099,9 @@ async def run_rollout(
                         f"Game {g_idx} Step {step_count} Adapter={adapter_key} (Batch: {batch_size})"
                     ):
                         metrics.inference_calls += 1
-                        responses = await InferenceEngine(
+                        responses = await InferenceEngine(  # pyright: ignore[reportCallIssue]
                             model_id=cfg.base_model_id
-                        ).generate.remote.aio(
+                        ).generate.remote.aio(  # pyright: ignore[reportCallIssue]
                             prompts=group_prompts,
                             valid_moves=group_valid_moves,
                             lora_name=adapter_key,
@@ -1222,7 +1217,7 @@ async def run_rollout(
 
                 if score_prompts:
                     # Call scoring endpoint (uses base model, no LoRA)
-                    score_results = await InferenceEngine(
+                    score_results = await InferenceEngine(  # pyright: ignore[reportCallIssue]
                         model_id=cfg.base_model_id
                     ).score.remote.aio(
                         prompts=score_prompts,
@@ -1994,7 +1989,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                         power_adapters[hero_power] = hero_adapter_path
 
                     handles.append(
-                        run_rollout.spawn(
+                        run_rollout.spawn(  # pyright: ignore[reportCallIssue]
                             cfg.model_dump(),
                             power_adapters=power_adapters,
                             hero_power=hero_power,
@@ -2106,7 +2101,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
 
             # Query prefix cache stats from inference engine
             try:
-                cache_stats_result = InferenceEngine(
+                cache_stats_result = InferenceEngine(  # pyright: ignore[reportCallIssue]
                     model_id=cfg.base_model_id
                 ).get_cache_stats.remote()
                 step_cache_stats = cache_stats_result.get("cumulative", {})
@@ -3002,7 +2997,7 @@ async def evaluate_league(
                     # Note: batch_size=1 is common when only one power uses a particular adapter
                     # vLLM's continuous batching will still batch these across different calls
                     batch_start = time.time()
-                    responses = await InferenceEngine(
+                    responses = await InferenceEngine(  # pyright: ignore[reportCallIssue]
                         model_id=model_id, is_for_league_evaluation=False
                     ).generate.remote.aio(
                         prompts=group_prompts,
@@ -3468,7 +3463,7 @@ async def run_evaluation(
 
                 # Batch inference for checkpoint powers
                 if checkpoint_prompts:
-                    responses = await InferenceEngine(model_id=model_id).generate.remote.aio(
+                    responses = await InferenceEngine(model_id=model_id).generate.remote.aio(  # pyright: ignore[reportCallIssue]
                         prompts=checkpoint_prompts,
                         valid_moves=checkpoint_valid_moves,
                         lora_name=checkpoint_path,
