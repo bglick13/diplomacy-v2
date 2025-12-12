@@ -120,7 +120,8 @@ def generate_with_vllm(
     sampling_params = SamplingParams(
         temperature=temperature,
         max_tokens=max_tokens,
-        extra_args={"valid_moves_dict": valid_moves, "start_active": True},
+        extra_args={"valid_moves_dict": valid_moves, "start_active": False},
+        logprobs=1,
         stop=["</orders>", "</Orders>"],
     )
 

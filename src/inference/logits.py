@@ -1,10 +1,19 @@
 """
-Diplomacy Logits Processor for vLLM v1 Engine (Optimized for Performance)
+Diplomacy Logits Processor for vLLM v1 Engine
 
-Key optimizations:
-1. Incremental tag detection - only scan new tokens, not entire history
-2. Cached trie position - don't re-walk from root each call
-3. Stateful tracking - O(1) per token instead of O(n)
+Fix: Option A (robust tag detection)
+- Detect <orders> and </orders> by incremental *text* matching (not token-id sequences),
+  which avoids BPE “boundary merge” bugs like ">\n" being a single token.
+
+Also includes a practical improvement:
+- Trie includes both `move` and `move + "\n"` variants to tolerate BPE merges at line ends.
+- Newline handling uses decoded text (`"\n" in piece`) instead of relying solely on a
+  single newline token id.
+
+Notes:
+- Constraints begin on the first token *after* <orders> is detected.
+- When we see a partial "</orders>" suffix, we force-complete the remainder by
+  encoding the remaining string and masking logits to that sequence.
 """
 
 from __future__ import annotations
@@ -16,13 +25,17 @@ import torch
 try:
     from vllm.v1.sample.logits_processor import LogitsProcessor
 except ImportError:
-    # vLLM not available (e.g., in CI test environment)
     LogitsProcessor = object  # type: ignore[assignment, misc]
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.sampling_params import SamplingParams
     from vllm.v1.sample.logits_processor import BatchUpdate
+
+
+# -------------------------
+# Trie for valid move tokens
+# -------------------------
 
 
 class TokenTrieNode:
@@ -32,65 +45,76 @@ class TokenTrieNode:
         self.children: dict[int, TokenTrieNode] = {}
         self.is_end_of_move: bool = False
 
-    def add_sequence(self, token_ids: list[int]):
+    def add_sequence(self, token_ids: list[int]) -> None:
         node = self
         for token_id in token_ids:
-            if token_id not in node.children:
-                node.children[token_id] = TokenTrieNode()
-            node = node.children[token_id]
+            child = node.children.get(token_id)
+            if child is None:
+                child = TokenTrieNode()
+                node.children[token_id] = child
+            node = child
         node.is_end_of_move = True
 
 
+# -------------------------
+# Per-request cached state
+# -------------------------
+
+
 class RequestState:
-    """
-    Cached state for a single request. Enables O(1) per-token processing.
-
-    State machine:
-    - DORMANT: Before <orders> tag, allow all tokens
-    - ACTIVE: Inside <orders> block, constrain via trie
-    - DONE: After </orders> tag, allow all tokens
-    """
-
     __slots__ = (
         "root",
-        "newline_token_id",
-        "eos_token_id",
         "output_token_ids",
-        "start_tag_ids",
-        "end_tag_ids",
-        # Cached state
-        "last_processed_len",  # How many tokens we've already processed
-        "orders_start_idx",  # Index where <orders> starts (-1 if not found)
-        "is_done",  # True if </orders> found
-        "current_node",  # Current position in trie
-        "tag_match_progress",  # Partial match progress for tags
+        "eos_token_id",
+        "newline_token_id",
+        # streaming decode / tag detection
+        "last_processed_len",
+        "recent_text",
+        "in_orders",
+        "is_done",
+        # trie cursor
+        "current_node",
+        # end-tag forcing
+        "force_end_ids",
+        "force_end_pos",
     )
 
     def __init__(
         self,
+        *,
         root: TokenTrieNode,
-        newline_token_id: int,
-        eos_token_id: int,
         output_token_ids: list[int],
-        start_tag_ids: list[int],
-        end_tag_ids: list[int],
+        eos_token_id: int,
+        newline_token_id: int,
     ):
         self.root = root
-        self.newline_token_id = newline_token_id
-        self.eos_token_id = eos_token_id
         self.output_token_ids = output_token_ids
-        self.start_tag_ids = start_tag_ids
-        self.end_tag_ids = end_tag_ids
+        self.eos_token_id = eos_token_id
+        self.newline_token_id = newline_token_id
 
-        # Initialize cached state
         self.last_processed_len = 0
-        self.orders_start_idx = -1
+        self.recent_text = ""  # rolling buffer of decoded text
+        self.in_orders = False
         self.is_done = False
+
         self.current_node = root
-        self.tag_match_progress = 0  # For incremental tag matching
+
+        self.force_end_ids: list[int] | None = None
+        self.force_end_pos: int = 0
+
+
+# -------------------------
+# Logits Processor
+# -------------------------
 
 
 class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
+    START_TAG = "<orders>"
+    END_TAG = "</orders>"
+
+    # keep only the last N chars of decoded output (enough to catch tags)
+    RECENT_TEXT_MAX_CHARS = 256
+
     @classmethod
     def validate_params(cls, sampling_params: SamplingParams) -> None:
         if sampling_params.extra_args is None:
@@ -100,7 +124,6 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
             return
         if not isinstance(valid_moves_dict, dict):
             raise ValueError("valid_moves_dict must be a dict")
-        # Validate inner types
         for unit_key, moves in valid_moves_dict.items():
             if not isinstance(unit_key, str):
                 raise ValueError(f"Unit key must be str, got {type(unit_key).__name__}")
@@ -119,13 +142,20 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
         model_name = vllm_config.model_config.model  # type: ignore[attr-defined]
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-        # Cache Special Tokens
-        self.newline_token_id = self.tokenizer.encode("\n", add_special_tokens=False)[-1]
-        self.eos_token_id = self.tokenizer.eos_token_id
+        # Best-effort newline + EOS ids
+        # (newline id may not cover all tokenizer-specific newline variants,
+        #  but we also detect "\n" in decoded pieces.)
+        nl_ids = self.tokenizer.encode("\n", add_special_tokens=False)
+        self.newline_token_id = nl_ids[-1] if nl_ids else 0
 
-        # Cache Tag Sequences for Fast Matching
-        self.start_tag_ids = self.tokenizer.encode("<orders>", add_special_tokens=False)
-        self.end_tag_ids = self.tokenizer.encode("</orders>", add_special_tokens=False)
+        self.eos_token_id = self.tokenizer.eos_token_id
+        if self.eos_token_id is None:
+            # keep an int for masking escape; you may prefer to omit EOS if None
+            self.eos_token_id = 0
+
+        # Used only as a *hint* for allowing the model to start the closing tag
+        self.end_tag_ids = self.tokenizer.encode(self.END_TAG, add_special_tokens=False)
+        self.end_tag_start_id = self.end_tag_ids[0] if self.end_tag_ids else None
 
         self.req_states: dict[int, RequestState] = {}
 
@@ -133,21 +163,29 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
         return False
 
     def _build_trie(self, valid_moves_dict: dict[str, list[str]]) -> TokenTrieNode:
+        """
+        Build a trie over token ids for valid moves.
+
+        Important: include `move + "\n"` to tolerate BPE merges like "BUR\n" as one token.
+        """
         root = TokenTrieNode()
         for moves in valid_moves_dict.values():
             for move in moves:
-                token_ids = self.tokenizer.encode(move, add_special_tokens=False)
-                root.add_sequence(token_ids)
-        return root
+                # Base move
+                ids = self.tokenizer.encode(move, add_special_tokens=False)
+                if ids:
+                    root.add_sequence(ids)
 
-    def _find_sequence_at(self, tokens: list[int], needle: list[int], start: int) -> int:
-        """Check if needle appears at exactly position start in tokens."""
-        if start < 0 or start + len(needle) > len(tokens):
-            return -1
-        for i, n_tok in enumerate(needle):
-            if tokens[start + i] != n_tok:
-                return -1
-        return start
+                # Move + newline (common formatting)
+                ids_nl = self.tokenizer.encode(move + "\n", add_special_tokens=False)
+                if ids_nl:
+                    root.add_sequence(ids_nl)
+
+                # Optional: tolerate CRLF (rare, but cheap)
+                ids_crlf = self.tokenizer.encode(move + "\r\n", add_special_tokens=False)
+                if ids_crlf:
+                    root.add_sequence(ids_crlf)
+        return root
 
     def update_state(self, batch_update: BatchUpdate | None) -> None:
         from vllm.v1.sample.logits_processor import MoveDirectionality
@@ -168,23 +206,20 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
                 self.req_states.pop(index, None)
                 continue
 
-            # Check if we should start in ACTIVE mode (prompt already contains <orders>)
-            start_active = params.extra_args.get("start_active", False)
+            start_active = bool(params.extra_args.get("start_active", False))
 
             root = self._build_trie(valid_moves_dict)
             state = RequestState(
                 root=root,
-                newline_token_id=self.newline_token_id,
-                eos_token_id=self.eos_token_id or 0,
                 output_token_ids=output_token_ids,
-                start_tag_ids=self.start_tag_ids,
-                end_tag_ids=self.end_tag_ids,
+                eos_token_id=int(self.eos_token_id),
+                newline_token_id=int(self.newline_token_id),
             )
 
-            # If prompt ends with <orders>, start in ACTIVE mode immediately
             if start_active:
-                state.orders_start_idx = 0  # Mark as found
-                state.current_node = root  # Ready for trie walk
+                # If prompt already contains <orders>, begin constraining immediately.
+                state.in_orders = True
+                state.current_node = state.root
 
             self.req_states[index] = state
 
@@ -196,124 +231,181 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
             if directionality == MoveDirectionality.SWAP and dst_state is not None:
                 self.req_states[src] = dst_state
 
+    # -------------------------
+    # Option A: text-based tags
+    # -------------------------
+
+    def _append_recent_text(self, state: RequestState, piece: str) -> None:
+        if not piece:
+            return
+        state.recent_text += piece
+        if len(state.recent_text) > self.RECENT_TEXT_MAX_CHARS:
+            state.recent_text = state.recent_text[-self.RECENT_TEXT_MAX_CHARS :]
+
+    def _longest_suffix_prefix(self, text: str, target: str) -> int:
+        """
+        Returns the largest k such that text endswith(target[:k]).
+        """
+        max_k = min(len(text), len(target))
+        # check from longest to shortest (target is tiny, so this is fast)
+        for k in range(max_k, 0, -1):
+            if text.endswith(target[:k]):
+                return k
+        return 0
+
+    def _decode_token(self, token_id: int) -> str:
+        # decode one token; keep special tokens; avoid cleanup to preserve exact chars
+        try:
+            return self.tokenizer.decode(
+                [token_id], skip_special_tokens=False, clean_up_tokenization_spaces=False
+            )
+        except TypeError:
+            # some tokenizers don’t accept these kwargs
+            return self.tokenizer.decode([token_id])
+
     def _update_request_state(self, state: RequestState) -> None:
         """
-        Incrementally update cached state based on new tokens.
-        Only processes tokens since last_processed_len.
+        Incrementally:
+        - decode only new tokens into a rolling text buffer
+        - detect <orders> / </orders> by substring search (robust to BPE merges)
+        - maintain trie cursor while inside <orders>
+        - if "</orders>" is partially started, force-complete it
         """
         tokens = state.output_token_ids
-        current_len = len(tokens)
+        cur_len = len(tokens)
+        if cur_len <= state.last_processed_len:
+            return
 
-        if current_len <= state.last_processed_len:
-            return  # No new tokens
+        for i in range(state.last_processed_len, cur_len):
+            tok = tokens[i]
+            piece = self._decode_token(tok)
+            self._append_recent_text(state, piece)
 
-        # Process only new tokens
-        for i in range(state.last_processed_len, current_len):
-            token = tokens[i]
-
-            # STATE: Looking for <orders>
-            if state.orders_start_idx == -1:
-                # Check if this token continues or starts the <orders> tag
-                if token == state.start_tag_ids[state.tag_match_progress]:
-                    state.tag_match_progress += 1
-                    if state.tag_match_progress == len(state.start_tag_ids):
-                        # Found complete <orders> tag!
-                        state.orders_start_idx = i - len(state.start_tag_ids) + 1
-                        state.tag_match_progress = 0  # Reset for </orders> search
-                        state.current_node = state.root  # Ready for trie walk
+            # If we are forcing the remainder of </orders>, advance force pointer
+            if state.force_end_ids is not None:
+                # Masking should have ensured this matches, but be defensive.
+                if (
+                    state.force_end_pos < len(state.force_end_ids)
+                    and tok == state.force_end_ids[state.force_end_pos]
+                ):
+                    state.force_end_pos += 1
                 else:
-                    # Reset progress (but check if current token starts the tag)
-                    state.tag_match_progress = 0
-                    if token == state.start_tag_ids[0]:
-                        state.tag_match_progress = 1
+                    # Something unexpected happened; stop forcing and continue normally.
+                    state.force_end_ids = None
+                    state.force_end_pos = 0
 
-            # STATE: Inside <orders>, looking for </orders>
-            elif not state.is_done:
-                # Check for </orders> closing tag
-                if token == state.end_tag_ids[state.tag_match_progress]:
-                    state.tag_match_progress += 1
-                    if state.tag_match_progress == len(state.end_tag_ids):
-                        state.is_done = True
-                else:
-                    # Reset progress (check if current token starts </orders>)
-                    state.tag_match_progress = 0
-                    if token == state.end_tag_ids[0]:
-                        state.tag_match_progress = 1
+                if state.force_end_ids is not None and state.force_end_pos >= len(
+                    state.force_end_ids
+                ):
+                    state.force_end_ids = None
+                    state.force_end_pos = 0
+                    state.is_done = True
+                continue
 
-                    # Update trie position for this token
-                    if token == state.newline_token_id:
-                        if state.current_node.is_end_of_move:
-                            state.current_node = state.root  # New line, reset trie
-                        # else: invalid state, but let trie handle it
-                    elif token in state.current_node.children:
-                        state.current_node = state.current_node.children[token]
-                    else:
-                        # Dead end - stay at current node (will mask in apply)
-                        pass
+            # Detect entering orders (one-time)
+            if not state.in_orders:
+                if self.START_TAG in state.recent_text:
+                    state.in_orders = True
+                    state.current_node = state.root
 
-        state.last_processed_len = current_len
+                    # Optional: trim buffer to after the start tag to reduce accidental matches
+                    # and make suffix-prefix checks less noisy.
+                    idx = state.recent_text.rfind(self.START_TAG)
+                    state.recent_text = state.recent_text[idx + len(self.START_TAG) :]
+                continue
+
+            # If already in orders, detect completion
+            if not state.is_done and self.END_TAG in state.recent_text:
+                state.is_done = True
+                continue
+
+            if state.is_done:
+                continue
+
+            # If the decoded text ends with a partial prefix of END_TAG, force completion.
+            # Example: recent_text endswith("</ord") => force "ers>" next.
+            k = self._longest_suffix_prefix(state.recent_text, self.END_TAG)
+            if 0 < k < len(self.END_TAG):
+                remaining = self.END_TAG[k:]
+                force_ids = self.tokenizer.encode(remaining, add_special_tokens=False)
+                if force_ids:
+                    state.force_end_ids = force_ids
+                    state.force_end_pos = 0
+                    continue
+
+            # Maintain trie cursor using token ids (works with move+"\n" variants too)
+            node = state.current_node
+            nxt = node.children.get(tok)
+            if nxt is not None:
+                state.current_node = nxt
+            else:
+                # dead end: keep node (apply() will mask to escape options)
+                pass
+
+            # If the token's decoded text contains a newline and we are at a move end,
+            # reset trie for the next line.
+            if "\n" in piece and state.current_node.is_end_of_move:
+                state.current_node = state.root
+
+        state.last_processed_len = cur_len
+
+    # -------------------------
+    # Logits masking
+    # -------------------------
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self.req_states:
             return logits
 
+        vocab = logits.shape[1]
         for idx, state in self.req_states.items():
             if idx >= logits.shape[0]:
                 continue
 
-            # Incrementally update state based on new tokens
+            # Update cached state from new tokens
             self._update_request_state(state)
 
-            # DORMANT: No <orders> tag yet - allow free generation
-            if state.orders_start_idx == -1:
+            # Not inside <orders> yet => allow free generation
+            if not state.in_orders:
                 continue
 
-            # DONE: After </orders> - allow free generation
+            # Finished </orders> => allow free generation
             if state.is_done:
                 continue
 
-            # ACTIVE: Inside <orders> block - apply trie constraint
-            current_node = state.current_node
-
-            # Check if we're in the middle of generating </orders> tag
-            if state.tag_match_progress > 0 and state.end_tag_ids:
-                # We've started </orders>, only allow the next token in the sequence
-                next_tag_token = state.end_tag_ids[state.tag_match_progress]
-                mask = torch.full((logits.shape[1],), float("-inf"), device=logits.device)
-                mask[next_tag_token] = 0
+            # Forcing remainder of </orders>
+            if state.force_end_ids is not None:
+                next_id = state.force_end_ids[state.force_end_pos]
+                mask = torch.full((vocab,), float("-inf"), device=logits.device)
+                mask[next_id] = 0.0
                 logits[idx] = logits[idx] + mask
                 continue
 
-            # Determine valid next tokens from trie
-            valid_tokens = list(current_node.children.keys())
-            is_at_end = current_node.is_end_of_move
-            is_at_root = current_node is state.root
+            # ACTIVE constraints via trie
+            node = state.current_node
+            allowed = set(node.children.keys())
 
-            # Build allowed set
-            allowed = set(valid_tokens)
-
-            # At root: allow newlines (formatting) and closing tag start
-            if is_at_root:
-                allowed.add(state.newline_token_id)
-                if state.end_tag_ids:
-                    allowed.add(state.end_tag_ids[0])
-
-            # At end of move: allow newline (to start next move) or close
-            if is_at_end:
+            # If at end-of-move, allow newline (to start next order) and close tag start
+            if node.is_end_of_move:
                 allowed.add(state.newline_token_id)
                 allowed.add(state.eos_token_id)
-                if state.end_tag_ids:
-                    allowed.add(state.end_tag_ids[0])
+                if self.end_tag_start_id is not None:
+                    allowed.add(self.end_tag_start_id)
 
-            # Safety: If dead end, allow escape via EOS or closing tag
+            # If at root, allow optional formatting newlines and close tag start
+            if node is state.root:
+                allowed.add(state.newline_token_id)
+                if self.end_tag_start_id is not None:
+                    allowed.add(self.end_tag_start_id)
+
+            # Safety escape if dead end
             if not allowed:
                 allowed.add(state.eos_token_id)
-                if state.end_tag_ids:
-                    allowed.add(state.end_tag_ids[0])
+                if self.end_tag_start_id is not None:
+                    allowed.add(self.end_tag_start_id)
 
-            # Apply mask efficiently
-            mask = torch.full((logits.shape[1],), float("-inf"), device=logits.device)
-            mask[list(allowed)] = 0
+            mask = torch.full((vocab,), float("-inf"), device=logits.device)
+            mask[list(allowed)] = 0.0
             logits[idx] = logits[idx] + mask
 
         return logits

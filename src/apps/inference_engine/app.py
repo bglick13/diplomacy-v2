@@ -291,7 +291,7 @@ class InferenceEngine:
                 sampling_params = SamplingParams(  # type: ignore[call-arg, misc]
                     temperature=temperature,  # type: ignore[arg-type]
                     max_tokens=max_new_tokens,  # type: ignore[arg-type]
-                    extra_args={"valid_moves_dict": moves},  # type: ignore[arg-type]
+                    extra_args={"valid_moves_dict": valid_moves, "start_active": True},
                     stop=["</orders>", "</Orders>"],  # type: ignore[arg-type]
                     logprobs=1,  # type: ignore[arg-type]  # Return logprobs for ref model opt
                 )
