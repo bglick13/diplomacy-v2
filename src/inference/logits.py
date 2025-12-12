@@ -168,14 +168,25 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
                 self.req_states.pop(index, None)
                 continue
 
-            self.req_states[index] = RequestState(
-                root=self._build_trie(valid_moves_dict),
+            # Check if we should start in ACTIVE mode (prompt already contains <orders>)
+            start_active = params.extra_args.get("start_active", False)
+
+            root = self._build_trie(valid_moves_dict)
+            state = RequestState(
+                root=root,
                 newline_token_id=self.newline_token_id,
                 eos_token_id=self.eos_token_id or 0,
                 output_token_ids=output_token_ids,
                 start_tag_ids=self.start_tag_ids,
                 end_tag_ids=self.end_tag_ids,
             )
+
+            # If prompt ends with <orders>, start in ACTIVE mode immediately
+            if start_active:
+                state.orders_start_idx = 0  # Mark as found
+                state.current_node = root  # Ready for trie walk
+
+            self.req_states[index] = state
 
         for src, dst, directionality in batch_update.moved:
             src_state = self.req_states.pop(src, None)
@@ -263,6 +274,15 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
 
             # ACTIVE: Inside <orders> block - apply trie constraint
             current_node = state.current_node
+
+            # Check if we're in the middle of generating </orders> tag
+            if state.tag_match_progress > 0 and state.end_tag_ids:
+                # We've started </orders>, only allow the next token in the sequence
+                next_tag_token = state.end_tag_ids[state.tag_match_progress]
+                mask = torch.full((logits.shape[1],), float("-inf"), device=logits.device)
+                mask[next_tag_token] = 0
+                logits[idx] = logits[idx] + mask
+                continue
 
             # Determine valid next tokens from trie
             valid_tokens = list(current_node.children.keys())

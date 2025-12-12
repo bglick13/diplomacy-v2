@@ -22,6 +22,7 @@ class PromptConfig:
 
     # Whether to show all valid moves in the prompt
     show_valid_moves: bool = True
+    show_board_context: bool = True
 
     # Maximum moves to show per unit (to avoid token overflow)
     max_moves_per_unit: int = 10
@@ -70,25 +71,23 @@ RULES:
 
 # Minimal prefix for when valid moves are NOT shown in prompt
 # Model relies on logits processor for valid moves, so we give strategic context only
+# CRITICAL: Strong "orders only" instruction to prevent model from generating analysis
+# NOTE: Don't use "Move:", "Hold:" prefixes - model copies them literally!
 MOVEMENT_PREFIX_MINIMAL = """\
-### DIPLOMACY MOVEMENT PHASE ###
-
-You are playing Diplomacy. Output exactly one order per unit.
-
-ORDER SYNTAX:
-- Move: "A PAR - BUR" (Army Paris to Burgundy)
-- Hold: "A PAR H" (Army Paris holds)
-- Support move: "A PAR S A BUR - MAR" (Paris supports Burgundy to Marseilles)
-- Support hold: "A PAR S A BUR" (Paris supports Burgundy to hold)
-- Convoy: "F NTH C A LON - NWY" (Fleet convoys Army London to Norway)
-
-ADJACENCIES (use standard Diplomacy geography):
-- Paris borders: Burgundy, Picardy, Gascony, Brest (army can't reach fleets)
-- Fleets can only move to coastal/sea provinces
-- Armies cannot cross water without convoy
-
-Output one order per line inside <orders> tags.
-
+### DIPLOMACY ENGINE ###
+ROLE: You are playing the board game Diplomacy.
+TASK: Output valid move orders inside <orders> tags.
+FORMAT RULES:
+1. Output MUST start with <orders>.
+2. Output MUST end with </orders>.
+3. Do NOT output any text, analysis, or new scenarios after </orders>.
+4. One order per line.
+Example output:
+<orders>
+A PAR - BUR
+A MAR H
+F BRE - MAO
+</orders>
 """
 
 ADJUSTMENT_PREFIX = """\
@@ -107,20 +106,16 @@ RULES:
 """
 
 ADJUSTMENT_PREFIX_MINIMAL = """\
-### DIPLOMACY ADJUSTMENT PHASE ###
+### DIPLOMACY ORDERS ###
 
-You are playing Diplomacy in the adjustment phase.
+Output orders inside <orders> tags, one per line.
+No analysis. No prefixes. Just the orders.
 
-ORDER SYNTAX:
-- Build Army: "A <HOME_SC> B" (e.g., "A PAR B")
-- Build Fleet: "F <COASTAL_HOME_SC> B" (e.g., "F BRE B")
-- Disband unit: "<UNIT> D" (e.g., "A MUN D")
-- Waive a build: "WAIVE"
-
-RULES:
-- Can only build in unoccupied home supply centers
-- Must disband if you have more units than supply centers
-- Output one order per line inside <orders> tags
+Example output:
+<orders>
+A PAR B
+F BRE B
+</orders>
 
 """
 
@@ -185,7 +180,7 @@ class LLMAgent:
                 phase=phase,
                 valid_moves=valid_moves,
                 adjustment_delta=adjustment_delta,
-                board_context=board_context,
+                board_context=board_context if self.config.show_board_context else None,
             )
         else:
             # Movement or Retreat phase
@@ -197,7 +192,7 @@ class LLMAgent:
                 moves_display=moves_display,
                 example_move=example_move,
                 valid_moves=valid_moves,
-                board_context=board_context,
+                board_context=board_context if self.config.show_board_context else None,
             )
 
         return prompt, valid_moves
@@ -225,34 +220,29 @@ class LLMAgent:
         return "A PAR - BUR"  # Fallback
 
     def _format_board_context(self, board_context: dict) -> str:
-        """Format board context for the prompt (used in minimal mode)."""
+        """Format board context concisely (used in minimal mode).
+
+        Keep this data-like, not prose-like, to avoid model generating analysis.
+        """
         lines = []
 
-        # My supply centers
+        # Supply centers owned
         my_centers = board_context.get("my_centers", [])
         if my_centers:
-            lines.append(
-                f"Your supply centers ({len(my_centers)}): {', '.join(sorted(my_centers))}"
-            )
-
-        # Opponent positions (compact format)
-        opponent_units = board_context.get("opponent_units", {})
-        if opponent_units:
-            lines.append("Opponent units:")
-            for power, units in sorted(opponent_units.items()):
-                units_str = ", ".join(units)
-                lines.append(f"  {power}: {units_str}")
+            lines.append(f"SCs: {', '.join(sorted(my_centers))}")
 
         # Neutral centers (if any)
         unowned = board_context.get("unowned_centers", [])
         if unowned:
-            lines.append(f"Neutral centers: {', '.join(sorted(unowned))}")
+            lines.append(f"Neutral: {', '.join(sorted(unowned))}")
 
-        # Power rankings (brief)
-        rankings = board_context.get("power_rankings", [])
-        if rankings:
-            ranking_str = ", ".join(f"{p}({c})" for p, c in rankings[:5])  # Top 5
-            lines.append(f"Rankings: {ranking_str}")
+        # Opponent positions (very compact)
+        opponent_units = board_context.get("opponent_units", {})
+        if opponent_units:
+            opp_parts = []
+            for power, units in sorted(opponent_units.items()):
+                opp_parts.append(f"{power}:{','.join(units)}")
+            lines.append(f"Opponents: {' | '.join(opp_parts)}")
 
         return "\n".join(lines)
 
@@ -276,7 +266,7 @@ class LLMAgent:
 
         When show_valid_moves=False, we only show unit positions (not exhaustive
         move lists). The logits processor handles validity, so we save tokens.
-        Board context provides strategic info (opponent positions, supply centers).
+        Board context provides strategic info but is clearly separated from orders.
         """
 
         # Count total units for context
@@ -300,15 +290,15 @@ class LLMAgent:
                 else:
                     # Minimal mode: unit positions + board context for strategy
                     # Logits processor handles move validity
+                    # Key: Strong "orders only" framing to prevent analysis generation
                     board_info = self._format_board_context(board_context) if board_context else ""
                     prompt = (
                         f"{MOVEMENT_PREFIX_MINIMAL}"
-                        f"GAME STATE:\n"
-                        f"Power: {power_name}\n"
-                        f"Phase: {phase}\n"
-                        f"Your units: {unit_list}\n\n"
-                        f"BOARD:\n{board_info}\n\n"
-                        f"Output {unit_count} orders (one per unit):\n"
+                        f"SITUATION:\n"
+                        f"You are {power_name}. Phase: {phase}\n"
+                        f"Your units: {unit_list}\n"
+                        f"{board_info}\n"
+                        f"OUTPUT {unit_count} ORDERS:\n"
                         "<orders>\n"
                     )
             else:
@@ -341,18 +331,13 @@ class LLMAgent:
     """
             else:
                 board_info = self._format_board_context(board_context) if board_context else ""
-                prompt = f"""You are playing Diplomacy as {power_name}.
-    Phase: {phase}
-    Your units: {unit_list}
+                prompt = f"""You are {power_name}. Phase: {phase}
+Your units: {unit_list}
+{board_info}
 
-    Board State:
-    {board_info}
-
-    Output exactly {unit_count} orders, one per line.
-    Use standard Diplomacy notation: A PAR - BUR, F BRE H, A MAR S A PIE - VEN, etc.
-
-    <orders>
-    """
+Output ONLY {unit_count} orders (no analysis):
+<orders>
+"""
 
         if self.config.custom_instructions:
             prompt += f"\n{self.config.custom_instructions}\n"
@@ -424,15 +409,16 @@ WAIVE
                         "<orders>\n"
                     )
                 else:
-                    # Minimal mode: just action info, rely on logits processor
+                    # Minimal mode: action info + board context
                     # For adjustment, valid moves list is usually small so savings are modest
+                    board_info = self._format_board_context(board_context) if board_context else ""
                     prompt = (
                         f"{ADJUSTMENT_PREFIX_MINIMAL}"
-                        f"GAME STATE:\n"
-                        f"Power: {power_name}\n"
-                        f"Phase: {phase}\n"
-                        f"Action: {action} {order_count} unit(s)\n\n"
-                        f"Output {order_count} order(s):\n"
+                        f"SITUATION:\n"
+                        f"You are {power_name}. Phase: {phase}\n"
+                        f"Action: {action} {order_count} unit(s)\n"
+                        f"{board_info}\n"
+                        f"OUTPUT {order_count} ORDER(S):\n"
                         "<orders>\n"
                     )
             else:
