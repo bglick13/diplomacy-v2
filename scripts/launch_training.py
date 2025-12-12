@@ -204,6 +204,7 @@ def main():
     )
     parser.add_argument(
         "--detach",
+        default=True,
         action="store_true",
         help="Launch and exit without waiting for results",
     )
