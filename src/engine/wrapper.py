@@ -259,6 +259,56 @@ class DiplomacyWrapper:
     def get_state_json(self) -> dict[str, Any]:
         return to_saved_game_format(self.game)
 
+    def get_board_context(self, power_name: str) -> dict[str, Any]:
+        """
+        Get board context for strategic decision making.
+
+        Returns a dict with:
+        - my_units: List of our units
+        - my_centers: List of our supply centers
+        - opponent_units: Dict of power -> units for other powers
+        - opponent_centers: Dict of power -> centers for other powers
+        - unowned_centers: List of neutral supply centers
+        - power_rankings: List of (power, center_count) sorted by centers
+        """
+        all_centers = set(self.game.map.scs)  # All supply centers on map
+
+        my_units = list(self.game.powers[power_name].units)
+        my_centers = list(self.game.powers[power_name].centers)
+
+        opponent_units = {}
+        opponent_centers = {}
+        owned_centers = set(my_centers)
+
+        for other_power, power_obj in self.game.powers.items():
+            if other_power != power_name:
+                units = list(power_obj.units)
+                centers = list(power_obj.centers)
+                if units:  # Only include powers with units (not eliminated)
+                    opponent_units[other_power] = units
+                if centers:
+                    opponent_centers[other_power] = centers
+                    owned_centers.update(centers)
+
+        unowned_centers = list(all_centers - owned_centers)
+
+        # Power rankings by supply centers
+        power_rankings = []
+        for pwr, power_obj in self.game.powers.items():
+            center_count = len(power_obj.centers)
+            if center_count > 0:  # Only include non-eliminated powers
+                power_rankings.append((pwr, center_count))
+        power_rankings.sort(key=lambda x: x[1], reverse=True)
+
+        return {
+            "my_units": my_units,
+            "my_centers": my_centers,
+            "opponent_units": opponent_units,
+            "opponent_centers": opponent_centers,
+            "unowned_centers": unowned_centers,
+            "power_rankings": power_rankings,
+        }
+
     def get_unit(self, power_name: str, unit_str: str) -> str | None:
         units: list[str] = list(self.game.get_units(power_name))
         print(f"\nDEBUG get_unit: power={power_name}, location={unit_str}, units={units}")

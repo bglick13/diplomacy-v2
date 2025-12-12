@@ -3003,7 +3003,7 @@ async def evaluate_league(
                     # vLLM's continuous batching will still batch these across different calls
                     batch_start = time.time()
                     responses = await InferenceEngine(
-                        model_id=model_id, is_for_league_evaluation=True
+                        model_id=model_id, is_for_league_evaluation=False
                     ).generate.remote.aio(
                         prompts=group_prompts,
                         valid_moves=group_valid_moves,

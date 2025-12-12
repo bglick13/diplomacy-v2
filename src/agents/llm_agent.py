@@ -172,6 +172,11 @@ class LLMAgent:
         phase = game.get_current_phase()
         phase_type = game.get_phase_type()
 
+        # Get board context for strategic awareness (used in minimal prompt mode)
+        board_context = (
+            game.get_board_context(power_name) if not self.config.show_valid_moves else None
+        )
+
         # Handle adjustment phases differently
         if phase_type == "A":
             adjustment_delta = game.get_adjustment_delta(power_name)
@@ -180,6 +185,7 @@ class LLMAgent:
                 phase=phase,
                 valid_moves=valid_moves,
                 adjustment_delta=adjustment_delta,
+                board_context=board_context,
             )
         else:
             # Movement or Retreat phase
@@ -191,6 +197,7 @@ class LLMAgent:
                 moves_display=moves_display,
                 example_move=example_move,
                 valid_moves=valid_moves,
+                board_context=board_context,
             )
 
         return prompt, valid_moves
@@ -217,6 +224,38 @@ class LLMAgent:
                 return moves[0]
         return "A PAR - BUR"  # Fallback
 
+    def _format_board_context(self, board_context: dict) -> str:
+        """Format board context for the prompt (used in minimal mode)."""
+        lines = []
+
+        # My supply centers
+        my_centers = board_context.get("my_centers", [])
+        if my_centers:
+            lines.append(
+                f"Your supply centers ({len(my_centers)}): {', '.join(sorted(my_centers))}"
+            )
+
+        # Opponent positions (compact format)
+        opponent_units = board_context.get("opponent_units", {})
+        if opponent_units:
+            lines.append("Opponent units:")
+            for power, units in sorted(opponent_units.items()):
+                units_str = ", ".join(units)
+                lines.append(f"  {power}: {units_str}")
+
+        # Neutral centers (if any)
+        unowned = board_context.get("unowned_centers", [])
+        if unowned:
+            lines.append(f"Neutral centers: {', '.join(sorted(unowned))}")
+
+        # Power rankings (brief)
+        rankings = board_context.get("power_rankings", [])
+        if rankings:
+            ranking_str = ", ".join(f"{p}({c})" for p, c in rankings[:5])  # Top 5
+            lines.append(f"Rankings: {ranking_str}")
+
+        return "\n".join(lines)
+
     def _construct_prompt(
         self,
         power_name: str,
@@ -224,6 +263,7 @@ class LLMAgent:
         moves_display: str,
         example_move: str,
         valid_moves: dict[str, list[str]],
+        board_context: dict | None = None,
     ) -> str:
         """Construct the full prompt string.
 
@@ -236,6 +276,7 @@ class LLMAgent:
 
         When show_valid_moves=False, we only show unit positions (not exhaustive
         move lists). The logits processor handles validity, so we save tokens.
+        Board context provides strategic info (opponent positions, supply centers).
         """
 
         # Count total units for context
@@ -257,14 +298,16 @@ class LLMAgent:
                         "<orders>\n"
                     )
                 else:
-                    # Minimal mode: just unit positions, rely on logits processor
-                    # Much shorter prompts = better prefix caching + faster inference
+                    # Minimal mode: unit positions + board context for strategy
+                    # Logits processor handles move validity
+                    board_info = self._format_board_context(board_context) if board_context else ""
                     prompt = (
                         f"{MOVEMENT_PREFIX_MINIMAL}"
                         f"GAME STATE:\n"
                         f"Power: {power_name}\n"
                         f"Phase: {phase}\n"
                         f"Your units: {unit_list}\n\n"
+                        f"BOARD:\n{board_info}\n\n"
                         f"Output {unit_count} orders (one per unit):\n"
                         "<orders>\n"
                     )
@@ -297,9 +340,13 @@ class LLMAgent:
     </orders>
     """
             else:
+                board_info = self._format_board_context(board_context) if board_context else ""
                 prompt = f"""You are playing Diplomacy as {power_name}.
     Phase: {phase}
     Your units: {unit_list}
+
+    Board State:
+    {board_info}
 
     Output exactly {unit_count} orders, one per line.
     Use standard Diplomacy notation: A PAR - BUR, F BRE H, A MAR S A PIE - VEN, etc.
@@ -321,6 +368,7 @@ class LLMAgent:
         phase: str,
         valid_moves: dict[str, list[str]],
         adjustment_delta: int,
+        board_context: dict | None = None,
     ) -> str:
         """Construct prompt for adjustment phases (builds/disbands).
 
