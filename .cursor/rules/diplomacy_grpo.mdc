@@ -152,3 +152,6 @@ Tests First: Do not proceed to Training Loop until pytest tests/test_logits_proc
 Type Hints: All function signatures must be typed.
 
 Strict Timeouts: All Modal functions must have timeouts to handle hanging games.
+
+## 3. Scripts
+- `launch_training.py`: used to launch and run all training experiments. Always use this instead of `modal run app.py ...`

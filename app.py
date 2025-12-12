@@ -3,7 +3,11 @@ from typing import Any
 
 import modal
 
-from src.utils.observability import log_inference_request, log_inference_response
+from src.utils.observability import (
+    log_inference_request,
+    log_inference_response,
+    log_prefix_cache_stats,
+)
 
 # ==============================================================================
 # 1. IMAGE DEFINITIONS
@@ -140,6 +144,14 @@ class InferenceEngine:
         self._loaded_adapters: set[str] = set()
         self._adapter_lock = asyncio.Lock()
 
+        # Prefix cache tracking for observability
+        self._cache_stats = {
+            "total_queries": 0,
+            "total_hits": 0,
+            "total_prompt_tokens": 0,
+            "batches_processed": 0,
+        }
+
         # vLLM v1: Pass logits_processors at engine initialization
         # The processor is loaded once and handles all requests at batch level
         # NOTE: max_lora_rank must match or exceed the rank used during training
@@ -181,7 +193,87 @@ class InferenceEngine:
         )
         self.engine = AsyncLLM.from_engine_args(engine_args)
 
+        # Try to access stat loggers for metrics (vLLM v1)
+        self._stat_logger_available = False
+        try:
+            if hasattr(self.engine, "stat_loggers") and self.engine.stat_loggers:
+                self._stat_logger_available = True
+                print("✅ vLLM stat_loggers available for metrics")
+            else:
+                print("⚠️ vLLM stat_loggers not available - using fallback metrics")
+        except Exception as e:
+            print(f"⚠️ Could not check stat_loggers: {e}")
+
         print("✅ Engine Ready (with dynamic LoRA support).")
+
+    def _get_prefix_cache_stats(self) -> dict | None:
+        """
+        Extract prefix cache stats from vLLM's Prometheus metrics.
+
+        vLLM v1 exposes prefix cache metrics as Prometheus counters:
+        - vllm:prefix_cache_queries (Counter)
+        - vllm:prefix_cache_hits (Counter)
+
+        See: https://docs.vllm.ai/en/latest/design/metrics/#prefix-cache-hit-rate
+
+        Returns dict with hit_rate, queries, hits if available, else None.
+        """
+        try:
+            # vLLM uses prometheus_client - query the registry directly
+            from prometheus_client import REGISTRY
+
+            queries = 0
+            hits = 0
+
+            # Look for vLLM prefix cache counters in the registry
+            for metric in REGISTRY.collect():
+                # vLLM v1 uses "vllm:prefix_cache_queries" and "vllm:prefix_cache_hits"
+                # prometheus_client may normalize colons to underscores
+                metric_name = metric.name.replace(":", "_")
+
+                if "prefix_cache_queries" in metric_name:
+                    for sample in metric.samples:
+                        if sample.name.endswith("_total") or sample.name == metric.name:
+                            queries = int(sample.value)
+                            break
+
+                elif "prefix_cache_hits" in metric_name:
+                    for sample in metric.samples:
+                        if sample.name.endswith("_total") or sample.name == metric.name:
+                            hits = int(sample.value)
+                            break
+
+            if queries > 0:
+                hit_rate = hits / queries
+                return {"hit_rate": hit_rate, "queries": queries, "hits": hits}
+
+            # Fallback: Try to access via stat_loggers if prometheus didn't work
+            if hasattr(self.engine, "stat_loggers"):
+                for logger in self.engine.stat_loggers.values():
+                    if hasattr(logger, "metrics"):
+                        metrics = logger.metrics
+                        # Try counter attributes
+                        if hasattr(metrics, "counter_prefix_cache_queries"):
+                            q_counter = metrics.counter_prefix_cache_queries
+                            h_counter = getattr(metrics, "counter_prefix_cache_hits", None)
+                            if hasattr(q_counter, "_value"):
+                                queries = int(q_counter._value.get())
+                                hits = int(h_counter._value.get()) if h_counter else 0
+                                if queries > 0:
+                                    return {
+                                        "hit_rate": hits / queries,
+                                        "queries": queries,
+                                        "hits": hits,
+                                    }
+
+        except ImportError:
+            # prometheus_client not available
+            pass
+        except Exception as e:
+            # Don't fail generation for stats errors
+            print(f"⚠️ Could not get prefix cache stats: {e}")
+
+        return None
 
     @modal.method()
     def warmup(self) -> dict:
@@ -198,6 +290,15 @@ class InferenceEngine:
             "hostname": socket.gethostname(),
             "pid": os.getpid(),
             "model_id": self.model_id,
+        }
+
+    @modal.method()
+    def get_cache_stats(self) -> dict:
+        """Get current prefix cache statistics."""
+        stats = self._get_prefix_cache_stats()
+        return {
+            "vllm_stats": stats,
+            "cumulative": self._cache_stats.copy(),
         }
 
     @modal.method()
@@ -401,13 +502,51 @@ class InferenceEngine:
             )
             tokens_per_second = total_tokens / (duration_ms / 1000) if duration_ms > 0 else None
 
-            # Enhanced logging with timing breakdown
+            # Calculate prompt tokens for cache tracking
+            total_prompt_tokens = sum(len(resp.get("prompt_token_ids", [])) for resp in responses)
+
+            # Get prefix cache stats from vLLM (may return None if API not accessible)
+            cache_stats = self._get_prefix_cache_stats()
+            cache_hit_rate = cache_stats["hit_rate"] if cache_stats else None
+            cache_queries = cache_stats.get("queries") if cache_stats else None
+            cache_hits = cache_stats.get("hits") if cache_stats else None
+
+            # Update cumulative stats - always track what we can measure directly
+            self._cache_stats["batches_processed"] += 1
+            self._cache_stats["total_prompt_tokens"] += total_prompt_tokens
+            self._cache_stats["batch_size_total"] = (
+                self._cache_stats.get("batch_size_total", 0) + batch_size
+            )
+
+            # If we got real stats from vLLM, track them
+            if cache_queries is not None:
+                self._cache_stats["total_queries"] += cache_queries
+            else:
+                # Fallback: count requests as queries
+                self._cache_stats["total_queries"] += batch_size
+
+            if cache_hits is not None:
+                self._cache_stats["total_hits"] += cache_hits
+            elif cache_hit_rate is not None:
+                # Estimate hits from hit rate
+                self._cache_stats["total_hits"] += int(batch_size * cache_hit_rate)
+
+            # Track if we're getting real stats or estimates
+            if cache_stats is not None:
+                self._cache_stats["real_stats_available"] = True
+            else:
+                self._cache_stats.setdefault("real_stats_available", False)
+
+            # Enhanced logging with timing breakdown and cache stats
             log_inference_response(
                 rollout_id="inference-engine",
                 batch_size=batch_size,
                 duration_ms=duration_ms,
                 tokens_generated=total_tokens,
                 tokens_per_second=tokens_per_second,
+                prefix_cache_hit_rate=cache_hit_rate,
+                prefix_cache_queries=cache_queries,
+                prefix_cache_hits=cache_hits,
             )
 
             # Log detailed timing breakdown to Axiom for analysis
@@ -423,8 +562,22 @@ class InferenceEngine:
                     "total_time_s": timing_breakdown["total_time_s"],
                     "tokens_generated": total_tokens,
                     "tokens_per_second": tokens_per_second,
+                    "prompt_tokens": total_prompt_tokens,
+                    "prefix_cache_hit_rate": cache_hit_rate,
                 }
             )
+
+            # Log cache stats if we got them and hit rate is notable
+            if cache_stats and batch_size >= 4:  # Only log for meaningful batches
+                log_prefix_cache_stats(
+                    batch_id=str(uuid.uuid4())[:8],
+                    hit_rate=cache_hit_rate or 0.0,
+                    queries=cache_queries or 0,
+                    hits=cache_hits or 0,
+                    prompt_tokens_total=total_prompt_tokens,
+                    # Estimate cached tokens from hit rate
+                    prompt_tokens_cached=int(total_prompt_tokens * (cache_hit_rate or 0.0)),
+                )
 
             # Debug logging for slow batches
             # Single-item batches are expected to be slower (2-3s is normal for vLLM)
@@ -1867,6 +2020,8 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 # Aggregate timing stats from rollouts
                 max_volume_reload_s = 0.0
                 max_rollout_total_s = 0.0
+                # Track prefix cache stats (query from engines after step)
+                step_cache_stats_available = False
 
                 failed_rollouts = 0
                 for handle in current_handles:
@@ -1922,6 +2077,26 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             step_metrics["max_rollout_total_s"] = max_rollout_total_s
             if step_profile is not None:
                 step_profile["rollout_time_ms"] = rollout_time * 1000
+
+            # Query prefix cache stats from inference engine
+            try:
+                cache_stats_result = InferenceEngine(
+                    model_id=cfg.base_model_id
+                ).get_cache_stats.remote()
+                step_cache_stats = cache_stats_result.get("cumulative", {})
+                step_cache_stats_available = True
+                # Debug: Log what we got
+                vllm_stats = cache_stats_result.get("vllm_stats")
+                logger.info(
+                    f"📊 Cache stats for step {step}: "
+                    f"batches={step_cache_stats.get('batches_processed', 0)}, "
+                    f"prompt_tokens={step_cache_stats.get('total_prompt_tokens', 0)}, "
+                    f"vllm_stats={'available' if vllm_stats else 'None'}"
+                )
+            except Exception as e:
+                logger.warning(f"Could not get cache stats: {e}")
+                step_cache_stats = {}
+                step_cache_stats_available = False
 
             # B. Launch NEW batch to maintain buffer (if not near the end)
             # This batch runs during training, keeping the pipeline full
@@ -2119,6 +2294,51 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 "power_law/simulated_years_per_step": sim_years_per_step,
                 "power_law/reward_at_compute": traj_stats.reward_mean,
             }
+
+            # Add prefix cache metrics (always log what we can track)
+            if step_cache_stats_available and step_cache_stats:
+                total_queries = step_cache_stats.get("total_queries", 0)
+                total_hits = step_cache_stats.get("total_hits", 0)
+                total_prompt_tokens = step_cache_stats.get("total_prompt_tokens", 0)
+                batches = step_cache_stats.get("batches_processed", 0)
+                batch_size_total = step_cache_stats.get("batch_size_total", 0)
+                real_stats = step_cache_stats.get("real_stats_available", False)
+
+                # Calculate hit rate from available data
+                cache_hit_rate = total_hits / total_queries if total_queries > 0 else 0.0
+
+                # Always log what we can measure
+                cache_metrics = {
+                    "cache/prompt_tokens": total_prompt_tokens,
+                    "cache/batches": batches,
+                    "cache/total_requests": batch_size_total,
+                }
+
+                # Only log hit rate if we have meaningful query data
+                if total_queries > 0:
+                    cache_metrics.update(
+                        {
+                            "cache/hit_rate": cache_hit_rate,
+                            "cache/total_queries": total_queries,
+                            "cache/total_hits": total_hits,
+                        }
+                    )
+
+                # Flag if we got real vLLM stats vs estimates
+                cache_metrics["cache/real_stats"] = 1 if real_stats else 0
+
+                wandb_metrics.update(cache_metrics)
+
+                logger.info(
+                    f"📈 Logging cache metrics to WandB: "
+                    f"batches={batches}, tokens={total_prompt_tokens}, "
+                    f"queries={total_queries}, hits={total_hits}"
+                )
+            else:
+                logger.warning(
+                    f"⚠️ No cache stats to log: available={step_cache_stats_available}, "
+                    f"stats={step_cache_stats}"
+                )
 
             # Add league training metrics if enabled
             if cfg.league_training and league_registry is not None:
