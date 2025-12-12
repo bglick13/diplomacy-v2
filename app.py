@@ -2092,34 +2092,45 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             # Calculate cumulative simulated years for power law X-axis
             cumulative_sim_years = (step + 1) * sim_years_per_step
 
-            wandb.log(
-                {
-                    "benchmark/step": step,
-                    "benchmark/loss": avg_loss,
-                    "benchmark/kl": avg_kl,
-                    "benchmark/reward_mean": traj_stats.reward_mean,
-                    "benchmark/reward_std": traj_stats.reward_std,
-                    "benchmark/rollout_time_s": rollout_time,
-                    "benchmark/training_time_s": training_time,
-                    "benchmark/trajectories": len(batch_data),
-                    "benchmark/grad_norm": grad_norm,
-                    "benchmark/pipeline_overlap_s": pipeline_overlap,
-                    # Rollout timing breakdown (diagnose spikes)
-                    "rollout/max_volume_reload_s": max_volume_reload_s,
-                    "rollout/max_total_s": max_rollout_total_s,
-                    "rollout/failed_count": failed_rollouts,
-                    # Order extraction metrics (monitor prompt structure regressions)
-                    "extraction/rate": step_extraction_stats["extraction_rate"],
-                    "extraction/orders_expected": step_extraction_stats["orders_expected"],
-                    "extraction/orders_extracted": step_extraction_stats["orders_extracted"],
-                    "extraction/empty_responses": step_extraction_stats["empty_responses"],
-                    "extraction/partial_responses": step_extraction_stats["partial_responses"],
-                    # Power Law metrics (for X-axis comparison across runs)
-                    "power_law/cumulative_simulated_years": cumulative_sim_years,
-                    "power_law/simulated_years_per_step": sim_years_per_step,
-                    "power_law/reward_at_compute": traj_stats.reward_mean,
-                }
-            )
+            # Build wandb metrics dict
+            wandb_metrics = {
+                "benchmark/step": step,
+                "benchmark/loss": avg_loss,
+                "benchmark/kl": avg_kl,
+                "benchmark/reward_mean": traj_stats.reward_mean,
+                "benchmark/reward_std": traj_stats.reward_std,
+                "benchmark/rollout_time_s": rollout_time,
+                "benchmark/training_time_s": training_time,
+                "benchmark/trajectories": len(batch_data),
+                "benchmark/grad_norm": grad_norm,
+                "benchmark/pipeline_overlap_s": pipeline_overlap,
+                # Rollout timing breakdown (diagnose spikes)
+                "rollout/max_volume_reload_s": max_volume_reload_s,
+                "rollout/max_total_s": max_rollout_total_s,
+                "rollout/failed_count": failed_rollouts,
+                # Order extraction metrics (monitor prompt structure regressions)
+                "extraction/rate": step_extraction_stats["extraction_rate"],
+                "extraction/orders_expected": step_extraction_stats["orders_expected"],
+                "extraction/orders_extracted": step_extraction_stats["orders_extracted"],
+                "extraction/empty_responses": step_extraction_stats["empty_responses"],
+                "extraction/partial_responses": step_extraction_stats["partial_responses"],
+                # Power Law metrics (for X-axis comparison across runs)
+                "power_law/cumulative_simulated_years": cumulative_sim_years,
+                "power_law/simulated_years_per_step": sim_years_per_step,
+                "power_law/reward_at_compute": traj_stats.reward_mean,
+            }
+
+            # Add league training metrics if enabled
+            if cfg.league_training and league_registry is not None:
+                wandb_metrics.update(
+                    {
+                        "league/num_checkpoints": league_registry.num_checkpoints,
+                        "league/best_elo": league_registry.best_elo,
+                        "league/latest_step": league_registry.latest_step,
+                    }
+                )
+
+            wandb.log(wandb_metrics)
             if profiler is not None:
                 profiler.step()
 
