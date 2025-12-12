@@ -193,6 +193,15 @@ class ExperimentConfig(BaseModel):
         default=True,
         description="Optimize prompt structure for vLLM prefix caching",
     )
+    show_valid_moves: bool = Field(
+        default=True,
+        description=(
+            "Include valid moves list in prompts. When False, prompts only show unit "
+            "positions and rely on the logits processor for move validity. "
+            "Dramatically reduces tokens late-game (~94% savings with 10+ units) "
+            "but may affect strategic decision quality. A/B test recommended."
+        ),
+    )
     compute_ref_logprobs_in_rollout: bool = Field(
         default=True,
         description=(
