@@ -99,6 +99,7 @@ TRACE_PATH = Path("/traces")
 @modal.concurrent(max_inputs=512, target_inputs=400)  # Increased from 256/200 for higher throughput
 class InferenceEngine:
     model_id: str = modal.parameter(default="Qwen/Qwen2.5-7B-Instruct")
+    is_for_league_evaluation: bool = modal.parameter(default=False)
 
     @modal.enter()
     def setup(self):
@@ -2663,8 +2664,11 @@ async def evaluate_league(
                     group_valid_moves = [item[2] for item in group_items]
 
                     # Batch inference call (much faster than sequential)
+                    # Use dedicated league evaluation engine pool (isolated from training)
                     batch_start = time.time()
-                    responses = await InferenceEngine(model_id=model_id).generate.remote.aio(
+                    responses = await InferenceEngine(
+                        model_id=model_id, is_for_league_evaluation=True
+                    ).generate.remote.aio(
                         prompts=group_prompts,
                         valid_moves=group_valid_moves,
                         lora_name=adapter_key if adapter_key != "base_model" else None,
