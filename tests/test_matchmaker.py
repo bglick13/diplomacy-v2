@@ -92,6 +92,47 @@ class TestPFSPMatchmaker:
         assert result.hero_power in PFSPMatchmaker.POWERS
         assert result.opponent_categories[result.hero_power] == "hero"
 
+    def test_hero_elo_from_registry(self, matchmaker, registry):
+        """Hero Elo should come from registry when agent is registered."""
+        result = matchmaker.sample_opponents("adapter_v30", hero_power="FRANCE")
+
+        # adapter_v30 has Elo 1150 in the test registry
+        assert result.hero_elo == 1150.0
+
+    def test_hero_elo_override(self, matchmaker):
+        """Hero Elo override should take precedence over registry lookup."""
+        result = matchmaker.sample_opponents(
+            "adapter_v30", hero_power="FRANCE", hero_elo_override=1300.0
+        )
+
+        # Override should be used even though adapter_v30 has Elo 1150
+        assert result.hero_elo == 1300.0
+
+    def test_hero_elo_default_for_unknown_agent(self, matchmaker):
+        """Unknown agent should default to 1000 Elo."""
+        result = matchmaker.sample_opponents("unknown_agent", hero_power="FRANCE")
+
+        # Unknown agent defaults to 1000.0
+        assert result.hero_elo == 1000.0
+
+    def test_self_play_with_unregistered_checkpoint(self, matchmaker):
+        """Self-play should use hero_adapter_path when hero isn't in registry."""
+        # Simulate an unregistered checkpoint (adapter_v55 not in registry)
+        result = matchmaker.sample_opponents(
+            hero_agent="test/adapter_v55",  # Not in registry
+            hero_power="FRANCE",
+            hero_elo_override=1200.0,
+            hero_adapter_path="test/adapter_v55",
+        )
+
+        # The hero adapter path should be used for the hero power
+        # and also for any self-play opponents
+        assert result.hero_elo == 1200.0
+
+        # Verify _agent_to_adapter returns the path for unregistered hero
+        adapter = matchmaker._agent_to_adapter("test/adapter_v55")
+        assert adapter == "test/adapter_v55"
+
     def test_cold_start_uses_only_baselines(self, matchmaker):
         """Cold start should use only baseline bots as opponents."""
         result = matchmaker.get_cold_start_opponents("FRANCE")
@@ -214,6 +255,7 @@ class TestMatchmakingResult:
         result = MatchmakingResult(
             hero_power="FRANCE",
             hero_agent="adapter_v50",
+            hero_elo=1150.0,
             power_adapters={
                 "FRANCE": "test/adapter_v50",
                 "ENGLAND": "random_bot",
@@ -238,6 +280,7 @@ class TestMatchmakingResult:
 
         assert wandb_dict["hero_power"] == "FRANCE"
         assert wandb_dict["hero_agent"] == "adapter_v50"
+        assert wandb_dict["hero_elo"] == 1150.0
         assert "opponent_categories" in wandb_dict
         assert wandb_dict["opponent_categories"]["baseline"] == 2
         assert wandb_dict["opponent_categories"]["self"] == 2

@@ -50,6 +50,7 @@ class MatchmakingResult:
 
     hero_power: str
     hero_agent: str
+    hero_elo: float  # Hero's Elo used for matchmaking
     power_adapters: dict[str, str | None]  # Power -> adapter path or bot name
     opponent_categories: dict[str, str]  # Power -> category (self, peer, baseline, etc.)
 
@@ -62,6 +63,7 @@ class MatchmakingResult:
         return {
             "hero_power": self.hero_power,
             "hero_agent": self.hero_agent,
+            "hero_elo": self.hero_elo,
             "opponent_categories": category_counts,
             "num_unique_adapters": len(set(self.power_adapters.values())),
         }
@@ -97,6 +99,8 @@ class PFSPMatchmaker:
         hero_agent: str,
         hero_power: str | None = None,
         num_opponents: int = 6,
+        hero_elo_override: float | None = None,
+        hero_adapter_path: str | None = None,
     ) -> MatchmakingResult:
         """
         Sample opponents for a training game.
@@ -105,6 +109,10 @@ class PFSPMatchmaker:
             hero_agent: Agent name for the hero (e.g., "adapter_v50")
             hero_power: Which power the hero plays (random if None)
             num_opponents: Number of opponent slots (usually 6)
+            hero_elo_override: Explicit Elo for the hero (used when hero isn't
+                               registered yet, e.g., during active training)
+            hero_adapter_path: Explicit adapter path for the hero (used for self-play
+                               when hero isn't in registry yet)
 
         Returns:
             MatchmakingResult with power_adapters mapping
@@ -113,8 +121,17 @@ class PFSPMatchmaker:
         if hero_power is None:
             hero_power = random.choice(self.POWERS)
 
-        hero_info = self.registry.get_agent(hero_agent)
-        hero_elo = hero_info.elo if hero_info else 1000.0
+        # Store hero info for self-play (may not be in registry yet)
+        # Used by _agent_to_adapter for unregistered checkpoints
+        self._current_hero_agent = hero_agent
+        self._current_hero_adapter_path = hero_adapter_path
+
+        # Determine hero Elo: explicit override > registry lookup > default
+        if hero_elo_override is not None:
+            hero_elo = hero_elo_override
+        else:
+            hero_info = self.registry.get_agent(hero_agent)
+            hero_elo = hero_info.elo if hero_info else 1000.0
 
         # Get available agents for opponent sampling
         all_agents = self.registry.get_all_agents()
@@ -157,6 +174,7 @@ class PFSPMatchmaker:
         return MatchmakingResult(
             hero_power=hero_power,
             hero_agent=hero_agent,
+            hero_elo=hero_elo,
             power_adapters=power_adapters,
             opponent_categories=opponent_categories,
         )
@@ -254,6 +272,17 @@ class PFSPMatchmaker:
         if agent_name == "base_model":
             return None
 
+        # For self-play: if agent matches the current hero, use provided adapter path
+        # This handles cases where the hero checkpoint isn't in registry yet
+        # (e.g., adapter_v55 when only every 10th step is registered)
+        if (
+            hasattr(self, "_current_hero_agent")
+            and agent_name == self._current_hero_agent
+            and hasattr(self, "_current_hero_adapter_path")
+            and self._current_hero_adapter_path
+        ):
+            return self._current_hero_adapter_path
+
         # Checkpoints use their path from registry
         agent = self.registry.get_agent(agent_name)
         if agent and agent.path:
@@ -293,6 +322,7 @@ class PFSPMatchmaker:
         return MatchmakingResult(
             hero_power=hero_power,
             hero_agent="base_model",
+            hero_elo=1000.0,  # Base model defaults to 1000 Elo
             power_adapters=power_adapters,
             opponent_categories=opponent_categories,
         )

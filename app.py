@@ -427,12 +427,24 @@ class InferenceEngine:
             )
 
             # Debug logging for slow batches
-            if timing_breakdown["total_time_s"] > 2.0:
+            # Single-item batches are expected to be slower (2-3s is normal for vLLM)
+            # Larger batches should be faster per-item, so we use adaptive thresholds
+            if batch_size == 1:
+                # Single-item batches: warn if > 5s (very slow)
+                slow_threshold = 5.0
+            elif batch_size <= 4:
+                # Small batches: warn if > 3s per item
+                slow_threshold = 3.0 * batch_size
+            else:
+                # Larger batches: warn if > 2s per item
+                slow_threshold = 2.0 * batch_size
+
+            if timing_breakdown["total_time_s"] > slow_threshold:
                 print(
                     f"⏱️  Slow inference batch: {timing_breakdown['total_time_s']:.3f}s "
                     f"(adapter_load: {timing_breakdown['adapter_load_time_s']:.3f}s, "
                     f"generation: {timing_breakdown['generation_time_s']:.3f}s, "
-                    f"batch_size={batch_size})"
+                    f"batch_size={batch_size}, threshold={slow_threshold:.1f}s)"
                 )
 
             # Return rich response structure with token data for trainer optimization
@@ -913,13 +925,19 @@ async def run_rollout(
                     )
 
                 # 3. Run batched inference for each adapter group
+                # Note: batch_size=1 is common when:
+                # - Only one power uses a particular adapter (league training)
+                # - Powers are eliminated early in the game
+                # - Using baseline bots for some powers
+                # vLLM's continuous batching will still batch these across concurrent games
                 for adapter_key, group_items in adapter_groups.items():
                     group_indices = [item[0] for item in group_items]
                     group_prompts = [item[1] for item in group_items]
                     group_valid_moves = [item[2] for item in group_items]
+                    batch_size = len(group_prompts)
 
                     with stopwatch(
-                        f"Game {g_idx} Step {step_count} Adapter={adapter_key} (Batch: {len(group_prompts)})"
+                        f"Game {g_idx} Step {step_count} Adapter={adapter_key} (Batch: {batch_size})"
                     ):
                         metrics.inference_calls += 1
                         responses = await InferenceEngine(
@@ -1622,6 +1640,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
         # ==========================================================================
         league_registry = None
         pfsp_matchmaker = None
+        last_registry_reload_step = -1  # Track last reload to throttle
 
         if cfg.league_training:
             from pathlib import Path
@@ -1736,47 +1755,65 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             """
             import random
 
+            nonlocal last_registry_reload_step
+
             handles = []
             for _ in range(cfg.num_groups_per_step):
                 if cfg.league_training and pfsp_matchmaker is not None:
                     # League training: hero uses latest adapter, opponents from registry
-                    POWERS = [
-                        "AUSTRIA",
-                        "ENGLAND",
-                        "FRANCE",
-                        "GERMANY",
-                        "ITALY",
-                        "RUSSIA",
-                        "TURKEY",
-                    ]
-                    hero_power = random.choice(POWERS)
-                    opponent_powers = [p for p in POWERS if p != hero_power]
-
-                    # Build power_adapters: hero uses provided path, opponents from PFSP
-                    power_adapters: dict[str, str | None] = {}
-                    power_adapters[hero_power] = hero_adapter_path
+                    hero_power = random.choice(pfsp_matchmaker.POWERS)
 
                     # Sample opponents based on registry (cold start = all baselines)
                     if league_registry and league_registry.num_checkpoints > 0:
-                        # Use PFSP sampling for opponents
-                        for opp_power in opponent_powers:
-                            category = pfsp_matchmaker._sample_category()
-                            all_checkpoints = league_registry.get_checkpoints()
-                            all_baselines = league_registry.get_baselines()
-                            # Use base Elo since we don't track hero's Elo in real-time
-                            agent = pfsp_matchmaker._sample_agent_for_category(
-                                category,
-                                hero_agent="current_policy",
-                                hero_elo=1000.0,
-                                checkpoints=all_checkpoints,
-                                baselines=all_baselines,
-                            )
-                            power_adapters[opp_power] = pfsp_matchmaker._agent_to_adapter(agent)
+                        # Reload registry periodically to get latest Elo updates from evaluate_league
+                        # Reload every 5 steps to balance freshness vs. performance
+                        # (evaluate_league typically runs every 50 steps, so this ensures we see updates)
+                        if step - last_registry_reload_step >= 5:  # type: ignore[possibly-unbound]
+                            try:
+                                # CRITICAL: Must reload volume first to see commits from evaluate_league
+                                # Modal Volumes don't auto-sync - each container has a local view
+                                volume.reload()
+                                league_registry.reload()
+                                last_registry_reload_step = step
+                                logger.debug(
+                                    f"🔄 Reloaded league registry at step {step} "
+                                    f"(best Elo: {league_registry.best_elo:.0f})"
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"⚠️ Failed to reload registry: {e}, using cached state"
+                                )
+
+                        # Estimate hero's Elo for peer matching
+                        # Hero adapter may not be registered yet (we checkpoint periodically)
+                        # Use registry lookup if available, otherwise estimate from best_elo
+                        hero_agent_name = hero_adapter_path or "base_model"
+                        hero_info = league_registry.get_agent(hero_agent_name)
+                        if hero_info:
+                            estimated_hero_elo = hero_info.elo
+                        else:
+                            # Checkpoint not registered yet - use best_elo as estimate
+                            # Current policy is likely similar strength to best registered checkpoint
+                            estimated_hero_elo = league_registry.best_elo
+
+                        # Use public API for clean opponent sampling
+                        match_result = pfsp_matchmaker.sample_opponents(
+                            hero_agent=hero_agent_name,
+                            hero_power=hero_power,
+                            num_opponents=6,
+                            hero_elo_override=estimated_hero_elo,
+                            hero_adapter_path=hero_adapter_path,  # For self-play when unregistered
+                        )
+
+                        # Use matched power_adapters, but override hero with exact training adapter
+                        # (matchmaker may return a different path for the hero agent)
+                        power_adapters = match_result.power_adapters.copy()
+                        power_adapters[hero_power] = hero_adapter_path
                     else:
-                        # Cold start: all opponents are baselines
-                        baseline_cycle = ["random_bot", "chaos_bot"]
-                        for i, opp_power in enumerate(opponent_powers):
-                            power_adapters[opp_power] = baseline_cycle[i % 2]
+                        # Cold start: use matchmaker's cold start helper
+                        match_result = pfsp_matchmaker.get_cold_start_opponents(hero_power)
+                        power_adapters = match_result.power_adapters.copy()
+                        power_adapters[hero_power] = hero_adapter_path
 
                     handles.append(
                         run_rollout.spawn(
@@ -1919,6 +1956,8 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                                 step=step,
                                 parent=parent_key,
                             )
+                            # CRITICAL: Commit registry to volume so evaluate_league can see it
+                            volume.commit()
                             logger.info(f"🏆 Added checkpoint {checkpoint_key} to league")
 
                             # Spawn async Elo evaluation if enabled
@@ -2665,6 +2704,8 @@ async def evaluate_league(
 
                     # Batch inference call (much faster than sequential)
                     # Use dedicated league evaluation engine pool (isolated from training)
+                    # Note: batch_size=1 is common when only one power uses a particular adapter
+                    # vLLM's continuous batching will still batch these across different calls
                     batch_start = time.time()
                     responses = await InferenceEngine(
                         model_id=model_id, is_for_league_evaluation=True
@@ -2680,11 +2721,18 @@ async def evaluate_league(
                         orders = extract_orders(response_data["text"])
                         inference_results[power] = orders
 
-                    # Log batch timing
-                    logger.debug(
-                        f"  Batch inference: adapter={adapter_key}, "
-                        f"batch_size={len(group_prompts)}, time={batch_time:.3f}s"
-                    )
+                    # Log batch timing (only warn for very slow single-item batches)
+                    batch_size = len(group_prompts)
+                    if batch_size == 1 and batch_time > 5.0:
+                        logger.warning(
+                            f"  Very slow single-item batch: adapter={adapter_key}, "
+                            f"time={batch_time:.3f}s (normal: 2-3s)"
+                        )
+                    else:
+                        logger.debug(
+                            f"  Batch inference: adapter={adapter_key}, "
+                            f"batch_size={batch_size}, time={batch_time:.3f}s"
+                        )
 
                 inference_time = time.time() - inference_start
 
@@ -2798,19 +2846,53 @@ async def evaluate_league(
     all_agents = registry.get_all_agents()
     current_elos = {a.name: a.elo for a in all_agents}
 
-    # Add challenger if not in registry yet (use parent's Elo or 1000)
-    if challenger_path not in current_elos:
-        # Find parent checkpoint
-        parent_elo = 1000.0
-        for agent in checkpoints:
-            if agent.path == challenger_path:
-                parent_name = agent.parent
-                if parent_name and parent_name in current_elos:
-                    parent_elo = current_elos[parent_name]
-                break
-        current_elos[challenger_path] = parent_elo
+    # Add challenger to registry if not present yet (race condition: eval might start before checkpoint is added)
+    challenger_name = challenger_path  # Name matches path for checkpoints
+    if challenger_name not in [a.name for a in all_agents]:
+        logger.warning(f"⚠️ Challenger {challenger_name} not in registry yet, adding it...")
 
-    # Apply Elo updates
+        # Extract step and run_name from path (e.g., "grpo-20251209-200240/adapter_v20" -> 20)
+        step = 0
+        run_name = None
+        try:
+            parts = challenger_path.rsplit("/", 1)
+            if len(parts) == 2:
+                run_name = parts[0]
+            step_str = challenger_path.split("adapter_v")[-1]
+            step = int(step_str)
+        except (ValueError, IndexError):
+            logger.warning(f"Could not extract step from challenger_path: {challenger_path}")
+
+        # Find parent checkpoint to inherit Elo
+        # Parent is the previous step's checkpoint (e.g., adapter_v19 is parent of adapter_v20)
+        parent_name = None
+        parent_elo = 1000.0
+        if step > 1 and run_name:
+            # Try to find parent checkpoint (previous step)
+            for prev_step in range(step - 1, 0, -1):
+                potential_parent = f"{run_name}/adapter_v{prev_step}"
+                if potential_parent in current_elos:
+                    parent_name = potential_parent
+                    parent_elo = current_elos[potential_parent]
+                    logger.info(f"  Inheriting Elo {parent_elo:.0f} from parent {parent_name}")
+                    break
+        elif step == 1:
+            parent_name = "base_model"
+            parent_elo = current_elos.get("base_model", 1000.0)
+
+        # Add challenger to registry
+        registry.add_checkpoint(
+            name=challenger_name,
+            path=challenger_path,
+            step=step,
+            parent=parent_name,
+            initial_elo=parent_elo,
+        )
+        # Reload current_elos to include the newly added challenger
+        all_agents = registry.get_all_agents()
+        current_elos = {a.name: a.elo for a in all_agents}
+
+    # Apply Elo updates from all matches
     for match in all_matches:
         current_elos = update_elo_from_match(
             power_agents=match["power_agents"],
@@ -2819,8 +2901,39 @@ async def evaluate_league(
             k=32.0,
         )
 
-    # Update registry
+    # Update registry with new Elos
+    # Only update agents that exist in the registry (bulk_update_elos filters automatically)
     registry.bulk_update_elos(current_elos)
+
+    # Also add match history for tracking
+    from src.league.types import MatchResult
+
+    for idx, match in enumerate(all_matches):
+        # Calculate rankings from scores
+        power_scores = match["power_scores"]
+        sorted_powers = sorted(power_scores.items(), key=lambda x: x[1], reverse=True)
+        rankings = {power: rank + 1 for rank, (power, _) in enumerate(sorted_powers)}
+
+        # Count years (approximate from step count)
+        num_years = len(match.get("step_timings", [])) // 2  # 2 phases per year
+
+        # Determine winner (agent with highest score)
+        winner_power = sorted_powers[0][0] if sorted_powers else None
+        winner_agent = match["power_agents"].get(winner_power) if winner_power else None
+
+        match_result = MatchResult(
+            game_id=f"eval-{challenger_name}-{int(time.time())}-{idx}",
+            step=training_step,
+            power_agents=match["power_agents"],
+            scores=power_scores,
+            rankings=rankings,
+            num_years=num_years,
+            winner=winner_agent,
+        )
+        registry.add_match(match_result)
+
+    # Final save to ensure match history is persisted
+    registry._save()
     volume.commit()
 
     # Compute summary stats
