@@ -1,3 +1,7 @@
+"""
+modal deploy -m src.apps.deploy
+"""
+
 import modal
 
 from src.apps.evaluation.app import app as evaluation_app

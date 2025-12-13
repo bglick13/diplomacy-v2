@@ -109,6 +109,7 @@ async def evaluate_league(
         compact_mode=compact_prompts,
         prefix_cache_optimized=prefix_cache_optimized,
         show_valid_moves=show_valid_moves,
+        show_map_windows=True,
     )
     llm_agent = LLMAgent(config=prompt_config)
 
@@ -591,6 +592,7 @@ async def run_evaluation(
         compact_mode=compact_prompts,
         prefix_cache_optimized=prefix_cache_optimized,
         show_valid_moves=show_valid_moves,
+        show_map_windows=True,
     )
     llm_agent = LLMAgent(config=prompt_config)
 

@@ -50,7 +50,10 @@ def run_simulation(
     vis = GameVisualizer()
 
     # Initialize agent
-    prompt_config = PromptConfig(compact_mode=cfg.compact_prompts)
+    prompt_config = PromptConfig(
+        compact_mode=cfg.compact_prompts,
+        show_map_windows=cfg.show_map_windows,
+    )
     agent = LLMAgent(config=prompt_config)
 
     vis.capture_turn(game.game, f"Game Start ({run_name})")

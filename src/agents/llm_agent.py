@@ -27,6 +27,9 @@ class PromptConfig:
     # Maximum moves to show per unit (to avoid token overflow)
     max_moves_per_unit: int = 10
 
+    # Whether to include compact per-unit map windows (adjacencies + threats)
+    show_map_windows: bool = True
+
     # Custom system instructions (appended to base prompt)
     custom_instructions: str = ""
 
@@ -169,7 +172,9 @@ class LLMAgent:
 
         # Get board context for strategic awareness (used in minimal prompt mode)
         board_context = (
-            game.get_board_context(power_name) if not self.config.show_valid_moves else None
+            game.get_board_context(power_name, include_windows=self.config.show_map_windows)
+            if not self.config.show_valid_moves
+            else None
         )
 
         # Handle adjustment phases differently
@@ -226,6 +231,12 @@ class LLMAgent:
         """
         lines = []
 
+        # Compact per-unit windows (optional)
+        if self.config.show_map_windows:
+            compact_map_view = board_context.get("compact_map_view") or ""
+            if compact_map_view:
+                lines.append("Windows:\n" + compact_map_view)
+
         # Supply centers owned
         my_centers = board_context.get("my_centers", [])
         if my_centers:
@@ -243,6 +254,13 @@ class LLMAgent:
             for power, units in sorted(opponent_units.items()):
                 opp_parts.append(f"{power}:{','.join(units)}")
             lines.append(f"Opponents: {' | '.join(opp_parts)}")
+
+        # Power rankings (top 3)
+        rankings = board_context.get("power_rankings", [])
+        if rankings:
+            top = rankings[:3]
+            rank_parts = [f"{p}:{c}" for p, c in top]
+            lines.append(f"SC_leaders: {', '.join(rank_parts)}")
 
         return "\n".join(lines)
 

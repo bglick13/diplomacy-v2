@@ -652,8 +652,8 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     )
             return handles, step_match_results
 
-        # Each entry is (handles_list, hero_adapter_path, match_results for PFSP tracking)
-        rollout_buffer: deque[tuple[list, str | None, list]] = deque()
+        # Each entry is (handle, hero_adapter_path, match_result)
+        rollout_buffer: deque[tuple[Any, str | None, Any]] = deque()
 
         # Determine initial adapter for buffer (use resumed adapter if applicable)
         initial_adapter: str | None = None
@@ -662,11 +662,15 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             initial_adapter = f"{cfg.run_name}/adapter_v{start_step}"
             logger.info(f"📦 Resuming - buffer will use adapter: {initial_adapter}")
 
+        # Prefill buffer with buffer_depth batches
+        # Note: spawn_rollouts_batch returns num_groups_per_step handles per call
         for _ in range(buffer_depth):
             handles, match_results = spawn_rollouts_batch(hero_adapter_path=initial_adapter)
-            rollout_buffer.append((handles, initial_adapter, match_results))
+            # Flatten: store each handle with its metadata
+            for h, mr in zip(handles, match_results, strict=False):
+                rollout_buffer.append((h, initial_adapter, mr))
 
-        total_in_flight = buffer_depth * cfg.num_groups_per_step
+        total_in_flight = len(rollout_buffer)
         logger.info(
             f"📦 Buffer initialized: {buffer_depth} batches ({total_in_flight} rollouts) in flight"
         )
@@ -676,74 +680,121 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             step_metrics: dict[str, Any] = {"step": step}
             step_profile: dict[str, Any] | None = {"step": step} if profile_enabled else None
 
-            # A. Wait for OLDEST rollouts (front of buffer)
-            current_handles, current_lora_name, current_match_results = rollout_buffer.popleft()
-            rollout_start = time.time()
-            with stopwatch(f"Benchmark_Rollout_{step}"):
-                raw_trajectories = []
-                # Aggregate extraction stats across all rollouts in this batch
-                step_extraction_stats: dict[str, int | float] = {
-                    "orders_expected": 0,
-                    "orders_extracted": 0,
-                    "empty_responses": 0,
-                    "partial_responses": 0,
-                    "extraction_rate": 1.0,
-                }
-                # Aggregate timing stats from rollouts
-                max_volume_reload_s = 0.0
-                max_rollout_total_s = 0.0
-                # Track prefix cache stats (query from engines after step)
-                step_cache_stats_available = False
+            # A. Gather next K rollouts (ready-first) to form this training step
+            target_rollouts = cfg.num_groups_per_step
+            collected: list[tuple[Any, str | None, Any, dict]] = []
+            max_volume_reload_s = 0.0
+            max_rollout_total_s = 0.0
+            failed_rollouts = 0
 
-                failed_rollouts = 0
-                for handle in current_handles:
-                    try:
-                        result = handle.get()  # Block until this rollout completes
-                    except Exception as e:
-                        # Log the failure but continue with other rollouts
-                        failed_rollouts += 1
+            # Determine current adapter for emergency spawns
+            current_adapter = f"{cfg.run_name}/adapter_v{step}" if step >= 1 else initial_adapter
+
+            rollout_start = time.time()
+            # Deadline to prevent infinite spinning if rollouts are very slow
+            max_wait_s = 300.0  # 5 minute max wait per step
+            deadline = rollout_start + max_wait_s
+            polls_without_progress = 0
+            MAX_POLLS_WITHOUT_PROGRESS = 50  # ~5s of spinning triggers blocking wait
+
+            with stopwatch(f"Benchmark_Rollout_{step}"):
+                while len(collected) < target_rollouts:
+                    if not rollout_buffer:
                         logger.warning(
-                            f"⚠️ Rollout failed (will continue with others): {type(e).__name__}: {e}"
+                            "Rollout buffer unexpectedly empty; spawning one-off to continue"
                         )
+                        handles, match_results = spawn_rollouts_batch(
+                            hero_adapter_path=current_adapter
+                        )
+                        for h, mr in zip(handles, match_results, strict=False):
+                            rollout_buffer.append((h, current_adapter, mr))
+                        polls_without_progress = 0
+
+                    handle, adapter_used, match_result = rollout_buffer.popleft()
+
+                    # Adaptive timeout: start non-blocking, escalate to blocking if spinning
+                    if polls_without_progress < MAX_POLLS_WITHOUT_PROGRESS:
+                        timeout = 0.1
+                    else:
+                        # After many failed polls, block to avoid CPU burn
+                        remaining = max(1.0, deadline - time.time())
+                        timeout = min(remaining, 30.0)
+                        logger.debug(
+                            f"Blocking wait ({timeout:.1f}s) after {polls_without_progress} polls"
+                        )
+
+                    try:
+                        result = handle.get(timeout=timeout)
+                        polls_without_progress = 0  # Reset on success
+                    except TimeoutError:
+                        rollout_buffer.append((handle, adapter_used, match_result))
+                        polls_without_progress += 1
+                        # Check deadline
+                        if time.time() > deadline:
+                            logger.error(
+                                f"Rollout deadline exceeded ({max_wait_s}s), "
+                                f"collected {len(collected)}/{target_rollouts}"
+                            )
+                            break
+                        continue
+                    except Exception as e:
+                        # Check if it's a timeout-like error from Modal
+                        if "timeout" in str(e).lower():
+                            rollout_buffer.append((handle, adapter_used, match_result))
+                            polls_without_progress += 1
+                            continue
+                        # Actual failure - skip this rollout
+                        failed_rollouts += 1
+                        polls_without_progress = 0  # Failure counts as progress (resolved)
+                        logger.warning(f"⚠️ Rollout failed (skipping): {type(e).__name__}: {e}")
                         continue
 
-                    # Unpack new return format: {"trajectories": [...], "extraction_stats": {...}, "timing": {...}}
-                    raw_trajectories.extend(result["trajectories"])
-                    # Aggregate extraction stats
-                    stats = result["extraction_stats"]
-                    step_extraction_stats["orders_expected"] += stats["orders_expected"]  # type: ignore[operator]
-                    step_extraction_stats["orders_extracted"] += stats["orders_extracted"]  # type: ignore[operator]
-                    step_extraction_stats["empty_responses"] += stats["empty_responses"]  # type: ignore[operator]
-                    step_extraction_stats["partial_responses"] += stats["partial_responses"]  # type: ignore[operator]
-                    # Track max timing stats (slowest rollout determines wait time)
+                    collected.append((adapter_used, match_result, result, handle))
+
                     timing = result.get("timing", {})
                     max_volume_reload_s = max(
                         max_volume_reload_s, timing.get("volume_reload_s", 0.0)
                     )
                     max_rollout_total_s = max(max_rollout_total_s, timing.get("total_s", 0.0))
 
-                if failed_rollouts > 0:
-                    logger.warning(
-                        f"⚠️ Step {step}: {failed_rollouts}/{len(current_handles)} rollouts failed"
-                    )
+            # Aggregate collected rollouts
+            raw_trajectories = []
+            step_extraction_stats: dict[str, int | float] = {
+                "orders_expected": 0,
+                "orders_extracted": 0,
+                "empty_responses": 0,
+                "partial_responses": 0,
+                "extraction_rate": 1.0,
+            }
+            # Extract match results for PFSP tracking (filter None for non-league mode)
+            current_match_results = [
+                match_result for _, match_result, _, _ in collected if match_result is not None
+            ]
 
-                # Compute step-level extraction rate
-                orders_expected = step_extraction_stats["orders_expected"]
-                orders_extracted = step_extraction_stats["orders_extracted"]
-                if isinstance(orders_expected, int) and orders_expected > 0:
-                    step_extraction_stats["extraction_rate"] = float(orders_extracted) / float(
-                        orders_expected
-                    )
+            for _adapter_used, _match_result, result, _handle in collected:
+                raw_trajectories.extend(result["trajectories"])
+                stats = result["extraction_stats"]
+                step_extraction_stats["orders_expected"] += stats["orders_expected"]  # type: ignore[operator]
+                step_extraction_stats["orders_extracted"] += stats["orders_extracted"]  # type: ignore[operator]
+                step_extraction_stats["empty_responses"] += stats["empty_responses"]  # type: ignore[operator]
+                step_extraction_stats["partial_responses"] += stats["partial_responses"]  # type: ignore[operator]
+
+            orders_expected = step_extraction_stats["orders_expected"]
+            orders_extracted = step_extraction_stats["orders_extracted"]
+            if isinstance(orders_expected, int) and orders_expected > 0:
+                step_extraction_stats["extraction_rate"] = float(orders_extracted) / float(
+                    orders_expected
+                )
 
             rollout_time = time.time() - rollout_start
             step_metrics["rollout_time_s"] = rollout_time
             step_metrics["raw_trajectories"] = len(raw_trajectories)
-            step_metrics["rollout_lora"] = current_lora_name or "base_model"
-            step_metrics["buffer_depth_actual"] = (
-                len(rollout_buffer) + 1
-            )  # +1 for the one we just popped
+            step_metrics["rollout_lora"] = "mixed"
+            step_metrics["buffer_depth_actual"] = len(rollout_buffer)
             step_metrics["extraction_stats"] = step_extraction_stats
             step_metrics["failed_rollouts"] = failed_rollouts
+            step_metrics["rollouts_consumed"] = len(collected) + failed_rollouts
+            step_metrics["collection_polls"] = polls_without_progress  # Spinning indicator
             # Track slowest rollout timing (identifies bottlenecks)
             step_metrics["max_volume_reload_s"] = max_volume_reload_s
             step_metrics["max_rollout_total_s"] = max_rollout_total_s
@@ -770,10 +821,13 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 step_cache_stats = {}
                 step_cache_stats_available = False
 
-            # B. Launch NEW batch to maintain buffer (if not near the end)
-            # This batch runs during training, keeping the pipeline full
+            # B. Launch NEW rollouts to maintain buffer (if not near the end)
+            # Spawn replacements for all consumed rollouts (collected + failed)
+            # This keeps buffer at target depth even with failures
+            rollouts_consumed = len(collected) + failed_rollouts
+            rollouts_spawned = 0
             steps_remaining = cfg.total_steps - step - 1
-            if steps_remaining >= buffer_depth:
+            if steps_remaining >= buffer_depth and rollouts_consumed > 0:
                 # Determine which adapter to use for the new batch
                 # After step 0 training completes, we'll have adapter_v1
                 new_hero_agent: str | None = None
@@ -841,15 +895,24 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     new_hero_agent = adapter_rel_path
 
                 target_step = step + buffer_depth
+                # Spawn enough batches to replace consumed rollouts
+                # (typically 1 batch, but may need more if failures occurred)
+                batches_needed = max(
+                    1, (rollouts_consumed + cfg.num_groups_per_step - 1) // cfg.num_groups_per_step
+                )
                 logger.info(
-                    f"🔀 Launching rollouts for step {target_step} "
-                    f"(using {'base model' if not new_hero_agent else new_hero_agent})"
+                    f"🔀 Launching {batches_needed} batch(es) for step {target_step} "
+                    f"(replacing {rollouts_consumed} consumed, "
+                    f"using {'base model' if not new_hero_agent else new_hero_agent})"
                 )
 
-                new_handles, new_match_results = spawn_rollouts_batch(
-                    hero_adapter_path=new_hero_agent
-                )
-                rollout_buffer.append((new_handles, new_hero_agent, new_match_results))
+                for _ in range(batches_needed):
+                    new_handles, new_match_results = spawn_rollouts_batch(
+                        hero_adapter_path=new_hero_agent
+                    )
+                    for h, mr in zip(new_handles, new_match_results, strict=False):
+                        rollout_buffer.append((h, new_hero_agent, mr))
+                        rollouts_spawned += 1
 
             if not raw_trajectories:
                 logger.warning(f"Step {step}: No trajectories, skipping")
@@ -963,6 +1026,11 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 "rollout/max_volume_reload_s": max_volume_reload_s,
                 "rollout/max_total_s": max_rollout_total_s,
                 "rollout/failed_count": failed_rollouts,
+                # Buffer health metrics (diagnose GPU starvation)
+                "buffer/depth": len(rollout_buffer),
+                "buffer/consumed": rollouts_consumed,
+                "buffer/spawned": rollouts_spawned,
+                "buffer/collection_polls": polls_without_progress,  # High = slow rollouts
                 # Order extraction metrics (monitor prompt structure regressions)
                 "extraction/rate": step_extraction_stats["extraction_rate"],
                 "extraction/orders_expected": step_extraction_stats["orders_expected"],
@@ -1032,7 +1100,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
 
                 # Add PFSP distribution metrics (validates matchmaking is working correctly)
                 if current_match_results and pfsp_matchmaker is not None:
-                    pfsp_stats = pfsp_matchmaker.get_sampling_stats(current_match_results)
+                    pfsp_stats = pfsp_matchmaker.get_sampling_stats(current_match_results)  # type: ignore[arg-type]
                     category_rates = pfsp_stats.get("category_rates", {})
                     hero_powers = pfsp_stats.get("hero_power_distribution", {})
 

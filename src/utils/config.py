@@ -161,11 +161,11 @@ class ExperimentConfig(BaseModel):
     # =========================================================================
     total_steps: int = Field(default=10, description="Total number of training steps")
     num_groups_per_step: int = Field(
-        default=8,
+        default=10,
         description="Number of rollout groups per step (G in GRPO). I.e., how many different game states to start from",
     )
     samples_per_group: int = Field(
-        default=8,
+        default=10,
         description="Number of trajectory samples per group (N in GRPO). I.e., how many different forked games to simulate for each starting state",
     )
     buffer_depth: int = Field(
@@ -184,7 +184,7 @@ class ExperimentConfig(BaseModel):
     # Inference Settings
     # =========================================================================
     max_new_tokens: int = Field(default=256, description="Maximum tokens to generate per inference")
-    temperature: float = Field(default=0.8, description="Sampling temperature for generation")
+    temperature: float = Field(default=0.9, description="Sampling temperature for generation")
     compact_prompts: bool = Field(
         default=True, description="Use compact prompt format (reduces token count)"
     )
@@ -194,12 +194,19 @@ class ExperimentConfig(BaseModel):
         description="Optimize prompt structure for vLLM prefix caching",
     )
     show_valid_moves: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Include valid moves list in prompts. When False, prompts only show unit "
             "positions and rely on the logits processor for move validity. "
             "Dramatically reduces tokens late-game (~94% savings with 10+ units) "
             "but may affect strategic decision quality. A/B test recommended."
+        ),
+    )
+    show_map_windows: bool = Field(
+        default=True,
+        description=(
+            "Include compact per-unit map windows (adjacent tiles + nearby threats) when "
+            "show_valid_moves=False. Adds a few tokens per unit to provide strategic context."
         ),
     )
     compute_ref_logprobs_in_rollout: bool = Field(

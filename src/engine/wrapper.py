@@ -259,7 +259,7 @@ class DiplomacyWrapper:
     def get_state_json(self) -> dict[str, Any]:
         return to_saved_game_format(self.game)
 
-    def get_board_context(self, power_name: str) -> dict[str, Any]:
+    def get_board_context(self, power_name: str, include_windows: bool = True) -> dict[str, Any]:
         """
         Get board context for strategic decision making.
 
@@ -270,6 +270,7 @@ class DiplomacyWrapper:
         - opponent_centers: Dict of power -> centers for other powers
         - unowned_centers: List of neutral supply centers
         - power_rankings: List of (power, center_count) sorted by centers
+        - compact_map_view: Token-efficient per-unit neighbor windows
         """
         all_centers = set(self.game.map.scs)  # All supply centers on map
 
@@ -300,6 +301,8 @@ class DiplomacyWrapper:
                 power_rankings.append((pwr, center_count))
         power_rankings.sort(key=lambda x: x[1], reverse=True)
 
+        compact_map_view = self.get_compact_map_view(power_name) if include_windows else ""
+
         return {
             "my_units": my_units,
             "my_centers": my_centers,
@@ -307,7 +310,72 @@ class DiplomacyWrapper:
             "opponent_centers": opponent_centers,
             "unowned_centers": unowned_centers,
             "power_rankings": power_rankings,
+            "compact_map_view": compact_map_view,
         }
+
+    def get_compact_map_view(self, power_name: str, max_neighbors: int = 4) -> str:
+        """
+        Return a compact, token-efficient map view focused on the player's units.
+
+        Format (one line per unit):
+            A PAR: PAR->BUR->PIC->GAS | n=BUR | e=GER:BUR
+
+        - Path shows the unit's province followed by up to `max_neighbors` adjacent spaces
+        - n= lists adjacent neutral SCs
+        - e= lists adjacent enemy units with their owning power
+        """
+        if power_name not in self.game.powers:
+            return ""
+
+        game_map = self.game.map
+        my_units = list(self.game.powers[power_name].units)
+
+        # Owner lookup for supply centers
+        owner_by_center: dict[str, str] = {}
+        for pwr, power_obj in self.game.powers.items():
+            for center in power_obj.centers:
+                owner_by_center[center] = pwr
+
+        # Enemy units keyed by location (base province, strip coasts)
+        enemy_units: dict[str, str] = {}
+        for pwr, power_obj in self.game.powers.items():
+            if pwr == power_name:
+                continue
+            for unit in power_obj.units:
+                parts = unit.split()
+                if len(parts) >= 2:
+                    loc = parts[1].split("/")[0]
+                    enemy_units[loc] = pwr
+
+        lines: list[str] = []
+        for unit in my_units:
+            parts = unit.split()
+            if len(parts) < 2:
+                continue
+            loc = parts[1].split("/")[0]
+            try:
+                neighbors = game_map.abut_list(loc)
+            except Exception:
+                neighbors = []
+            neighbor_path = "->".join([loc] + neighbors[:max_neighbors])
+
+            # Neutral SCs adjacent
+            neutral_adj = [
+                n for n in neighbors if n in game_map.scs and owner_by_center.get(n) is None
+            ][:2]
+
+            # Enemy units adjacent
+            enemy_adj = [f"{owner}:{n}" for n, owner in enemy_units.items() if n in neighbors][:3]
+
+            line_parts = [f"{unit}: {neighbor_path}"]
+            if neutral_adj:
+                line_parts.append(f"n={','.join(neutral_adj)}")
+            if enemy_adj:
+                line_parts.append(f"e={','.join(enemy_adj)}")
+
+            lines.append(" | ".join(line_parts))
+
+        return "\n".join(lines)
 
     def get_unit(self, power_name: str, unit_str: str) -> str | None:
         units: list[str] = list(self.game.get_units(power_name))

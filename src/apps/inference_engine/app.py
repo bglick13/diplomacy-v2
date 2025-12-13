@@ -35,7 +35,7 @@ app = modal.App("diplomacy-grpo-inference-engine")
         str(HF_CACHE_PATH): hf_cache_volume,
     },
     scaledown_window=60 * 10,
-    buffer_containers=1,
+    buffer_containers=2,
 )
 @modal.concurrent(max_inputs=512, target_inputs=400)
 class InferenceEngine:

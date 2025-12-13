@@ -694,6 +694,7 @@ class RolloutMetrics:
     inference_calls: int = 0
     total_orders_expected: int = 0
     total_orders_extracted: int = 0
+    total_orders_overflow: int = 0
     empty_responses: int = 0
     partial_responses: int = 0
     invalid_orders: int = 0
@@ -701,6 +702,9 @@ class RolloutMetrics:
     def record_extraction(self, extracted: int, expected: int):
         """Record order extraction result."""
         self.total_orders_expected += expected
+        if extracted > expected:
+            self.total_orders_overflow += extracted - expected
+            extracted = expected
         self.total_orders_extracted += extracted
         if extracted == 0:
             self.empty_responses += 1
@@ -728,6 +732,7 @@ class RolloutMetrics:
             "empty_responses": self.empty_responses,
             "partial_responses": self.partial_responses,
             "invalid_orders": self.invalid_orders,
+            "over_extracted": self.total_orders_overflow,
         }
 
     def log_summary(self):

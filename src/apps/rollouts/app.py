@@ -131,6 +131,7 @@ async def run_rollout(
             compact_mode=cfg.compact_prompts,
             prefix_cache_optimized=cfg.prefix_cache_optimized,
             show_valid_moves=cfg.show_valid_moves,
+            show_map_windows=cfg.show_map_windows,
         )
         agent = LLMAgent(config=prompt_config)
 
@@ -329,11 +330,6 @@ async def run_rollout(
                     )
 
                 # 3. Run batched inference for each adapter group
-                # Note: batch_size=1 is common when:
-                # - Only one power uses a particular adapter (league training)
-                # - Powers are eliminated early in the game
-                # - Using baseline bots for some powers
-                # vLLM's continuous batching will still batch these across concurrent games
                 for adapter_key, group_items in adapter_groups.items():
                     group_indices = [item[0] for item in group_items]
                     group_prompts = [item[1] for item in group_items]

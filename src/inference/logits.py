@@ -24,7 +24,7 @@ import torch
 
 try:
     from vllm.v1.sample.logits_processor import LogitsProcessor
-except ImportError:
+except ImportError:  # pragma: no cover - fallback for environments without vLLM
     LogitsProcessor = object  # type: ignore[assignment, misc]
 
 if TYPE_CHECKING:
@@ -70,10 +70,14 @@ class RequestState:
         # streaming decode / tag detection
         "last_processed_len",
         "recent_text",
+        "recent_text_lower",
         "in_orders",
         "is_done",
         # trie cursor
         "current_node",
+        # line counting
+        "expected_orders",
+        "emitted_orders",
         # end-tag forcing
         "force_end_ids",
         "force_end_pos",
@@ -86,6 +90,7 @@ class RequestState:
         output_token_ids: list[int],
         eos_token_id: int,
         newline_token_id: int,
+        expected_orders: int,
     ):
         self.root = root
         self.output_token_ids = output_token_ids
@@ -94,10 +99,15 @@ class RequestState:
 
         self.last_processed_len = 0
         self.recent_text = ""  # rolling buffer of decoded text
+        self.recent_text_lower = ""
         self.in_orders = False
         self.is_done = False
 
         self.current_node = root
+
+        # Stop-gap to avoid runaway generations: close after expected_orders lines
+        self.expected_orders = max(expected_orders, 0)
+        self.emitted_orders = 0
 
         self.force_end_ids: list[int] | None = None
         self.force_end_pos: int = 0
@@ -111,6 +121,8 @@ class RequestState:
 class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
     START_TAG = "<orders>"
     END_TAG = "</orders>"
+    START_TAG_LOWER = START_TAG.lower()
+    END_TAG_LOWER = END_TAG.lower()
 
     # keep only the last N chars of decoded output (enough to catch tags)
     RECENT_TEXT_MAX_CHARS = 256
@@ -122,6 +134,12 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
         valid_moves_dict = sampling_params.extra_args.get("valid_moves_dict")
         if valid_moves_dict is None:
             return
+        # Tolerate legacy list-wrapped payloads (e.g., [ {unit: [moves]} ])
+        if isinstance(valid_moves_dict, list):
+            if valid_moves_dict and isinstance(valid_moves_dict[0], dict):
+                valid_moves_dict = valid_moves_dict[0]
+            else:
+                raise ValueError("valid_moves_dict must be a dict")
         if not isinstance(valid_moves_dict, dict):
             raise ValueError("valid_moves_dict must be a dict")
         for unit_key, moves in valid_moves_dict.items():
@@ -206,7 +224,19 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
                 self.req_states.pop(index, None)
                 continue
 
+            if isinstance(valid_moves_dict, list):
+                if valid_moves_dict and isinstance(valid_moves_dict[0], dict):
+                    valid_moves_dict = valid_moves_dict[0]
+                else:
+                    self.req_states.pop(index, None)
+                    continue
+
+            if not isinstance(valid_moves_dict, dict):
+                self.req_states.pop(index, None)
+                continue
+
             start_active = bool(params.extra_args.get("start_active", False))
+            expected_orders = len(valid_moves_dict)
 
             root = self._build_trie(valid_moves_dict)
             state = RequestState(
@@ -214,6 +244,7 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
                 output_token_ids=output_token_ids,
                 eos_token_id=int(self.eos_token_id),
                 newline_token_id=int(self.newline_token_id),
+                expected_orders=expected_orders,
             )
 
             if start_active:
@@ -231,27 +262,38 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
             if directionality == MoveDirectionality.SWAP and dst_state is not None:
                 self.req_states[src] = dst_state
 
-    # -------------------------
-    # Option A: text-based tags
-    # -------------------------
-
     def _append_recent_text(self, state: RequestState, piece: str) -> None:
         if not piece:
             return
         state.recent_text += piece
+        state.recent_text_lower += piece.lower()
         if len(state.recent_text) > self.RECENT_TEXT_MAX_CHARS:
             state.recent_text = state.recent_text[-self.RECENT_TEXT_MAX_CHARS :]
+            state.recent_text_lower = state.recent_text_lower[-self.RECENT_TEXT_MAX_CHARS :]
 
-    def _longest_suffix_prefix(self, text: str, target: str) -> int:
-        """
-        Returns the largest k such that text endswith(target[:k]).
-        """
-        max_k = min(len(text), len(target))
-        # check from longest to shortest (target is tiny, so this is fast)
+    def _longest_suffix_prefix_lower(self, text_lower: str, target_lower: str) -> int:
+        max_k = min(len(text_lower), len(target_lower))
         for k in range(max_k, 0, -1):
-            if text.endswith(target[:k]):
+            if text_lower.endswith(target_lower[:k]):
                 return k
         return 0
+
+    def _is_tag_boundary(self, text: str, tag_index: int) -> bool:
+        i = tag_index - 1
+        while i >= 0 and text[i] in (" ", "\t", "\r"):
+            i -= 1
+        if i < 0:
+            return True
+        prev_char = text[i]
+        return prev_char in {"\n", ">"}
+
+    def _restrict_logits_to_ids(self, logits_row: torch.Tensor, ids: set[int] | list[int]) -> None:
+        if not ids:
+            return
+        allowed = list(ids)
+        values = logits_row[allowed].clone()
+        logits_row.fill_(float("-inf"))
+        logits_row[allowed] = values
 
     def _decode_token(self, token_id: int) -> str:
         # decode one token; keep special tokens; avoid cleanup to preserve exact chars
@@ -304,18 +346,20 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
 
             # Detect entering orders (one-time)
             if not state.in_orders:
-                if self.START_TAG in state.recent_text:
+                start_idx = state.recent_text_lower.rfind(self.START_TAG_LOWER)
+                if start_idx != -1 and self._is_tag_boundary(state.recent_text, start_idx):
                     state.in_orders = True
                     state.current_node = state.root
 
                     # Optional: trim buffer to after the start tag to reduce accidental matches
                     # and make suffix-prefix checks less noisy.
-                    idx = state.recent_text.rfind(self.START_TAG)
-                    state.recent_text = state.recent_text[idx + len(self.START_TAG) :]
+                    trim_idx = start_idx + len(self.START_TAG)
+                    state.recent_text = state.recent_text[trim_idx:]
+                    state.recent_text_lower = state.recent_text_lower[trim_idx:]
                 continue
 
             # If already in orders, detect completion
-            if not state.is_done and self.END_TAG in state.recent_text:
+            if not state.is_done and state.recent_text_lower.rfind(self.END_TAG_LOWER) != -1:
                 state.is_done = True
                 continue
 
@@ -324,7 +368,7 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
 
             # If the decoded text ends with a partial prefix of END_TAG, force completion.
             # Example: recent_text endswith("</ord") => force "ers>" next.
-            k = self._longest_suffix_prefix(state.recent_text, self.END_TAG)
+            k = self._longest_suffix_prefix_lower(state.recent_text_lower, self.END_TAG_LOWER)
             if 0 < k < len(self.END_TAG):
                 remaining = self.END_TAG[k:]
                 force_ids = self.tokenizer.encode(remaining, add_special_tokens=False)
@@ -345,6 +389,7 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
             # If the token's decoded text contains a newline and we are at a move end,
             # reset trie for the next line.
             if "\n" in piece and state.current_node.is_end_of_move:
+                state.emitted_orders += 1
                 state.current_node = state.root
 
         state.last_processed_len = cur_len
@@ -357,7 +402,6 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
         if not self.req_states:
             return logits
 
-        vocab = logits.shape[1]
         for idx, state in self.req_states.items():
             if idx >= logits.shape[0]:
                 continue
@@ -371,14 +415,27 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
 
             # Finished </orders> => allow free generation
             if state.is_done:
+                self._restrict_logits_to_ids(logits[idx], [state.eos_token_id])
                 continue
+
+            # If we've emitted enough orders, force close tag
+            if (
+                state.force_end_ids is None
+                and state.expected_orders > 0
+                and state.emitted_orders >= state.expected_orders
+            ):
+                if self.end_tag_ids:
+                    state.force_end_ids = self.end_tag_ids
+                    state.force_end_pos = 0
+                else:
+                    # Fallback: only allow EOS
+                    self._restrict_logits_to_ids(logits[idx], [state.eos_token_id])
+                    continue
 
             # Forcing remainder of </orders>
             if state.force_end_ids is not None:
                 next_id = state.force_end_ids[state.force_end_pos]
-                mask = torch.full((vocab,), float("-inf"), device=logits.device)
-                mask[next_id] = 0.0
-                logits[idx] = logits[idx] + mask
+                self._restrict_logits_to_ids(logits[idx], [next_id])
                 continue
 
             # ACTIVE constraints via trie
@@ -404,8 +461,6 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
                 if self.end_tag_start_id is not None:
                     allowed.add(self.end_tag_start_id)
 
-            mask = torch.full((vocab,), float("-inf"), device=logits.device)
-            mask[list(allowed)] = 0.0
-            logits[idx] = logits[idx] + mask
+            self._restrict_logits_to_ids(logits[idx], allowed)
 
         return logits
