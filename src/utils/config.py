@@ -161,7 +161,7 @@ class ExperimentConfig(BaseModel):
     # =========================================================================
     total_steps: int = Field(default=10, description="Total number of training steps")
     num_groups_per_step: int = Field(
-        default=10,
+        default=16,
         description="Number of rollout groups per step (G in GRPO). I.e., how many different game states to start from",
     )
     samples_per_group: int = Field(
@@ -202,11 +202,26 @@ class ExperimentConfig(BaseModel):
             "but may affect strategic decision quality. A/B test recommended."
         ),
     )
+    show_board_context: bool = Field(
+        default=True,
+        description=(
+            "Include board context (supply centers, opponent positions, power rankings) when "
+            "show_valid_moves=False. Provides strategic awareness for decision making."
+        ),
+    )
     show_map_windows: bool = Field(
         default=True,
         description=(
             "Include compact per-unit map windows (adjacent tiles + nearby threats) when "
             "show_valid_moves=False. Adds a few tokens per unit to provide strategic context."
+        ),
+    )
+    show_action_counts: bool = Field(
+        default=True,
+        description=(
+            "Show action count and types per unit (e.g., '15 moves | move,support') when "
+            "show_valid_moves=False. Helps model understand action space size without listing all moves. "
+            "Adds ~10-15 tokens per unit."
         ),
     )
     compute_ref_logprobs_in_rollout: bool = Field(
