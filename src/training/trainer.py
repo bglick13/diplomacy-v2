@@ -59,6 +59,7 @@ def process_trajectories(
     trajectories: list[dict],
     tokenizer,
     min_group_size: int = 2,
+    verbose: bool = False,
 ) -> tuple[list[dict], TrajectoryStats]:
     """
     Takes raw rollouts and prepares tensors for the training loop.
@@ -81,6 +82,7 @@ def process_trajectories(
         tokenizer: HuggingFace tokenizer
         min_group_size: Minimum samples per group for valid advantage computation.
             Groups smaller than this are skipped (can't compute meaningful std).
+            Recommended: 3-4 for stable advantages (2 can have high variance).
 
     Returns:
         Tuple of (processed_batch, stats) where processed_batch is list of dicts
@@ -130,9 +132,10 @@ def process_trajectories(
         stats.group_reward_stds.append(float(std_r))
 
         # Handle edge case: all rewards identical (std=0)
-        # In this case, all advantages should be 0 (no signal)
+        # Skip groups with no variance - they provide no gradient signal
         if std_r < 1e-8:
-            std_r = 1.0  # Avoid division by zero, advantages will all be ~0
+            stats.skipped_single_sample_groups += 1  # Reuse counter for zero-variance groups
+            continue
 
         # Normalize Advantages within group
         for item in items:
@@ -159,6 +162,8 @@ def process_trajectories(
                 labels[:prompt_len] = -100
 
                 # Process reference logprobs if available
+                # IMPORTANT: Only use if ALL trajectories in the batch will have them
+                # Otherwise, the loss function will mix cached and computed ref logprobs
                 ref_logprobs = None
                 if completion_logprobs and len(completion_logprobs) == len(completion_token_ids):
                     # Sum completion logprobs to get sequence-level logprob
@@ -210,5 +215,18 @@ def process_trajectories(
     stats.avg_completion_tokens = (
         total_completion_tokens / len(processed_batch) if processed_batch else 0.0
     )
+
+    # Log warnings for edge cases
+    if verbose:
+        if stats.skipped_single_sample_groups > 0:
+            print(
+                f"⚠️ Skipped {stats.skipped_single_sample_groups} groups "
+                f"(too small or zero variance)"
+            )
+        if stats.fallback_tokenized_count > 0 and stats.pretokenized_count > 0:
+            print(
+                f"⚠️ Mixed tokenization: {stats.pretokenized_count} pre-tokenized, "
+                f"{stats.fallback_tokenized_count} fallback tokenized"
+            )
 
     return processed_batch, stats

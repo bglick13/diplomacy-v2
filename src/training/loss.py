@@ -104,7 +104,23 @@ class GRPOLoss:
 
         # 5. Reference LogProbs: Use cached or compute via forward pass
         # Check if ALL batch items have pre-computed reference logprobs
-        all_have_ref_logprobs = all("ref_logprobs" in b for b in batch)
+        # CRITICAL: Must be all-or-nothing to avoid mixing cached and computed logprobs
+        has_ref_logprobs = ["ref_logprobs" in b for b in batch]
+        all_have_ref_logprobs = all(has_ref_logprobs)
+        none_have_ref_logprobs = not any(has_ref_logprobs)
+
+        # Validate consistency
+        if not all_have_ref_logprobs and not none_have_ref_logprobs:
+            # Mixed batch - some have ref_logprobs, some don't
+            # This is a bug in trajectory processing
+            num_with = sum(has_ref_logprobs)
+            num_without = len(batch) - num_with
+            raise ValueError(
+                f"Inconsistent reference logprobs in batch: {num_with} items have ref_logprobs, "
+                f"{num_without} don't. This creates biased KL estimates. "
+                "All trajectories in a batch must have the same ref_logprobs availability."
+            )
+
         used_cached_ref = False
 
         if all_have_ref_logprobs:
