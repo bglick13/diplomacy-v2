@@ -3,17 +3,21 @@ Diplomacy Logits Processor for vLLM v1 Engine
 
 Fix: Option A (robust tag detection)
 - Detect <orders> and </orders> by incremental *text* matching (not token-id sequences),
-  which avoids BPE “boundary merge” bugs like ">\n" being a single token.
+  which avoids BPE "boundary merge" bugs like ">\n" being a single token.
 
-Also includes a practical improvement:
+Also includes practical improvements:
 - Trie includes both `move` and `move + "\n"` variants to tolerate BPE merges at line ends.
 - Newline handling uses decoded text (`"\n" in piece`) instead of relying solely on a
   single newline token id.
+- Prevents duplicate orders per unit: after each order is emitted, the trie is rebuilt
+  excluding moves for that unit.
 
 Notes:
 - Constraints begin on the first token *after* <orders> is detected.
 - When we see a partial "</orders>" suffix, we force-complete the remainder by
   encoding the remaining string and masking logits to that sequence.
+- Unit identifiers are extracted from completed moves (e.g., "A PAR - BUR" -> "A PAR")
+  and tracked to prevent reuse.
 """
 
 from __future__ import annotations
@@ -81,6 +85,10 @@ class RequestState:
         # end-tag forcing
         "force_end_ids",
         "force_end_pos",
+        # track used units
+        "valid_moves_dict",
+        "current_line_text",
+        "used_units",
     )
 
     def __init__(
@@ -91,6 +99,7 @@ class RequestState:
         eos_token_id: int,
         newline_token_id: int,
         expected_orders: int,
+        valid_moves_dict: dict[str, list[str]],
     ):
         self.root = root
         self.output_token_ids = output_token_ids
@@ -112,6 +121,11 @@ class RequestState:
         self.force_end_ids: list[int] | None = None
         self.force_end_pos: int = 0
 
+        # Track which units have been used
+        self.valid_moves_dict = valid_moves_dict
+        self.current_line_text = ""
+        self.used_units: set[str] = set()
+
 
 # -------------------------
 # Logits Processor
@@ -126,6 +140,14 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
 
     # keep only the last N chars of decoded output (enough to catch tags)
     RECENT_TEXT_MAX_CHARS = 256
+
+    @staticmethod
+    def _extract_unit_from_move(move: str) -> str | None:
+        """Extract unit identifier from a move string (e.g., 'A PAR - BUR' -> 'A PAR')"""
+        parts = move.strip().split()
+        if len(parts) >= 2:
+            return f"{parts[0]} {parts[1]}"
+        return None
 
     @classmethod
     def validate_params(cls, sampling_params: SamplingParams) -> None:
@@ -180,14 +202,25 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
     def is_argmax_invariant(self) -> bool:
         return False
 
-    def _build_trie(self, valid_moves_dict: dict[str, list[str]]) -> TokenTrieNode:
+    def _build_trie(
+        self, valid_moves_dict: dict[str, list[str]], exclude_units: set[str] | None = None
+    ) -> TokenTrieNode:
         """
         Build a trie over token ids for valid moves.
 
         Important: include `move + "\n"` to tolerate BPE merges like "BUR\n" as one token.
+
+        Args:
+            valid_moves_dict: Dictionary mapping unit identifiers to their valid moves
+            exclude_units: Set of unit identifiers to exclude from the trie
         """
         root = TokenTrieNode()
-        for moves in valid_moves_dict.values():
+        exclude = exclude_units or set()
+
+        for unit, moves in valid_moves_dict.items():
+            if unit in exclude:
+                continue
+
             for move in moves:
                 # Base move
                 ids = self.tokenizer.encode(move, add_special_tokens=False)
@@ -245,6 +278,7 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
                 eos_token_id=int(self.eos_token_id),
                 newline_token_id=int(self.newline_token_id),
                 expected_orders=expected_orders,
+                valid_moves_dict=valid_moves_dict,
             )
 
             if start_active:
@@ -350,6 +384,7 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
                 if start_idx != -1 and self._is_tag_boundary(state.recent_text, start_idx):
                     state.in_orders = True
                     state.current_node = state.root
+                    state.current_line_text = ""  # Reset line tracking
 
                     # Optional: trim buffer to after the start tag to reduce accidental matches
                     # and make suffix-prefix checks less noisy.
@@ -377,6 +412,10 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
                     state.force_end_pos = 0
                     continue
 
+            # Track current line text for unit extraction
+            if state.in_orders and not state.is_done:
+                state.current_line_text += piece
+
             # Maintain trie cursor using token ids (works with move+"\n" variants too)
             node = state.current_node
             nxt = node.children.get(tok)
@@ -387,10 +426,20 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
                 pass
 
             # If the token's decoded text contains a newline and we are at a move end,
-            # reset trie for the next line.
+            # extract the unit and rebuild the trie excluding it.
             if "\n" in piece and state.current_node.is_end_of_move:
                 state.emitted_orders += 1
+
+                # Extract unit from completed line and mark as used
+                unit = self._extract_unit_from_move(state.current_line_text)
+                if unit and unit in state.valid_moves_dict:
+                    state.used_units.add(unit)
+                    # Rebuild trie excluding used units
+                    state.root = self._build_trie(state.valid_moves_dict, state.used_units)
+
+                # Reset for next line
                 state.current_node = state.root
+                state.current_line_text = ""
 
         state.last_processed_len = cur_len
 
