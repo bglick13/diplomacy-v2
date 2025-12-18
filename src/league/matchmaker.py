@@ -238,7 +238,21 @@ class PFSPMatchmaker:
             if near_peers:
                 return random.choice(near_peers).name
 
-            # Fall back to self-play if no peers
+            # Fall back to self-play if no peers - warn as this may be unintentional
+            # This typically happens at training start when few checkpoints exist
+            if checkpoints:
+                # Other checkpoints exist but none are close enough in Elo
+                print(
+                    f"⚠️ Peer sampling: No agents within Elo range for {hero_agent} "
+                    f"(Elo {hero_elo:.0f}). Falling back to self-play. "
+                    f"Consider widening peer_elo_range or near_peer_elo_range."
+                )
+            else:
+                # No other checkpoints at all - expected at training start
+                print(
+                    f"ℹ️ Peer sampling: No other checkpoints yet for {hero_agent}. "
+                    "Using self-play (expected during early training)."
+                )
             return hero_agent
 
         if category == "exploitable":
