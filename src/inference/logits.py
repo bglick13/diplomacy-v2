@@ -143,11 +143,32 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
 
     @staticmethod
     def _extract_unit_from_move(move: str) -> str | None:
-        """Extract unit identifier from a move string (e.g., 'A PAR - BUR' -> 'A PAR')"""
+        """
+        Extract the ACTING unit identifier from a completed order string.
+
+        The acting unit is always at the start of the order (TYPE LOCATION).
+        This is correct for all Diplomacy order types:
+        - Movement: "A PAR - BUR" -> "A PAR" (Army Paris moves)
+        - Hold: "A PAR H" -> "A PAR" (Army Paris holds)
+        - Support: "A PAR S A MAR - GAL" -> "A PAR" (Army Paris supports, A MAR is supported)
+        - Convoy: "F NTH C A LON - BRE" -> "F NTH" (Fleet North Sea convoys)
+        - Retreat: "A PAR R BUR" -> "A PAR" (Army Paris retreats)
+        - Build: "A PAR B" -> "A PAR" (Build Army Paris)
+        - Disband: "A PAR D" -> "A PAR" (Disband Army Paris)
+        - Waive: "WAIVE" -> None (no unit for waive orders)
+
+        Returns:
+            Unit identifier string (e.g., "A PAR", "F LON") or None if invalid/WAIVE.
+        """
         parts = move.strip().split()
-        if len(parts) >= 2:
-            return f"{parts[0]} {parts[1]}"
-        return None
+        # Need at least unit type + location (e.g., "A PAR")
+        if len(parts) < 2:
+            return None  # WAIVE, malformed, or empty
+        # Validate unit type is a recognized type (Army or Fleet)
+        unit_type = parts[0].upper()
+        if unit_type not in ("A", "F"):
+            return None  # Not a valid unit order (e.g., WAIVE)
+        return f"{parts[0]} {parts[1]}"
 
     @classmethod
     def validate_params(cls, sampling_params: SamplingParams) -> None:
