@@ -143,6 +143,7 @@ class stopwatch:
     def __init__(self, name: str, metadata: dict | None = None):
         self.name = name
         self.start_time = 0.0
+        self.duration = 0.0
         self.metadata = metadata or {}
 
     def __enter__(self):
@@ -151,26 +152,65 @@ class stopwatch:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        duration = time.time() - self.start_time
+        self.duration = time.time() - self.start_time
         status = "error" if exc_type else "success"
 
         # Console Log
         if exc_type:
-            console_logger.error(f"❌ [FAIL] {self.name} ({duration:.2f}s)")
+            console_logger.error(f"❌ [FAIL] {self.name} ({self.duration:.2f}s)")
         else:
-            console_logger.info(f"✅ [DONE] {self.name} ({duration:.2f}s)")
+            console_logger.info(f"✅ [DONE] {self.name} ({self.duration:.2f}s)")
 
         # Axiom Log
         axiom.log(
             {
                 "event": EventType.SPAN_DURATION,
                 "span_name": self.name,
-                "duration_ms": int(duration * 1000),
+                "duration_ms": int(self.duration * 1000),
                 "status": status,
                 "error": str(exc_val) if exc_val else None,
                 **self.metadata,
             }
         )
+
+
+class tracked_timing:
+    """
+    Context manager to measure time and add it to a TimingBreakdown.
+
+    Usage:
+        timing = TimingBreakdown()
+        with tracked_timing(timing, "inference"):
+            # do inference work
+            pass
+        # timing.inference_s is now updated
+    """
+
+    def __init__(
+        self,
+        timing: "TimingBreakdown",
+        category: str,
+        log_name: str | None = None,
+        silent: bool = False,
+    ):
+        self.timing = timing
+        self.category = category
+        self.log_name = log_name or category
+        self.silent = silent
+        self.start_time = 0.0
+        self.duration = 0.0
+
+    def __enter__(self):
+        self.start_time = time.time()
+        if not self.silent:
+            logger.debug(f"⏱️ [START] {self.log_name}")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.duration = time.time() - self.start_time
+        self.timing.add(self.category, self.duration)
+        if not self.silent:
+            logger.debug(f"⏱️ [DONE] {self.log_name} ({self.duration:.3f}s)")
 
 
 class GPUStatsLogger:
@@ -684,6 +724,54 @@ def log_training_error(run_name: str, step: int, error: str):
 
 
 @dataclass
+class TimingBreakdown:
+    """
+    Tracks detailed timing breakdown for rollouts.
+
+    Categories are designed for waterfall chart visualization (mutually exclusive):
+    - inference: Time spent calling the LLM inference engine
+    - game_engine: Time spent processing moves in the diplomacy engine
+    - prompt_building: Time spent building prompts for the LLM
+    - ref_scoring: Time spent computing reference logprobs
+    - visualization: Time spent capturing/saving game visualizations
+    - forking: Time spent forking game state
+    - other: Uncategorized time (should be minimal)
+    """
+
+    inference_s: float = 0.0
+    game_engine_s: float = 0.0
+    prompt_building_s: float = 0.0
+    ref_scoring_s: float = 0.0
+    visualization_s: float = 0.0
+    forking_s: float = 0.0
+    other_s: float = 0.0
+
+    def add(self, category: str, duration: float):
+        """Add duration to a category."""
+        attr = f"{category}_s"
+        if hasattr(self, attr):
+            setattr(self, attr, getattr(self, attr) + duration)
+        else:
+            self.other_s += duration
+
+    def to_dict(self) -> dict[str, float]:
+        """Return as dict for JSON serialization."""
+        return {
+            "inference_s": self.inference_s,
+            "game_engine_s": self.game_engine_s,
+            "prompt_building_s": self.prompt_building_s,
+            "ref_scoring_s": self.ref_scoring_s,
+            "visualization_s": self.visualization_s,
+            "forking_s": self.forking_s,
+            "other_s": self.other_s,
+        }
+
+    def total(self) -> float:
+        """Total tracked time."""
+        return sum(self.to_dict().values())
+
+
+@dataclass
 class RolloutMetrics:
     """Accumulator for rollout-level metrics."""
 
@@ -698,6 +786,9 @@ class RolloutMetrics:
     empty_responses: int = 0
     partial_responses: int = 0
     invalid_orders: int = 0
+
+    # Detailed timing breakdown
+    timing: TimingBreakdown = field(default_factory=TimingBreakdown)
 
     def record_extraction(self, extracted: int, expected: int):
         """Record order extraction result."""
