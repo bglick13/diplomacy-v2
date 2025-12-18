@@ -522,6 +522,22 @@ def build_trajectories(
     win_bonus_awarded = 0
 
     for g_idx, game in enumerate(games):
+        # Check for missing or empty fork data - indicates collection failure
+        if g_idx not in fork_data:
+            print(
+                f"⚠️ Warning: Game index {g_idx} missing from fork_data. "
+                "This may indicate a rollout collection failure."
+            )
+            continue
+        if not fork_data[g_idx]:
+            print(
+                f"⚠️ Warning: Empty fork_data for game index {g_idx} (game_id={game_id}). "
+                "No trajectories will be generated for this fork. "
+                "Check if powers are correctly configured for data collection."
+            )
+            # Continue to calculate scores but will skip trajectory creation
+            # (the inner loops will naturally skip since fork_data[g_idx] is empty)
+
         final_scores = calculate_final_scores(
             game,
             win_bonus=cfg.win_bonus,
@@ -529,7 +545,7 @@ def build_trajectories(
         )
 
         # Track SC counts for hero power (if set) or all powers
-        for power in fork_data[g_idx].keys():
+        for power in fork_data.get(g_idx, {}).keys():
             if adapter_config.hero_power and power != adapter_config.hero_power:
                 continue
             n_sc = len(game.game.powers[power].centers)
@@ -541,7 +557,7 @@ def build_trajectories(
                 if n_sc == max(all_sc) and all_sc.count(n_sc) == 1:
                     win_bonus_awarded += 1
 
-        for power, data in fork_data[g_idx].items():
+        for power, data in fork_data.get(g_idx, {}).items():
             if power not in final_scores:
                 continue
 
