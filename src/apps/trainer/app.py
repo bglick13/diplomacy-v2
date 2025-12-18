@@ -1346,9 +1346,34 @@ def _save_and_register_adapter(
 
     adapter_rel_path = f"{cfg.run_name}/adapter_v{step}"
     adapter_full_path = MODELS_PATH / cfg.run_name / f"adapter_v{step}"
+
+    # Save adapter with verification to prevent corrupted league entries
     policy_model.save_pretrained(str(adapter_full_path))
+
+    # Verify critical adapter files were written before committing
+    # LoRA adapters should have at minimum: adapter_config.json and adapter_model.safetensors
+    required_files = ["adapter_config.json"]
+    safetensors_file = adapter_full_path / "adapter_model.safetensors"
+    bin_file = adapter_full_path / "adapter_model.bin"
+
+    for required_file in required_files:
+        file_path = adapter_full_path / required_file
+        if not file_path.exists():
+            raise RuntimeError(
+                f"Adapter save failed: {file_path} not found after save_pretrained(). "
+                "This would corrupt the league registry."
+            )
+
+    # Check that at least one model file exists (safetensors preferred, bin as fallback)
+    if not safetensors_file.exists() and not bin_file.exists():
+        raise RuntimeError(
+            f"Adapter save failed: neither {safetensors_file} nor {bin_file} found. "
+            "This would corrupt the league registry."
+        )
+
+    # Commit volume only after verification passes
     volume.commit()
-    logger.info(f"💾 Saved adapter to {adapter_full_path}")
+    logger.info(f"💾 Saved and verified adapter to {adapter_full_path}")
 
     if league_ctx:
         add_checkpoint_to_league(step, adapter_rel_path, cfg, league_ctx, evaluate_league_fn)
