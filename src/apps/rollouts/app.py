@@ -72,6 +72,22 @@ class AdapterConfig:
         if power_adapters is None:
             power_adapters = dict.fromkeys(POWERS, lora_name)
 
+        # Validate power_adapters completeness - missing powers would silently use base model
+        missing_powers = set(POWERS) - set(power_adapters.keys())
+        if missing_powers:
+            print(
+                f"⚠️ Warning: power_adapters missing {len(missing_powers)} powers: "
+                f"{sorted(missing_powers)}. These powers will use base model (no LoRA). "
+                "If this is intentional, explicitly set them to None or 'base_model'."
+            )
+            # Fill in missing powers with None to make behavior explicit
+            for power in missing_powers:
+                power_adapters[power] = None
+
+        # Validate hero_power if specified
+        if hero_power and hero_power not in POWERS:
+            raise ValueError(f"Invalid hero_power '{hero_power}'. Must be one of: {POWERS}")
+
         # Collect unique LoRA adapters that need to be loaded
         unique_loras = {
             adapter
