@@ -5,10 +5,16 @@ The registry is stored as a JSON file on the Modal Volume, enabling:
 - Checkpoint versioning and promotion
 - Elo rating tracking
 - Match history for WandB visualization
+
+File locking is used to prevent race conditions when multiple Modal containers
+access the registry concurrently.
 """
 
+import fcntl
 import json
 import logging
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +27,31 @@ from src.league.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Lock timeout in seconds
+LOCK_TIMEOUT_S = 30.0
+
+
+@contextmanager
+def file_lock(lock_path: Path, timeout: float = LOCK_TIMEOUT_S) -> Generator[None, None, None]:
+    """
+    Context manager for exclusive file locking.
+
+    Uses fcntl.flock() for blocking exclusive lock. The lock is released
+    when the context exits.
+
+    Args:
+        lock_path: Path to the lock file (will be created if doesn't exist)
+        timeout: Not currently used (flock blocks indefinitely), but kept for future
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 class LeagueRegistry:
@@ -44,20 +75,22 @@ class LeagueRegistry:
             run_name: Name of the training run (used for new registries)
         """
         self.path = Path(registry_path)
+        self._lock_path = self.path.parent / ".league.lock"
         self._agents: dict[str, AgentInfo] = {}
         self._history: list[MatchResult] = []
         self._metadata: LeagueMetadata | None = None
         self._run_name = run_name
 
-        # Load existing or create new
-        # Check if file exists AND has content (empty file = initialize)
-        if self.path.exists() and self.path.stat().st_size > 0:
-            self._load()
-        else:
-            self._initialize(run_name or "unknown-run")
+        # Load existing or create new (with lock to prevent races during init)
+        with file_lock(self._lock_path):
+            # Check if file exists AND has content (empty file = initialize)
+            if self.path.exists() and self.path.stat().st_size > 0:
+                self._load_unlocked()
+            else:
+                self._initialize_unlocked(run_name or "unknown-run")
 
-    def _initialize(self, run_name: str) -> None:
-        """Initialize a new registry with default baselines."""
+    def _initialize_unlocked(self, run_name: str) -> None:
+        """Initialize a new registry with default baselines (caller must hold lock)."""
         logger.info(f"Initializing new league registry for run: {run_name}")
 
         self._metadata = LeagueMetadata(run_name=run_name)
@@ -67,10 +100,10 @@ class LeagueRegistry:
             self._agents[baseline.name] = baseline
 
         self._history = []
-        self._save()
+        self._save_unlocked()
 
-    def _load(self) -> None:
-        """Load registry from JSON file."""
+    def _load_unlocked(self) -> None:
+        """Load registry from JSON file (caller must hold lock)."""
         logger.info(f"Loading league registry from {self.path}")
 
         with open(self.path) as f:
@@ -97,14 +130,17 @@ class LeagueRegistry:
         This is useful when other processes (e.g., evaluate_league) have updated
         the registry file and we want to refresh our in-memory state.
         """
-        if self.path.exists() and self.path.stat().st_size > 0:
-            self._load()
-            logger.debug(f"Reloaded league registry from {self.path}")
-        else:
-            logger.warning(f"Registry file {self.path} does not exist or is empty, skipping reload")
+        with file_lock(self._lock_path):
+            if self.path.exists() and self.path.stat().st_size > 0:
+                self._load_unlocked()
+                logger.debug(f"Reloaded league registry from {self.path}")
+            else:
+                logger.warning(
+                    f"Registry file {self.path} does not exist or is empty, skipping reload"
+                )
 
-    def _save(self) -> None:
-        """Save registry to JSON file."""
+    def _save_unlocked(self) -> None:
+        """Save registry to JSON file (caller must hold lock)."""
         # Ensure parent directory exists
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -160,37 +196,42 @@ class LeagueRegistry:
         Returns:
             The created AgentInfo
         """
-        if name in self._agents:
-            logger.warning(f"Checkpoint {name} already exists, skipping")
-            return self._agents[name]
+        with file_lock(self._lock_path):
+            # Reload to get latest state before modifying
+            if self.path.exists() and self.path.stat().st_size > 0:
+                self._load_unlocked()
 
-        # Inherit Elo from parent if not specified
-        if initial_elo is None:
-            if parent and parent in self._agents:
-                initial_elo = self._agents[parent].elo
-            else:
-                initial_elo = 1000.0
+            if name in self._agents:
+                logger.warning(f"Checkpoint {name} already exists, skipping")
+                return self._agents[name]
 
-        agent = AgentInfo.create_checkpoint(
-            name=name,
-            path=path,
-            step=step,
-            parent=parent,
-            elo=initial_elo,
-        )
-        self._agents[name] = agent
+            # Inherit Elo from parent if not specified
+            if initial_elo is None:
+                if parent and parent in self._agents:
+                    initial_elo = self._agents[parent].elo
+                else:
+                    initial_elo = 1000.0
 
-        # Update metadata
-        if self._metadata:
-            self._metadata.latest_step = max(self._metadata.latest_step, step)
-            if agent.elo > self._metadata.best_elo:
-                self._metadata.best_elo = agent.elo
-                self._metadata.best_agent = name
+            agent = AgentInfo.create_checkpoint(
+                name=name,
+                path=path,
+                step=step,
+                parent=parent,
+                elo=initial_elo,
+            )
+            self._agents[name] = agent
 
-        self._save()
-        logger.info(f"Added checkpoint {name} at step {step} with Elo {initial_elo:.0f}")
+            # Update metadata
+            if self._metadata:
+                self._metadata.latest_step = max(self._metadata.latest_step, step)
+                if agent.elo > self._metadata.best_elo:
+                    self._metadata.best_elo = agent.elo
+                    self._metadata.best_agent = name
 
-        return agent
+            self._save_unlocked()
+            logger.info(f"Added checkpoint {name} at step {step} with Elo {initial_elo:.0f}")
+
+            return agent
 
     def update_elo(self, name: str, new_elo: float, matches_delta: int = 1) -> None:
         """
@@ -201,20 +242,25 @@ class LeagueRegistry:
             new_elo: New Elo rating
             matches_delta: Number of matches to add to count
         """
-        if name not in self._agents:
-            logger.warning(f"Agent {name} not found, cannot update Elo")
-            return
+        with file_lock(self._lock_path):
+            # Reload to get latest state before modifying
+            if self.path.exists() and self.path.stat().st_size > 0:
+                self._load_unlocked()
 
-        agent = self._agents[name]
-        agent.elo = new_elo
-        agent.matches += matches_delta
+            if name not in self._agents:
+                logger.warning(f"Agent {name} not found, cannot update Elo")
+                return
 
-        # Update best agent tracking
-        if self._metadata and new_elo > self._metadata.best_elo:
-            self._metadata.best_elo = new_elo
-            self._metadata.best_agent = name
+            agent = self._agents[name]
+            agent.elo = new_elo
+            agent.matches += matches_delta
 
-        self._save()
+            # Update best agent tracking
+            if self._metadata and new_elo > self._metadata.best_elo:
+                self._metadata.best_elo = new_elo
+                self._metadata.best_agent = name
+
+            self._save_unlocked()
 
     def bulk_update_elos(self, elo_updates: dict[str, float]) -> None:
         """
@@ -223,19 +269,24 @@ class LeagueRegistry:
         Args:
             elo_updates: Mapping of agent name to new Elo
         """
-        for name, new_elo in elo_updates.items():
-            if name in self._agents:
-                self._agents[name].elo = new_elo
-                self._agents[name].matches += 1
+        with file_lock(self._lock_path):
+            # Reload to get latest state before modifying
+            if self.path.exists() and self.path.stat().st_size > 0:
+                self._load_unlocked()
 
-        # Update best agent tracking
-        if self._metadata:
             for name, new_elo in elo_updates.items():
-                if new_elo > self._metadata.best_elo:
-                    self._metadata.best_elo = new_elo
-                    self._metadata.best_agent = name
+                if name in self._agents:
+                    self._agents[name].elo = new_elo
+                    self._agents[name].matches += 1
 
-        self._save()
+            # Update best agent tracking
+            if self._metadata:
+                for name, new_elo in elo_updates.items():
+                    if new_elo > self._metadata.best_elo:
+                        self._metadata.best_elo = new_elo
+                        self._metadata.best_agent = name
+
+            self._save_unlocked()
 
     # -------------------------------------------------------------------------
     # Match History
@@ -262,7 +313,8 @@ class LeagueRegistry:
 
     def save_history(self) -> None:
         """Explicitly save (call after batch of add_match calls)."""
-        self._save()
+        with file_lock(self._lock_path):
+            self._save_unlocked()
 
     # -------------------------------------------------------------------------
     # Properties
