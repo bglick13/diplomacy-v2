@@ -381,9 +381,14 @@ async def run_warmup_phase(
     rollout_id: str,
     warmup_phases: int,
     vis: GameVisualizer | None = None,
+    step_timeout_s: float = 120.0,  # Per-step timeout to prevent hangs
 ) -> bool:
     """
     Run warmup phase to generate random initial state.
+
+    Args:
+        step_timeout_s: Timeout in seconds for each step. If inference hangs,
+                       the step will fail rather than blocking the entire rollout.
 
     Returns:
         True if warmup completed successfully, False if game ended early.
@@ -395,17 +400,27 @@ async def run_warmup_phase(
             logger.info("Game ended during warmup, discarding.")
             return False
 
-        all_orders, _ = await process_game_step(
-            game=game,
-            agent=agent,
-            adapter_config=adapter_config,
-            inference_engine_cls=inference_engine_cls,
-            cfg=cfg,
-            metrics=metrics,
-            rollout_id=rollout_id,
-            step_count=i + 1,
-            collect_fork_data=False,  # Don't collect during warmup
-        )
+        try:
+            all_orders, _ = await asyncio.wait_for(
+                process_game_step(
+                    game=game,
+                    agent=agent,
+                    adapter_config=adapter_config,
+                    inference_engine_cls=inference_engine_cls,
+                    cfg=cfg,
+                    metrics=metrics,
+                    rollout_id=rollout_id,
+                    step_count=i + 1,
+                    collect_fork_data=False,  # Don't collect during warmup
+                ),
+                timeout=step_timeout_s,
+            )
+        except TimeoutError:
+            logger.error(
+                f"❌ Warmup step {i + 1}/{warmup_phases} timed out after {step_timeout_s}s. "
+                "This may indicate an inference engine hang."
+            )
+            return False
 
         # Track game engine time
         engine_start = time.time()
