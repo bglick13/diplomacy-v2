@@ -69,6 +69,25 @@ class AdapterManager:
 
         return lora_req
 
+    async def load_adapters(self, lora_names: list[str]) -> dict[str, LoRARequest]:
+        """
+        Load multiple LoRA adapters concurrently.
+
+        Args:
+            lora_names: List of adapter names to load
+
+        Returns:
+            Dict mapping adapter name to LoRARequest
+        """
+        if not lora_names:
+            return {}
+
+        # Load all adapters concurrently
+        tasks = [self.load_adapter(name) for name in lora_names]
+        results = await asyncio.gather(*tasks)
+
+        return dict(zip(lora_names, results, strict=True))
+
     async def _wait_for_adapter(self, full_path: str, lora_name: str) -> None:
         """Wait for adapter to appear with retries."""
         max_retries = 5
@@ -415,6 +434,7 @@ class InferenceEngine:
         prompts: list[str],
         valid_moves: list[dict],
         lora_name: str | None = None,
+        lora_names: list[str | None] | None = None,
         temperature: float = 0.8,
         max_new_tokens: int = 256,
     ) -> list[GenerateBatchResponseItem]:
@@ -424,12 +444,18 @@ class InferenceEngine:
         Args:
             prompts: List of prompt strings
             valid_moves: List of valid moves dicts for each prompt
-            lora_name: Name of the LoRA adapter (relative to /data/models/)
+            lora_name: Single LoRA adapter for all prompts (legacy, for backwards compat)
+            lora_names: Per-prompt LoRA adapters (preferred for mixed-adapter batches)
             temperature: Sampling temperature
             max_new_tokens: Maximum tokens to generate
 
         Returns:
             List of generation responses with text, tokens, and logprobs
+
+        Note:
+            If both lora_name and lora_names are provided, lora_names takes precedence.
+            Use lora_names=["adapter1", None, "adapter2", ...] for mixed batches where
+            some prompts use base model (None) and others use specific adapters.
         """
         batch_size = len(prompts)
         request_start = time.time()
@@ -448,17 +474,43 @@ class InferenceEngine:
         )
 
         try:
-            # Load adapter if specified
+            # Determine per-prompt adapters
             adapter_start = time.time()
-            lora_req = None
-            if lora_name:
+
+            # Build per-prompt lora_reqs (type annotation needed for pyright)
+            per_prompt_lora_reqs: list[LoRARequest | None]
+
+            if lora_names is not None:
+                # Per-prompt adapters (new batched mode)
+                assert len(lora_names) == batch_size, (
+                    f"lora_names length ({len(lora_names)}) must match prompts ({batch_size})"
+                )
+                # Get unique non-None adapter names
+                unique_adapters = list({name for name in lora_names if name is not None})
+                # Load all unique adapters concurrently
+                adapter_map = await self.adapter_mgr.load_adapters(unique_adapters)
+                # Build per-prompt lora_reqs list
+                per_prompt_lora_reqs = [
+                    adapter_map.get(name) if name else None for name in lora_names
+                ]
+                # For logging, show unique adapters
+                lora_name_for_logging = f"mixed:{len(unique_adapters)}_adapters"
+            elif lora_name is not None:
+                # Single adapter for all prompts (legacy mode)
                 lora_req = await self.adapter_mgr.load_adapter(lora_name)
+                per_prompt_lora_reqs = [lora_req] * batch_size
+                lora_name_for_logging = lora_name
+            else:
+                # No adapters (base model only)
+                per_prompt_lora_reqs = [None] * batch_size
+                lora_name_for_logging = None
+
             timing["adapter_load_time_s"] = time.time() - adapter_start
 
             # Generate responses
             generation_start = time.time()
             responses = await self._generate_batch(
-                prompts, valid_moves, lora_req, temperature, max_new_tokens
+                prompts, valid_moves, per_prompt_lora_reqs, temperature, max_new_tokens
             )
             timing["generation_time_s"] = time.time() - generation_start
 
@@ -487,7 +539,7 @@ class InferenceEngine:
                 total_tokens,
                 tokens_per_second,
                 total_prompt_tokens,
-                lora_name,
+                lora_name_for_logging,
                 timing,
                 cache_hit_rate,
                 cache_queries,
@@ -518,19 +570,29 @@ class InferenceEngine:
         self,
         prompts: list[str],
         valid_moves: list[dict],
-        lora_req: LoRARequest | None,
+        lora_reqs: list[LoRARequest | None],
         temperature: float,
         max_new_tokens: int,
     ) -> list[GenerationResponse]:
-        """Generate responses for a batch of prompts concurrently."""
+        """Generate responses for a batch of prompts concurrently.
 
-        async def _generate_single(prompt: str, moves: dict) -> GenerationResponse:
-            """Generate for a single prompt."""
+        Args:
+            prompts: List of prompt strings
+            valid_moves: List of valid moves dicts for each prompt
+            lora_reqs: Per-prompt LoRA requests (None = use base model)
+            temperature: Sampling temperature
+            max_new_tokens: Maximum tokens to generate
+        """
+
+        async def _generate_single(
+            prompt: str, moves: dict, lora_req: LoRARequest | None
+        ) -> GenerationResponse:
+            """Generate for a single prompt with optional LoRA adapter."""
             request_id = str(uuid.uuid4())
             sampling_params = SamplingParams(  # type: ignore[call-arg, misc]
                 temperature=temperature,  # type: ignore[arg-type]
                 max_tokens=max_new_tokens,  # type: ignore[arg-type]
-                extra_args={"valid_moves_dict": valid_moves, "start_active": True},
+                extra_args={"valid_moves_dict": moves, "start_active": True},
                 stop=["</orders>", "</Orders>"],  # type: ignore[arg-type]
                 logprobs=1,  # type: ignore[arg-type]
             )
@@ -580,7 +642,10 @@ class InferenceEngine:
                 raise e
 
         return await asyncio.gather(
-            *[_generate_single(p, m) for p, m in zip(prompts, valid_moves, strict=True)]
+            *[
+                _generate_single(p, m, lr)
+                for p, m, lr in zip(prompts, valid_moves, lora_reqs, strict=True)
+            ]
         )
 
     def _log_generation_metrics(

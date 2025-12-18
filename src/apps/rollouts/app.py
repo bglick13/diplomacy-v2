@@ -178,18 +178,21 @@ def process_baseline_bot(
     )
 
 
-def group_powers_by_adapter(
+def collect_llm_powers(
     inputs: dict,
     power_adapters: dict[str, str | None],
     exclude_indices: set[int],
-) -> dict[str | None, list[tuple[int, str, dict]]]:
+) -> tuple[list[int], list[str], list[dict], list[str | None]]:
     """
-    Group LLM powers by their adapter for batched inference.
+    Collect all LLM powers (non-baseline) for batched inference.
 
     Returns:
-        Map of adapter -> list of (original_idx, prompt, valid_moves)
+        Tuple of (indices, prompts, valid_moves, lora_names)
     """
-    adapter_groups: dict[str | None, list[tuple[int, str, dict]]] = {}
+    indices: list[int] = []
+    prompts: list[str] = []
+    valid_moves: list[dict] = []
+    lora_names: list[str | None] = []
 
     for idx, power in enumerate(inputs["power_names"]):
         if idx in exclude_indices:
@@ -199,59 +202,56 @@ def group_powers_by_adapter(
         # Normalize: None and "base_model" both mean no LoRA
         adapter_key = None if adapter in (None, "base_model") else adapter
 
-        if adapter_key not in adapter_groups:
-            adapter_groups[adapter_key] = []
+        indices.append(idx)
+        prompts.append(inputs["prompts"][idx])
+        valid_moves.append(inputs["valid_moves"][idx])
+        lora_names.append(adapter_key)
 
-        adapter_groups[adapter_key].append(
-            (idx, inputs["prompts"][idx], inputs["valid_moves"][idx])
-        )
-
-    return adapter_groups
+    return indices, prompts, valid_moves, lora_names
 
 
 async def run_batched_inference(
     inference_engine_cls,
     base_model_id: str,
-    adapter_groups: dict[str | None, list[tuple[int, str, dict]]],
+    indices: list[int],
+    prompts: list[str],
+    valid_moves: list[dict],
+    lora_names: list[str | None],
     temperature: float,
     max_new_tokens: int,
     metrics: RolloutMetrics,
     stopwatch_prefix: str = "",
 ) -> dict[int, dict]:
     """
-    Run batched inference for all adapter groups.
+    Run batched inference for all powers in a single call.
+
+    Uses per-prompt LoRA adapters for efficient mixed-adapter batching,
+    reducing Modal round-trip overhead from O(adapters) to O(1) per phase.
 
     Returns:
         Map of original_idx -> response_data
     """
-    results: dict[int, dict] = {}
+    if not prompts:
+        return {}
 
-    for adapter_key, group_items in adapter_groups.items():
-        group_indices = [item[0] for item in group_items]
-        group_prompts = [item[1] for item in group_items]
-        group_valid_moves = [item[2] for item in group_items]
-        batch_size = len(group_prompts)
+    batch_size = len(prompts)
+    unique_adapters = len({name for name in lora_names if name is not None})
+    stopwatch_label = f"{stopwatch_prefix}Batch={batch_size}, Adapters={unique_adapters}"
 
-        stopwatch_label = f"{stopwatch_prefix}Adapter={adapter_key} (Batch: {batch_size})"
+    with stopwatch(stopwatch_label):
+        inference_start = time.time()
+        metrics.inference_calls += 1
+        responses = await inference_engine_cls(model_id=base_model_id).generate.remote.aio(
+            prompts=prompts,
+            valid_moves=valid_moves,
+            lora_names=lora_names,  # Per-prompt adapters
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+        )
+        metrics.timing.add("inference", time.time() - inference_start)
 
-        with stopwatch(stopwatch_label):
-            inference_start = time.time()
-            metrics.inference_calls += 1
-            responses = await inference_engine_cls(model_id=base_model_id).generate.remote.aio(
-                prompts=group_prompts,
-                valid_moves=group_valid_moves,
-                lora_name=adapter_key,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-            )
-            # Track inference time in metrics
-            metrics.timing.add("inference", time.time() - inference_start)
-
-        # Map responses back to original indices
-        for resp_idx, orig_idx in enumerate(group_indices):
-            results[orig_idx] = responses[resp_idx]
-
-    return results
+    # Map responses back to original indices
+    return dict(zip(indices, responses, strict=True))
 
 
 def log_and_record_orders(
@@ -308,19 +308,22 @@ async def process_game_step(
             result = process_baseline_bot(game, power, adapter, inputs["valid_moves"][idx])
             power_results[idx] = result
 
-    # 2. Group LLM powers by adapter for batched inference
-    adapter_groups = group_powers_by_adapter(
+    # 2. Collect LLM powers for batched inference (single call with per-prompt adapters)
+    indices, prompts, valid_moves_list, lora_names = collect_llm_powers(
         inputs,
         adapter_config.power_adapters,
         exclude_indices=set(power_results.keys()),
     )
 
-    # 3. Run batched inference
+    # 3. Run batched inference (single Modal call for all powers)
     stopwatch_prefix = f"Game Step {step_count} " if step_count else ""
     inference_results = await run_batched_inference(
         inference_engine_cls,
         cfg.base_model_id,
-        adapter_groups,
+        indices,
+        prompts,
+        valid_moves_list,
+        lora_names,
         cfg.temperature,
         cfg.max_new_tokens,
         metrics,
