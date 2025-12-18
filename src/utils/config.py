@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 from typing import TYPE_CHECKING, Any, Literal, get_args, get_origin
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 if TYPE_CHECKING:
     pass
@@ -273,6 +273,23 @@ class ExperimentConfig(BaseModel):
     def total_simulated_years(self) -> int:
         """Calculate total simulated years for the full training run."""
         return self.simulated_years_per_step * self.total_steps
+
+    @model_validator(mode="after")
+    def validate_pfsp_weights(self) -> ExperimentConfig:
+        """Validate that PFSP weights sum to 1.0."""
+        total = (
+            self.pfsp_self_play_weight
+            + self.pfsp_peer_weight
+            + self.pfsp_exploitable_weight
+            + self.pfsp_baseline_weight
+        )
+        if not (0.99 <= total <= 1.01):  # Allow small floating point tolerance
+            raise ValueError(
+                f"PFSP weights must sum to 1.0, got {total:.4f}. "
+                f"(self_play={self.pfsp_self_play_weight}, peer={self.pfsp_peer_weight}, "
+                f"exploitable={self.pfsp_exploitable_weight}, baseline={self.pfsp_baseline_weight})"
+            )
+        return self
 
 
 class EvalConfig(BaseModel):
