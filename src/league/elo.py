@@ -48,7 +48,7 @@ def calculate_actual_score(score_a: float, score_b: float) -> float:
 def update_elo_multiplayer(
     game_results: dict[str, float],
     elo_ratings: dict[str, float],
-    k: float = 32.0,
+    k: float = 48.0,
 ) -> dict[str, float]:
     """
     Update Elo ratings based on a multiplayer game result.
@@ -57,6 +57,9 @@ def update_elo_multiplayer(
     the expected and actual scores, then update both players' Elo.
     The K-factor is scaled by 1/(n-1) where n is the number of players
     to account for multiple pairwise comparisons.
+
+    Note: Default K=48 (vs standard K=32) gives stronger Elo signal for
+    7-player games where the scaled K would otherwise be only ~5 per pair.
 
     Args:
         game_results: Mapping of agent name to final score
