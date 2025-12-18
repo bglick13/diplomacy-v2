@@ -58,7 +58,7 @@ class ExperimentConfig(BaseModel):
     # Rollout/Environment Settings
     # =========================================================================
     rollout_horizon_years: int = Field(
-        default=5, description="Number of game years to simulate per rollout"
+        default=3, description="Number of game years to simulate per rollout"
     )
     rollout_visualize_chance: float = Field(
         default=0.0,
@@ -80,7 +80,7 @@ class ExperimentConfig(BaseModel):
         ),
     )
     winner_threshold_sc: int = Field(
-        default=7,
+        default=5,
         description="Minimum supply centers required to be eligible for win bonus",
     )
 

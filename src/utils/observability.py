@@ -486,10 +486,14 @@ def log_orders_extracted(
     # Truncate raw response for logging (first 200 chars)
     response_preview = raw_response[:200] if raw_response else ""
 
-    if orders_count == 0:
+    if orders_count == 0 and expected_count > 0:
         # CRITICAL: This is the bug we want to catch!
+        # Only warn if orders were expected but none were generated.
+        # During ADJUSTMENTS phase, expected_count == 0 is legitimate when
+        # a power has exactly as many units as supply centers (no builds/disbands needed).
         console_logger.warning(
             f"⚠️ ZERO ORDERS for {power_name} in {phase}! "
+            f"Expected {expected_count}, got 0. "
             f"Response ({raw_response_length} chars): {response_preview!r}"
         )
         axiom.log(
@@ -500,6 +504,19 @@ def log_orders_extracted(
                 "expected_count": expected_count,
                 "raw_response_length": raw_response_length,
                 "raw_response_preview": response_preview,
+                "phase": phase,
+            }
+        )
+    elif orders_count == 0 and expected_count == 0:
+        # Legitimate case: no orders needed (e.g., ADJUSTMENTS with units == supply centers)
+        axiom.log(
+            {
+                "event": EventType.ORDERS_EXTRACTED,
+                "rollout_id": rollout_id,
+                "power_name": power_name,
+                "orders_count": 0,
+                "expected_count": 0,
+                "status": "no_orders_needed",
                 "phase": phase,
             }
         )
