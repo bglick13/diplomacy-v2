@@ -35,7 +35,8 @@ BASELINE_BOTS = {
     "random_bot": RandomBot(),
     "chaos_bot": ChaosBot(),
 }
-CURRENT_ROLLOUT_LORA: str | None = None
+# Removed CURRENT_ROLLOUT_LORA global - unreliable across container restarts.
+# Instead, just check if adapter files exist on disk before each rollout.
 
 
 # ============================================================================
@@ -115,12 +116,10 @@ def ensure_adapters_loaded(adapter_config: AdapterConfig) -> float:
         return 0.0
 
     logger.info(f"📂 Using LoRA adapters: {adapter_config.unique_loras}")
-    global CURRENT_ROLLOUT_LORA
 
-    # Check if we need to reload (any new adapter not seen before)
+    # Check if we need to reload (any adapter file missing from disk)
     needs_reload = any(
-        adapter != CURRENT_ROLLOUT_LORA and not os.path.exists(f"/data/models/{adapter}")
-        for adapter in adapter_config.unique_loras
+        not os.path.exists(f"/data/models/{adapter}") for adapter in adapter_config.unique_loras
     )
 
     reload_time = 0.0
@@ -130,7 +129,7 @@ def ensure_adapters_loaded(adapter_config: AdapterConfig) -> float:
         reload_time = time.time() - reload_start
         logger.info(f"⏱️ Volume reload took {reload_time:.2f}s")
 
-    # Verify all adapters exist
+    # Verify all adapters exist after reload
     for adapter in adapter_config.unique_loras:
         full_path = f"/data/models/{adapter}"
         if os.path.exists(full_path):
@@ -138,10 +137,6 @@ def ensure_adapters_loaded(adapter_config: AdapterConfig) -> float:
             logger.info(f"✅ LoRA adapter found at {full_path}. Files: {files}")
         else:
             logger.error(f"❌ LoRA adapter NOT found at: {full_path}")
-
-    # Track the "main" adapter (for backwards compat)
-    if adapter_config.unique_loras:
-        CURRENT_ROLLOUT_LORA = next(iter(adapter_config.unique_loras))
 
     return reload_time
 
