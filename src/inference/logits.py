@@ -527,9 +527,22 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
 
             # Safety escape if dead end
             if not allowed:
-                allowed.add(state.eos_token_id)
-                if self.end_tag_start_id is not None:
-                    allowed.add(self.end_tag_start_id)
+                # Check if we're mid-order (partial order in progress)
+                is_mid_order = bool(state.current_line_text.strip())
+
+                if is_mid_order:
+                    # Mid-order dead end: allow ONLY newline to reset and try next order
+                    # This prevents incomplete orders from being submitted.
+                    # Also reset state to allow fresh start on next order.
+                    allowed.add(state.newline_token_id)
+                    # Reset trie cursor to root so next token has valid options
+                    state.current_node = state.root
+                    state.current_line_text = ""
+                else:
+                    # At order boundary: allow clean termination
+                    allowed.add(state.eos_token_id)
+                    if self.end_tag_start_id is not None:
+                        allowed.add(self.end_tag_start_id)
 
             self._restrict_logits_to_ids(logits[idx], allowed)
 
