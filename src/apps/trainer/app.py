@@ -1335,6 +1335,8 @@ def _run_training_step(
     accum_loss = 0.0
     accum_kl = 0.0
     num_chunks = 0
+    # Use ceiling division to correctly count partial chunks at the end
+    total_chunks = (len(batch_data) + cfg.chunk_size - 1) // cfg.chunk_size
 
     for i in range(0, len(batch_data), cfg.chunk_size):
         chunk = batch_data[i : i + cfg.chunk_size]
@@ -1344,7 +1346,7 @@ def _run_training_step(
         with profile_section(step_profile, "loss_forward"):
             loss_output = loss_fn.compute_loss(chunk)
 
-        scaled_loss = loss_output.loss / max(1, len(batch_data) // cfg.chunk_size)
+        scaled_loss = loss_output.loss / max(1, total_chunks)
 
         with profile_section(step_profile, "backward"):
             scaled_loss.backward()
