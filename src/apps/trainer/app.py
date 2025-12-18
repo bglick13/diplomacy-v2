@@ -754,6 +754,8 @@ def build_wandb_metrics(
         "benchmark/trajectories": step_metrics["processed_trajectories"],
         "benchmark/grad_norm": step_metrics["grad_norm"],
         "benchmark/pipeline_overlap_s": step_metrics["pipeline_overlap_s"],
+        # True if ref logprobs came from rollouts, False if computed in trainer
+        "benchmark/used_cached_ref_logprobs": step_metrics.get("used_cached_ref_logprobs", False),
         # Rollout timing
         "rollout/max_volume_reload_s": step_metrics["max_volume_reload_s"],
         "rollout/max_total_s": step_metrics["max_rollout_total_s"],
@@ -1170,6 +1172,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     "loss": train_metrics["loss"],
                     "kl": train_metrics["kl"],
                     "grad_norm": train_metrics["grad_norm"],
+                    "used_cached_ref_logprobs": train_metrics["used_cached_ref_logprobs"],
                     "reward_mean": traj_stats.reward_mean,
                     "reward_std": traj_stats.reward_std,
                     "total_tokens": traj_stats.total_tokens,
@@ -1395,6 +1398,7 @@ def _run_training_step(
     accum_loss = 0.0
     accum_kl = 0.0
     num_chunks = 0
+    used_cached_ref = False  # Track if ref logprobs came from rollouts vs computed here
     # Use ceiling division to correctly count partial chunks at the end
     total_chunks = (len(batch_data) + cfg.chunk_size - 1) // cfg.chunk_size
 
@@ -1414,6 +1418,9 @@ def _run_training_step(
         accum_loss += loss_output.loss.item()
         accum_kl += loss_output.kl
         num_chunks += 1
+        # Track if any chunk used cached ref logprobs (should be all or none)
+        if loss_output.used_cached_ref_logprobs:
+            used_cached_ref = True
 
     with profile_section(step_profile, "optimizer_step"):
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1429,6 +1436,7 @@ def _run_training_step(
         "loss": accum_loss / max(1, num_chunks),
         "kl": accum_kl / max(1, num_chunks),
         "grad_norm": grad_norm,
+        "used_cached_ref_logprobs": used_cached_ref,
     }
 
 

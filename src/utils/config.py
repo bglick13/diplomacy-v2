@@ -235,10 +235,12 @@ class ExperimentConfig(BaseModel):
         ),
     )
     compute_ref_logprobs_in_rollout: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Compute reference (base model) logprobs during rollouts. "
-            "Adds inference latency but eliminates reference forward pass in trainer (~50% speedup)."
+            "If True: Rollouts slower, training faster (no ref forward pass). "
+            "If False: Rollouts faster, training does ref forward pass. "
+            "Default False is optimal when rollouts are the bottleneck (trainer data-starved)."
         ),
     )
 
