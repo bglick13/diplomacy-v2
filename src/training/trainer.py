@@ -229,4 +229,23 @@ def process_trajectories(
                 f"{stats.fallback_tokenized_count} fallback tokenized"
             )
 
+    # PRE-VALIDATION: Check for mixed ref_logprobs consistency
+    # This catches the issue early, before the batch reaches the loss function.
+    # Mixed batches (some with ref_logprobs, some without) create biased KL estimates.
+    if processed_batch:
+        has_ref = sum(1 for item in processed_batch if "ref_logprobs" in item)
+        has_no_ref = len(processed_batch) - has_ref
+
+        if has_ref > 0 and has_no_ref > 0:
+            # Mixed batch detected - strip ref_logprobs to force consistent behavior
+            # This ensures all items use the reference forward pass instead of
+            # mixing cached and computed ref logprobs (which would bias KL estimates).
+            if verbose:
+                print(
+                    f"⚠️ Mixed ref_logprobs in batch: {has_ref} with, {has_no_ref} without. "
+                    "Stripping all ref_logprobs for consistency."
+                )
+            for item in processed_batch:
+                item.pop("ref_logprobs", None)
+
     return processed_batch, stats
