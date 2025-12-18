@@ -389,6 +389,9 @@ class RolloutManager:
     Enforces max_concurrent_containers to avoid hitting Modal's hard limits.
     """
 
+    # Maximum number of times to retry a failed rollout before giving up
+    MAX_ROLLOUT_RETRIES = 2
+
     def __init__(
         self,
         cfg: ExperimentConfig,
@@ -400,6 +403,8 @@ class RolloutManager:
         self.league_ctx = league_ctx
         self.buffer: deque[tuple[Any, str | None, Any]] = deque()
         self.max_containers = cfg.max_concurrent_containers
+        # Track retry counts by handle id to limit retries
+        self._retry_counts: dict[int, int] = {}
 
     @property
     def containers_in_flight(self) -> int:
@@ -575,6 +580,8 @@ class RolloutManager:
                         handle=handle,
                     )
                 )
+                # Clean up retry tracking on success
+                self._retry_counts.pop(id(handle), None)
 
             except TimeoutError:
                 self.buffer.append((handle, adapter_used, match_result))
@@ -590,9 +597,28 @@ class RolloutManager:
                     self.buffer.append((handle, adapter_used, match_result))
                     polls_without_progress += 1
                 else:
-                    failed_count += 1
+                    # Check retry count for this handle
+                    handle_id = id(handle)
+                    retry_count = self._retry_counts.get(handle_id, 0)
+
+                    if retry_count < self.MAX_ROLLOUT_RETRIES:
+                        # Re-queue for retry
+                        self._retry_counts[handle_id] = retry_count + 1
+                        self.buffer.append((handle, adapter_used, match_result))
+                        logger.warning(
+                            f"⚠️ Rollout failed (retry {retry_count + 1}/{self.MAX_ROLLOUT_RETRIES}): "
+                            f"{type(e).__name__}: {e}"
+                        )
+                    else:
+                        # Max retries exceeded, permanently fail
+                        failed_count += 1
+                        # Clean up retry tracking
+                        self._retry_counts.pop(handle_id, None)
+                        logger.error(
+                            f"❌ Rollout failed after {self.MAX_ROLLOUT_RETRIES} retries: "
+                            f"{type(e).__name__}: {e}"
+                        )
                     polls_without_progress = 0
-                    logger.warning(f"⚠️ Rollout failed (skipping): {type(e).__name__}: {e}")
 
         return collected, {
             "max_volume_reload_s": max_volume_reload_s,
