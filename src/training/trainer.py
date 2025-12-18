@@ -33,6 +33,19 @@ class TrajectoryStats:
     pretokenized_count: int = 0
     fallback_tokenized_count: int = 0
 
+    # Advantage statistics (after normalization)
+    advantage_mean: float = 0.0
+    advantage_std: float = 0.0
+    advantage_min: float = 0.0
+    advantage_max: float = 0.0
+    advantages_clipped: int = 0  # Count of advantages that were clipped
+
+    # Skip diagnostics
+    skipped_zero_variance_groups: int = 0  # Groups skipped due to low variance
+    total_samples_skipped: int = 0  # Total samples lost due to all skipping
+    effective_batch_size: int = 0  # Final batch size after all skipping
+    skip_rate: float = 0.0  # Fraction of input trajectories skipped
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for logging."""
         return {
@@ -52,6 +65,17 @@ class TrajectoryStats:
             "avg_completion_tokens": self.avg_completion_tokens,
             "pretokenized_count": self.pretokenized_count,
             "fallback_tokenized_count": self.fallback_tokenized_count,
+            # Advantage statistics
+            "advantage_mean": self.advantage_mean,
+            "advantage_std": self.advantage_std,
+            "advantage_min": self.advantage_min,
+            "advantage_max": self.advantage_max,
+            "advantages_clipped": self.advantages_clipped,
+            # Skip diagnostics
+            "skipped_zero_variance_groups": self.skipped_zero_variance_groups,
+            "total_samples_skipped": self.total_samples_skipped,
+            "effective_batch_size": self.effective_batch_size,
+            "skip_rate": self.skip_rate,
         }
 
 
@@ -60,6 +84,8 @@ def process_trajectories(
     tokenizer,
     min_group_size: int = 2,
     verbose: bool = False,
+    advantage_clip: float | None = None,
+    advantage_min_std: float = 1e-8,
 ) -> tuple[list[dict], TrajectoryStats]:
     """
     Takes raw rollouts and prepares tensors for the training loop.
@@ -83,6 +109,10 @@ def process_trajectories(
         min_group_size: Minimum samples per group for valid advantage computation.
             Groups smaller than this are skipped (can't compute meaningful std).
             Recommended: 3-4 for stable advantages (2 can have high variance).
+        advantage_clip: If set, clip advantages to [-clip, +clip] to prevent
+            extreme gradients from outliers.
+        advantage_min_std: Minimum std for advantage normalization. Groups with
+            std below this are skipped as they provide no gradient signal.
 
     Returns:
         Tuple of (processed_batch, stats) where processed_batch is list of dicts
@@ -110,6 +140,8 @@ def process_trajectories(
 
     processed_batch = []
     total_completion_tokens = 0
+    all_advantages: list[float] = []  # Track all advantages for stats
+    input_trajectory_count = len(trajectories)  # For skip rate calculation
 
     for group_id, items in groups.items():
         # Skip empty groups (shouldn't happen but defensive)
@@ -131,15 +163,24 @@ def process_trajectories(
 
         stats.group_reward_stds.append(float(std_r))
 
-        # Handle edge case: all rewards identical (std=0)
-        # Skip groups with no variance - they provide no gradient signal
-        if std_r < 1e-8:
-            stats.skipped_single_sample_groups += 1  # Reuse counter for zero-variance groups
+        # Handle edge case: all rewards identical or near-identical (low std)
+        # Skip groups with low variance - they provide no gradient signal
+        if std_r < advantage_min_std:
+            stats.skipped_zero_variance_groups += 1
             continue
 
         # Normalize Advantages within group
         for item in items:
             advantage = (item["reward"] - mean_r) / std_r
+
+            # Clip advantages if configured (prevents extreme gradients from outliers)
+            if advantage_clip is not None:
+                clipped_advantage = max(-advantage_clip, min(advantage_clip, advantage))
+                if clipped_advantage != advantage:
+                    stats.advantages_clipped += 1
+                advantage = clipped_advantage
+
+            all_advantages.append(advantage)
 
             # Check if pre-tokenized data is available
             prompt_token_ids = item.get("prompt_token_ids", [])
@@ -216,12 +257,32 @@ def process_trajectories(
         total_completion_tokens / len(processed_batch) if processed_batch else 0.0
     )
 
+    # Compute advantage statistics
+    if all_advantages:
+        adv_array = np.array(all_advantages)
+        stats.advantage_mean = float(adv_array.mean())
+        stats.advantage_std = float(adv_array.std())
+        stats.advantage_min = float(adv_array.min())
+        stats.advantage_max = float(adv_array.max())
+
+    # Compute skip diagnostics
+    stats.effective_batch_size = len(processed_batch)
+    stats.total_samples_skipped = input_trajectory_count - len(processed_batch)
+    stats.skip_rate = (
+        stats.total_samples_skipped / input_trajectory_count if input_trajectory_count > 0 else 0.0
+    )
+
     # Log warnings for edge cases
     if verbose:
         if stats.skipped_single_sample_groups > 0:
             print(
                 f"⚠️ Skipped {stats.skipped_single_sample_groups} groups "
-                f"(too small or zero variance)"
+                f"(fewer than {min_group_size} samples)"
+            )
+        if stats.skipped_zero_variance_groups > 0:
+            print(
+                f"⚠️ Skipped {stats.skipped_zero_variance_groups} groups "
+                f"(std < {advantage_min_std}, no gradient signal)"
             )
         if stats.fallback_tokenized_count > 0 and stats.pretokenized_count > 0:
             print(

@@ -10,12 +10,109 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class KLControllerConfig:
+    """Configuration for adaptive KL penalty controller."""
+
+    initial_beta: float = 0.04  # Starting KL penalty coefficient
+    warmup_steps: int = 0  # Steps to linearly warmup beta from 0
+    target_kl: float | None = None  # Target KL for adaptive control (None = disabled)
+    horizon: int = 10  # Steps to smooth KL for adaptive control
+    beta_min: float = 0.001  # Minimum beta when using adaptive control
+    beta_max: float = 0.5  # Maximum beta when using adaptive control
+
+
+class AdaptiveKLController:
+    """
+    Manages KL penalty coefficient (beta) with warmup and adaptive adjustment.
+
+    Features:
+    1. Linear warmup: beta starts at 0 and increases to initial_beta over warmup_steps
+    2. Adaptive control (optional): PPO-style adjustment based on observed KL
+       - If KL > 1.5 * target: increase beta by 1.5x
+       - If KL < 0.5 * target: decrease beta by 1.5x
+    3. Exponential moving average (EMA) of KL for stability
+    """
+
+    def __init__(self, config: KLControllerConfig):
+        self.config = config
+        self.current_step = 0
+        self._beta = config.initial_beta
+        self._kl_ema: float | None = None  # Exponential moving average of KL
+
+    def get_beta(self) -> float:
+        """
+        Get the current effective beta value.
+
+        During warmup, this linearly interpolates from 0 to initial_beta.
+        After warmup, returns the current (possibly adapted) beta.
+        """
+        if self.current_step < self.config.warmup_steps:
+            # Linear warmup from 0 to initial_beta
+            warmup_fraction = self.current_step / self.config.warmup_steps
+            return self.config.initial_beta * warmup_fraction
+        return self._beta
+
+    def get_warmup_progress(self) -> float:
+        """Returns warmup progress as a fraction [0, 1]."""
+        if self.config.warmup_steps == 0:
+            return 1.0
+        return min(1.0, self.current_step / self.config.warmup_steps)
+
+    def get_kl_ema(self) -> float | None:
+        """Returns the current KL EMA value."""
+        return self._kl_ema
+
+    def step_update(self, observed_kl: float) -> dict[str, float]:
+        """
+        Update controller state after a training step.
+
+        Args:
+            observed_kl: The KL divergence observed in this step.
+
+        Returns:
+            Dict with diagnostic info for logging:
+            - 'beta': current beta value
+            - 'warmup_progress': fraction of warmup complete
+            - 'kl_ema': exponential moving average of KL
+            - 'beta_adjusted': 1 if beta was adjusted this step, else 0
+        """
+        self.current_step += 1
+        beta_adjusted = 0
+
+        # Update KL EMA
+        alpha = 2.0 / (self.config.horizon + 1)  # EMA smoothing factor
+        if self._kl_ema is None:
+            self._kl_ema = observed_kl
+        else:
+            self._kl_ema = alpha * observed_kl + (1 - alpha) * self._kl_ema
+
+        # Adaptive control (only after warmup and if target is set)
+        if self.config.target_kl is not None and self.current_step >= self.config.warmup_steps:
+            # PPO-style adaptive beta adjustment
+            if self._kl_ema > 1.5 * self.config.target_kl:
+                # KL too high - increase penalty
+                self._beta = min(self._beta * 1.5, self.config.beta_max)
+                beta_adjusted = 1
+            elif self._kl_ema < 0.5 * self.config.target_kl:
+                # KL too low - decrease penalty
+                self._beta = max(self._beta / 1.5, self.config.beta_min)
+                beta_adjusted = -1
+
+        return {
+            "beta": self.get_beta(),
+            "warmup_progress": self.get_warmup_progress(),
+            "kl_ema": self._kl_ema,
+            "beta_adjusted": float(beta_adjusted),
+        }
+
+
+@dataclass
 class GRPOLossOutput:
     """Structured output from GRPO loss computation for better observability."""
 
     loss: torch.Tensor
     pg_loss: float
-    kl: float
+    kl: float  # Alias for kl_mean for backwards compatibility
 
     # Additional metrics for logging
     mean_completion_logprob: float
@@ -23,6 +120,13 @@ class GRPOLossOutput:
     mean_advantage: float
     advantage_std: float
     num_tokens: int
+
+    # KL statistics (per-batch)
+    kl_mean: float = 0.0
+    kl_max: float = 0.0
+    kl_min: float = 0.0
+    kl_std: float = 0.0
+    effective_beta: float = 0.04  # The beta value actually used for this batch
 
     # Optimization tracking
     used_cached_ref_logprobs: bool = False
@@ -41,17 +145,26 @@ class GRPOLoss:
     reference forward pass entirely. This saves ~50% of compute.
     """
 
-    def __init__(self, model: "PeftModel", beta: float = 0.04, epsilon: float = 1e-4):
+    def __init__(
+        self,
+        model: "PeftModel",
+        beta: float = 0.04,
+        epsilon: float = 1e-4,
+        kl_controller: AdaptiveKLController | None = None,
+    ):
         """
         Args:
             model: A PeftModel (LoRA-wrapped model). Reference logprobs are computed
                    by disabling the adapter temporarily, unless pre-computed.
-            beta: KL penalty coefficient.
+            beta: KL penalty coefficient (used when kl_controller is None).
             epsilon: Small constant for numerical stability.
+            kl_controller: Optional adaptive KL controller. If provided, its get_beta()
+                value is used instead of the fixed beta parameter.
         """
         self.model = model
         self.beta = beta
         self.epsilon = epsilon
+        self.kl_controller = kl_controller
 
     def compute_loss(self, batch: list[dict]) -> GRPOLossOutput:
         """
@@ -149,19 +262,34 @@ class GRPOLoss:
         log_ratio = completion_log_probs - ref_completion_log_probs
         kl = torch.exp(log_ratio) - 1 - log_ratio
 
+        # Compute KL statistics for diagnostics
+        kl_mean = kl.mean().item()
+        kl_max = kl.max().item()
+        kl_min = kl.min().item()
+        kl_std = kl.std().item() if len(kl) > 1 else 0.0
+
         # 7. GRPO Loss = -Advantage * LogProb + Beta * KL
+        # Use adaptive beta from controller if available, otherwise fall back to fixed beta
+        effective_beta = (
+            self.kl_controller.get_beta() if self.kl_controller is not None else self.beta
+        )
         # advantages are already normalized by the trainer
         pg_loss = -(advantages.detach() * completion_log_probs)
-        total_loss = pg_loss + (self.beta * kl)
+        total_loss = pg_loss + (effective_beta * kl)
 
         return GRPOLossOutput(
             loss=total_loss.mean(),
             pg_loss=pg_loss.mean().item(),
-            kl=kl.mean().item(),
+            kl=kl_mean,  # Keep for backwards compatibility
             mean_completion_logprob=completion_log_probs.mean().item(),
             mean_ref_logprob=ref_completion_log_probs.mean().item(),
             mean_advantage=advantages.mean().item(),
             advantage_std=advantages.std().item() if len(advantages) > 1 else 0.0,
             num_tokens=int(num_completion_tokens),
+            kl_mean=kl_mean,
+            kl_max=kl_max,
+            kl_min=kl_min,
+            kl_std=kl_std,
+            effective_beta=effective_beta,
             used_cached_ref_logprobs=used_cached_ref,
         )

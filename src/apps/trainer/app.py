@@ -21,8 +21,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.apps.common.images import gpu_image
 from src.apps.common.volumes import MODELS_PATH, TRACE_PATH, VOLUME_PATH, trace_volume, volume
-from src.training.loss import GRPOLoss
-from src.training.trainer import process_trajectories
+from src.training.loss import AdaptiveKLController, GRPOLoss, KLControllerConfig
+from src.training.trainer import TrajectoryStats, process_trajectories
 from src.utils.config import ExperimentConfig
 from src.utils.observability import GPUStatsLogger, axiom, logger, stopwatch
 
@@ -734,7 +734,7 @@ def build_wandb_metrics(
     step_metrics: dict[str, Any],
     extraction_stats: ExtractionStats,
     game_stats: GameStats,
-    traj_stats: Any,
+    traj_stats: TrajectoryStats,
     cache_stats: dict | None,
     league_ctx: LeagueContext | None,
     match_results: list[Any],
@@ -787,6 +787,27 @@ def build_wandb_metrics(
         "power_law/cumulative_simulated_years": cumulative_sim_years,
         "power_law/simulated_years_per_step": sim_years_per_step,
         "power_law/reward_at_compute": traj_stats.reward_mean,
+        # KL diagnostics
+        "kl/mean": step_metrics.get("kl", 0.0),
+        "kl/max": step_metrics.get("kl_max", 0.0),
+        "kl/min": step_metrics.get("kl_min", 0.0),
+        "kl/std": step_metrics.get("kl_std", 0.0),
+        "kl/beta": step_metrics.get("effective_beta", 0.04),
+        "kl/warmup_progress": step_metrics.get("kl_ctrl_warmup_progress", 1.0),
+        "kl/ema": step_metrics.get("kl_ctrl_kl_ema", step_metrics.get("kl", 0.0)),
+        "kl/beta_adjusted": step_metrics.get("kl_ctrl_beta_adjusted", 0.0),
+        # Advantage diagnostics
+        "advantage/mean": traj_stats.advantage_mean,
+        "advantage/std": traj_stats.advantage_std,
+        "advantage/min": traj_stats.advantage_min,
+        "advantage/max": traj_stats.advantage_max,
+        "advantage/clipped_count": traj_stats.advantages_clipped,
+        # Skip/processing diagnostics
+        "processing/skip_rate": traj_stats.skip_rate,
+        "processing/skipped_single_sample": traj_stats.skipped_single_sample_groups,
+        "processing/skipped_zero_variance": traj_stats.skipped_zero_variance_groups,
+        "processing/effective_batch_size": traj_stats.effective_batch_size,
+        "processing/total_samples_skipped": traj_stats.total_samples_skipped,
     }
 
     # Add cache metrics
@@ -860,8 +881,8 @@ def _add_league_metrics(metrics: dict, league_ctx: LeagueContext, match_results:
 
 def initialize_model_and_optimizer(
     cfg: ExperimentConfig,
-) -> tuple[Any, Any, AutoTokenizer, GRPOLoss]:
-    """Initialize model, optimizer, tokenizer, and loss function."""
+) -> tuple[Any, Any, AutoTokenizer, GRPOLoss, AdaptiveKLController | None]:
+    """Initialize model, optimizer, tokenizer, loss function, and optional KL controller."""
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_id)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -885,9 +906,31 @@ def initialize_model_and_optimizer(
     logger.info("✅ Gradient checkpointing enabled")
 
     optimizer = torch.optim.AdamW(policy_model.parameters(), lr=cfg.learning_rate)
-    loss_fn = GRPOLoss(policy_model, beta=0.04)  # pyright: ignore[reportArgumentType]
 
-    return policy_model, optimizer, tokenizer, loss_fn
+    # Create KL controller if warmup or adaptive control is enabled
+    kl_controller: AdaptiveKLController | None = None
+    if cfg.kl_beta_warmup_steps > 0 or cfg.kl_target is not None:
+        kl_config = KLControllerConfig(
+            initial_beta=cfg.kl_beta,
+            warmup_steps=cfg.kl_beta_warmup_steps,
+            target_kl=cfg.kl_target,
+            horizon=cfg.kl_horizon,
+            beta_min=cfg.kl_beta_min,
+            beta_max=cfg.kl_beta_max,
+        )
+        kl_controller = AdaptiveKLController(kl_config)
+        logger.info(
+            f"🎛️ KL controller enabled: warmup={cfg.kl_beta_warmup_steps} steps, "
+            f"target={cfg.kl_target}, beta={cfg.kl_beta}"
+        )
+
+    loss_fn = GRPOLoss(
+        policy_model,  # pyright: ignore[reportArgumentType]
+        beta=cfg.kl_beta,
+        kl_controller=kl_controller,
+    )
+
+    return policy_model, optimizer, tokenizer, loss_fn, kl_controller
 
 
 def initialize_wandb(
@@ -1026,7 +1069,9 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
 
         # Initialize model and optimizer
         model_load_start = time.time()
-        policy_model, optimizer, tokenizer, loss_fn = initialize_model_and_optimizer(cfg)
+        policy_model, optimizer, tokenizer, loss_fn, kl_controller = initialize_model_and_optimizer(
+            cfg
+        )
         metrics["timing"]["model_load_s"] = time.time() - model_load_start
         logger.info(f"✅ Model loaded in {metrics['timing']['model_load_s']:.2f}s")
 
@@ -1148,7 +1193,12 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             # Process trajectories
             process_start = time.time()
             with profile_section(step_profile, "tokenize"):
-                batch_data, traj_stats = process_trajectories(raw_trajectories, tokenizer)
+                batch_data, traj_stats = process_trajectories(
+                    raw_trajectories,
+                    tokenizer,
+                    advantage_clip=cfg.advantage_clip,
+                    advantage_min_std=cfg.advantage_min_std,
+                )
 
             step_metrics["process_time_s"] = time.time() - process_start
             step_metrics["processed_trajectories"] = len(batch_data)
@@ -1165,12 +1215,21 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             )
             training_time = time.time() - training_start
 
+            # Update KL controller (if enabled) and get diagnostics
+            kl_diagnostics: dict[str, float] = {}
+            if kl_controller is not None:
+                kl_diagnostics = kl_controller.step_update(train_metrics["kl"])
+
             # Update metrics
             step_metrics.update(
                 {
                     "training_time_s": training_time,
                     "loss": train_metrics["loss"],
                     "kl": train_metrics["kl"],
+                    "kl_max": train_metrics["kl_max"],
+                    "kl_min": train_metrics["kl_min"],
+                    "kl_std": train_metrics["kl_std"],
+                    "effective_beta": train_metrics["effective_beta"],
                     "grad_norm": train_metrics["grad_norm"],
                     "used_cached_ref_logprobs": train_metrics["used_cached_ref_logprobs"],
                     "reward_mean": traj_stats.reward_mean,
@@ -1181,6 +1240,10 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     # Positive = training is bottleneck (rollouts are fast/prefetched)
                     # Zero = rollout is bottleneck (waiting for results)
                     "pipeline_overlap_s": max(0, training_time - rollout_time) if step > 0 else 0,
+                    # KL controller diagnostics (if enabled)
+                    **{f"kl_ctrl_{k}": v for k, v in kl_diagnostics.items()},
+                    # Trajectory stats for advantage/skip diagnostics
+                    "traj_stats": traj_stats,
                 }
             )
 
@@ -1200,8 +1263,11 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
 
             # Log to console
             extraction_rate_pct = extraction_stats["extraction_rate"] * 100
+            beta_str = (
+                f" | β={train_metrics['effective_beta']:.4f}" if kl_controller is not None else ""
+            )
             logger.info(
-                f"Step {step}: loss={train_metrics['loss']:.4f} | kl={train_metrics['kl']:.4f} | "
+                f"Step {step}: loss={train_metrics['loss']:.4f} | kl={train_metrics['kl']:.4f}{beta_str} | "
                 f"reward={traj_stats.reward_mean:.2f}±{traj_stats.reward_std:.2f} | "
                 f"extraction={extraction_rate_pct:.1f}% | "
                 f"trajectories={len(batch_data)} | time={step_metrics['total_time_s']:.2f}s"
@@ -1391,12 +1457,16 @@ def _run_training_step(
     policy_model: Any,
     cfg: ExperimentConfig,
     step_profile: dict[str, Any] | None,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """Run a single training step. Returns training metrics."""
     optimizer.zero_grad()
 
     accum_loss = 0.0
     accum_kl = 0.0
+    accum_kl_max = 0.0
+    accum_kl_min = float("inf")
+    accum_kl_std = 0.0
+    last_effective_beta = 0.0
     num_chunks = 0
     used_cached_ref = False  # Track if ref logprobs came from rollouts vs computed here
     # Use ceiling division to correctly count partial chunks at the end
@@ -1417,6 +1487,10 @@ def _run_training_step(
 
         accum_loss += loss_output.loss.item()
         accum_kl += loss_output.kl
+        accum_kl_max = max(accum_kl_max, loss_output.kl_max)
+        accum_kl_min = min(accum_kl_min, loss_output.kl_min)
+        accum_kl_std += loss_output.kl_std
+        last_effective_beta = loss_output.effective_beta
         num_chunks += 1
         # Track if any chunk used cached ref logprobs (should be all or none)
         if loss_output.used_cached_ref_logprobs:
@@ -1435,6 +1509,10 @@ def _run_training_step(
     return {
         "loss": accum_loss / max(1, num_chunks),
         "kl": accum_kl / max(1, num_chunks),
+        "kl_max": accum_kl_max,
+        "kl_min": accum_kl_min if accum_kl_min != float("inf") else 0.0,
+        "kl_std": accum_kl_std / max(1, num_chunks),
+        "effective_beta": last_effective_beta,
         "grad_norm": grad_norm,
         "used_cached_ref_logprobs": used_cached_ref,
     }

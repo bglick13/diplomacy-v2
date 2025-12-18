@@ -191,6 +191,65 @@ class ExperimentConfig(BaseModel):
     )
 
     # =========================================================================
+    # KL Penalty / GRPO Stability Settings
+    # =========================================================================
+    kl_beta: float = Field(
+        default=0.04,
+        description="KL penalty coefficient. Higher values constrain policy closer to reference.",
+    )
+    kl_beta_warmup_steps: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Number of steps to linearly warmup KL beta from 0 to kl_beta. "
+            "Allows policy to explore freely in early training before constraining."
+        ),
+    )
+    kl_target: float | None = Field(
+        default=None,
+        description=(
+            "Target KL divergence for adaptive KL control. If set, beta is adjusted "
+            "each step to achieve this target. Typical values: 0.01-0.1. "
+            "None disables adaptive KL (uses fixed/warmup beta)."
+        ),
+    )
+    kl_horizon: int = Field(
+        default=10,
+        ge=1,
+        description="Number of steps over which to smooth KL for adaptive control.",
+    )
+    kl_beta_min: float = Field(
+        default=0.001,
+        gt=0,
+        description="Minimum KL beta when using adaptive control.",
+    )
+    kl_beta_max: float = Field(
+        default=0.5,
+        gt=0,
+        description="Maximum KL beta when using adaptive control.",
+    )
+
+    # =========================================================================
+    # Advantage Processing Settings
+    # =========================================================================
+    advantage_clip: float | None = Field(
+        default=None,
+        description=(
+            "Clip advantages to [-clip, +clip] after normalization. "
+            "Prevents extreme gradients from outlier rewards. "
+            "Typical values: 4.0-10.0. None disables clipping."
+        ),
+    )
+    advantage_min_std: float = Field(
+        default=1e-8,
+        gt=0,
+        description=(
+            "Minimum std for advantage normalization. Groups with lower std are skipped. "
+            "Higher values (e.g., 0.1) skip more low-signal groups."
+        ),
+    )
+
+    # =========================================================================
     # Inference Settings
     # =========================================================================
     max_new_tokens: int = Field(default=256, description="Maximum tokens to generate per inference")
