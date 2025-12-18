@@ -305,7 +305,7 @@ async def run_full_game(
         final_scores=final_scores,
         power_agents=power_agents,
         step_timings=step_timings,
-        num_years=len(step_timings) // 2,  # 2 phases per year
+        num_years=(len(step_timings) + 1) // 2,  # 2 phases per year, ceiling division
     )
 
 
