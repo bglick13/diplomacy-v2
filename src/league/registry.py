@@ -209,7 +209,16 @@ class LeagueRegistry:
             if initial_elo is None:
                 if parent and parent in self._agents:
                     initial_elo = self._agents[parent].elo
+                elif parent:
+                    # Parent specified but not found - warn about broken lineage
+                    logger.warning(
+                        f"Parent '{parent}' not found in registry for checkpoint '{name}'. "
+                        f"Using default Elo 1000.0 instead of inheriting. "
+                        "This may indicate a broken checkpoint lineage."
+                    )
+                    initial_elo = 1000.0
                 else:
+                    # No parent specified - normal case for first checkpoint
                     initial_elo = 1000.0
 
             agent = AgentInfo.create_checkpoint(
