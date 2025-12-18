@@ -1,6 +1,9 @@
+import os
 import random
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import modal
 import wandb
@@ -11,11 +14,512 @@ from src.apps.common.images import cpu_image
 from src.apps.common.volumes import EVALS_PATH, VOLUME_PATH, volume
 from src.engine.wrapper import DiplomacyWrapper
 from src.league import LeagueRegistry, update_elo_from_match
+from src.league.types import MatchResult
 from src.utils.observability import axiom, logger
 from src.utils.parsing import extract_orders
 from src.utils.scoring import calculate_final_scores
 
 app = modal.App("diplomacy-grpo-evaluation")
+
+# Constants
+POWERS = ["AUSTRIA", "ENGLAND", "FRANCE", "GERMANY", "ITALY", "RUSSIA", "TURKEY"]
+BASELINE_BOTS = {
+    "random_bot": RandomBot(),
+    "chaos_bot": ChaosBot(),
+    "base_model": None,  # Placeholder for base model
+}
+
+
+# ============================================================================
+# SHARED DATA STRUCTURES
+# ============================================================================
+
+
+@dataclass
+class GameTiming:
+    """Timing breakdown for a single game step."""
+
+    step: int
+    prompt_time_s: float
+    inference_time_s: float
+    combine_time_s: float
+    step_game_time_s: float
+    total_time_s: float
+    num_llm_powers: int
+    num_baseline_powers: int
+
+
+@dataclass
+class GameResult:
+    """Result from a completed game."""
+
+    game_id: str
+    final_scores: dict[str, float]
+    power_agents: dict[str, str]
+    step_timings: list[GameTiming]
+    num_years: int
+
+
+@dataclass
+class MatchSummary:
+    """Summary of a single match for logging."""
+
+    gatekeeper: str
+    game_idx: int
+    challenger_score: float
+    gatekeeper_avg_score: float
+    win: bool
+
+
+# ============================================================================
+# HELPER FUNCTIONS - AGENT INITIALIZATION
+# ============================================================================
+
+
+def create_llm_agent(
+    compact_prompts: bool,
+    prefix_cache_optimized: bool,
+    show_valid_moves: bool,
+) -> LLMAgent:
+    """Create LLM agent with consistent prompt configuration."""
+    prompt_config = PromptConfig(
+        compact_mode=compact_prompts,
+        prefix_cache_optimized=prefix_cache_optimized,
+        show_valid_moves=show_valid_moves,
+        show_map_windows=True,
+    )
+    return LLMAgent(config=prompt_config)
+
+
+def get_baseline_agent(opponent_type: str) -> RandomBot | ChaosBot:
+    """Get baseline agent by type."""
+    if opponent_type == "random":
+        return RandomBot()
+    elif opponent_type == "chaos":
+        return ChaosBot()
+    else:
+        logger.warning(f"Unknown opponent type: {opponent_type}, using random")
+        return RandomBot()
+
+
+# ============================================================================
+# HELPER FUNCTIONS - GAME EXECUTION
+# ============================================================================
+
+
+async def run_game_step(
+    game: DiplomacyWrapper,
+    power_adapters: dict[str, str | None],
+    llm_agent: LLMAgent,
+    InferenceEngineCls: Any,
+    model_id: str,
+    temperature: float,
+    max_new_tokens: int,
+    is_league_eval: bool,
+) -> GameTiming:
+    """
+    Execute a single game step with batched inference.
+
+    Groups powers by adapter for efficient batching, then combines results.
+
+    Args:
+        game: The diplomacy game wrapper
+        power_adapters: Mapping of power -> adapter path (or baseline bot name)
+        llm_agent: LLM agent for prompt building
+        InferenceEngineCls: Modal class for inference engine
+        model_id: Base model ID
+        temperature: Sampling temperature
+        max_new_tokens: Max tokens to generate
+        is_league_eval: Whether this is league evaluation (affects engine pool)
+
+    Returns:
+        GameTiming with performance breakdown
+    """
+    step_start = time.time()
+
+    # Phase 1: Collect prompts and group by adapter
+    prompt_start = time.time()
+    adapter_groups: dict[str | None, list[tuple[str, str, dict]]] = {}
+    baseline_orders: dict[str, list[str]] = {}
+
+    for power in POWERS:
+        adapter = power_adapters.get(power)
+
+        # Get orders based on adapter type
+        if adapter in BASELINE_BOTS and adapter is not None:
+            bot = BASELINE_BOTS[adapter]
+            if bot:
+                orders = bot.get_orders(game, power)
+                baseline_orders[power] = orders
+            else:
+                baseline_orders[power] = []
+        else:
+            # LLM power - collect prompt for batching
+            prompt, valid_moves = llm_agent.build_prompt(game, power)
+            if valid_moves:
+                adapter_key = adapter or "base_model"
+                if adapter_key not in adapter_groups:
+                    adapter_groups[adapter_key] = []
+                adapter_groups[adapter_key].append((power, prompt, valid_moves))
+            else:
+                baseline_orders[power] = []
+
+    prompt_time = time.time() - prompt_start
+
+    # Phase 2: Batch inference for each adapter group
+    inference_start = time.time()
+    inference_results: dict[str, list[str]] = {}  # power -> orders
+
+    for adapter_key, group_items in adapter_groups.items():
+        group_powers = [item[0] for item in group_items]
+        group_prompts = [item[1] for item in group_items]
+        group_valid_moves = [item[2] for item in group_items]
+
+        # Batch inference call
+        batch_start = time.time()
+        responses = await InferenceEngineCls(  # pyright: ignore[reportCallIssue]
+            model_id=model_id,
+            # Hardcode is_for_league_evaluation for now
+            is_for_league_evaluation=False,
+        ).generate.remote.aio(
+            prompts=group_prompts,
+            valid_moves=group_valid_moves,
+            lora_name=adapter_key if adapter_key != "base_model" else None,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+        )
+        batch_time = time.time() - batch_start
+
+        # Extract orders for each power
+        for power, response_data in zip(group_powers, responses, strict=True):
+            orders = extract_orders(response_data["text"])
+            inference_results[power] = orders
+
+        # Log batch timing (warn for slow single-item batches)
+        batch_size = len(group_prompts)
+        if batch_size == 1 and batch_time > 5.0:
+            logger.warning(
+                f"  Very slow single-item batch: adapter={adapter_key}, "
+                f"time={batch_time:.3f}s (normal: 2-3s)"
+            )
+        else:
+            logger.debug(
+                f"  Batch inference: adapter={adapter_key}, "
+                f"batch_size={batch_size}, time={batch_time:.3f}s"
+            )
+
+    inference_time = time.time() - inference_start
+
+    # Phase 3: Combine all orders
+    combine_start = time.time()
+    all_orders = []
+    for power in POWERS:
+        if power in baseline_orders:
+            all_orders.extend(baseline_orders[power])
+        elif power in inference_results:
+            all_orders.extend(inference_results[power])
+    combine_time = time.time() - combine_start
+
+    # Phase 4: Step game
+    step_game_start = time.time()
+    game.step(all_orders)
+    step_game_time = time.time() - step_game_start
+
+    step_total = time.time() - step_start
+
+    return GameTiming(
+        step=0,  # Will be set by caller
+        prompt_time_s=prompt_time,
+        inference_time_s=inference_time,
+        combine_time_s=combine_time,
+        step_game_time_s=step_game_time,
+        total_time_s=step_total,
+        num_llm_powers=sum(len(group) for group in adapter_groups.values()),
+        num_baseline_powers=len(baseline_orders),
+    )
+
+
+async def run_full_game(
+    power_adapters: dict[str, str | None],
+    llm_agent: LLMAgent,
+    InferenceEngineCls: Any,
+    model_id: str,
+    max_years: int,
+    temperature: float,
+    max_new_tokens: int,
+    is_league_eval: bool,
+) -> GameResult:
+    """
+    Run a complete game to completion.
+
+    Args:
+        power_adapters: Mapping of power -> adapter path
+        llm_agent: LLM agent for prompts
+        InferenceEngineCls: Modal inference engine class
+        model_id: Base model ID
+        max_years: Maximum game length
+        temperature: Sampling temperature
+        max_new_tokens: Max tokens to generate
+        is_league_eval: Whether this is league evaluation
+
+    Returns:
+        GameResult with final scores and timing data
+    """
+    game = DiplomacyWrapper(horizon=max_years * 2)
+    game_id = game.game.game_id
+    step_timings: list[GameTiming] = []
+    step_count = 0
+
+    while not game.is_done():
+        step_count += 1
+
+        timing = await run_game_step(
+            game=game,
+            power_adapters=power_adapters,
+            llm_agent=llm_agent,
+            InferenceEngineCls=InferenceEngineCls,
+            model_id=model_id,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+            is_league_eval=is_league_eval,
+        )
+        timing.step = step_count
+        step_timings.append(timing)
+
+        # Log every 5 steps to avoid spam
+        if step_count % 5 == 0:
+            logger.info(
+                f"  Step {step_count}: {timing.total_time_s:.3f}s total "
+                f"(prompt: {timing.prompt_time_s:.3f}s, inference: {timing.inference_time_s:.3f}s, "
+                f"game: {timing.step_game_time_s:.3f}s)"
+            )
+
+    # Compute final scores
+    final_scores = calculate_final_scores(game)
+
+    # Build power_agents mapping
+    power_agents = {p: power_adapters[p] or "base_model" for p in POWERS}
+
+    return GameResult(
+        game_id=game_id,
+        final_scores=final_scores,
+        power_agents=power_agents,
+        step_timings=step_timings,
+        num_years=len(step_timings) // 2,  # 2 phases per year
+    )
+
+
+# ============================================================================
+# HELPER FUNCTIONS - LEAGUE EVALUATION
+# ============================================================================
+
+
+def ensure_challenger_in_registry(
+    challenger_path: str,
+    registry: LeagueRegistry,
+) -> None:
+    """
+    Ensure challenger is in registry, adding it if missing.
+
+    This handles the race condition where evaluation starts before the
+    trainer adds the checkpoint to the registry.
+
+    Args:
+        challenger_path: Path to challenger adapter
+        registry: League registry
+    """
+    all_agents = registry.get_all_agents()
+    challenger_name = challenger_path
+
+    if challenger_name in [a.name for a in all_agents]:
+        return  # Already in registry
+
+    logger.warning(f"⚠️ Challenger {challenger_name} not in registry yet, adding it...")
+
+    # Extract step and run_name from path (e.g., "grpo-20251209-200240/adapter_v20" -> 20)
+    step = 0
+    run_name = None
+    try:
+        parts = challenger_path.rsplit("/", 1)
+        if len(parts) == 2:
+            run_name = parts[0]
+        step_str = challenger_path.split("adapter_v")[-1]
+        step = int(step_str)
+    except (ValueError, IndexError):
+        logger.warning(f"Could not extract step from challenger_path: {challenger_path}")
+
+    # Find parent checkpoint to inherit Elo
+    current_elos = {a.name: a.elo for a in all_agents}
+    parent_name = None
+    parent_elo = 1000.0
+
+    if step > 1 and run_name:
+        # Try to find parent checkpoint (previous step)
+        for prev_step in range(step - 1, 0, -1):
+            potential_parent = f"{run_name}/adapter_v{prev_step}"
+            if potential_parent in current_elos:
+                parent_name = potential_parent
+                parent_elo = current_elos[potential_parent]
+                logger.info(f"  Inheriting Elo {parent_elo:.0f} from parent {parent_name}")
+                break
+    elif step == 1:
+        parent_name = "base_model"
+        parent_elo = current_elos.get("base_model", 1000.0)
+
+    # Add challenger to registry
+    registry.add_checkpoint(
+        name=challenger_name,
+        path=challenger_path,
+        step=step,
+        parent=parent_name,
+        initial_elo=parent_elo,
+    )
+
+
+def compute_elo_updates(
+    matches: list[GameResult],
+    registry: LeagueRegistry,
+    k: float = 32.0,
+) -> dict[str, float]:
+    """
+    Compute Elo updates from match results.
+
+    Args:
+        matches: List of game results
+        registry: League registry for current Elos
+        k: Elo K-factor
+
+    Returns:
+        Dict mapping agent name to new Elo
+    """
+    # Get current Elos
+    all_agents = registry.get_all_agents()
+    current_elos = {a.name: a.elo for a in all_agents}
+
+    # Apply Elo updates from all matches
+    for match in matches:
+        current_elos = update_elo_from_match(
+            power_agents=match.power_agents,
+            power_scores=match.final_scores,
+            agent_elos=current_elos,
+            k=k,
+        )
+
+    return current_elos
+
+
+def create_match_results(
+    matches: list[GameResult],
+    challenger_name: str,
+    training_step: int,
+) -> list[MatchResult]:
+    """
+    Convert GameResult objects to MatchResult for registry.
+
+    Args:
+        matches: List of game results
+        challenger_name: Name of the challenger
+        training_step: Current training step
+
+    Returns:
+        List of MatchResult objects
+    """
+    match_results = []
+
+    for idx, match in enumerate(matches):
+        # Calculate rankings from scores
+        sorted_powers = sorted(match.final_scores.items(), key=lambda x: x[1], reverse=True)
+        rankings = {power: rank + 1 for rank, (power, _) in enumerate(sorted_powers)}
+
+        # Determine winner (agent with highest score)
+        winner_power = sorted_powers[0][0] if sorted_powers else None
+        winner_agent = match.power_agents.get(winner_power) if winner_power else None
+
+        match_result = MatchResult(
+            game_id=f"eval-{challenger_name}-{int(time.time())}-{idx}",
+            step=training_step,
+            power_agents=match.power_agents,
+            scores=match.final_scores,
+            rankings=rankings,
+            num_years=match.num_years,
+            winner=winner_agent,
+        )
+        match_results.append(match_result)
+
+    return match_results
+
+
+def log_game_timing(
+    game_idx: int,
+    step_timings: list[GameTiming],
+    challenger_path: str,
+    gatekeeper_name: str,
+) -> None:
+    """Log timing summary for a completed game."""
+    if not step_timings:
+        return
+
+    step_count = len(step_timings)
+    total_time = sum(s.total_time_s for s in step_timings)
+    avg_inference_time = sum(s.inference_time_s for s in step_timings) / step_count
+    avg_prompt_time = sum(s.prompt_time_s for s in step_timings) / step_count
+    avg_game_time = sum(s.step_game_time_s for s in step_timings) / step_count
+
+    logger.info(
+        f"  Game {game_idx} complete: {step_count} steps, {total_time:.2f}s total "
+        f"(avg: prompt={avg_prompt_time:.3f}s, inference={avg_inference_time:.3f}s, "
+        f"game={avg_game_time:.3f}s)"
+    )
+
+    # Log to Axiom for analysis
+    axiom.log(
+        {
+            "event": "league_eval_game_timing",
+            "challenger_path": challenger_path,
+            "gatekeeper": gatekeeper_name,
+            "game_idx": game_idx,
+            "total_steps": step_count,
+            "total_time_s": total_time,
+            "avg_prompt_time_s": avg_prompt_time,
+            "avg_inference_time_s": avg_inference_time,
+            "avg_game_time_s": avg_game_time,
+            "num_llm_powers": step_timings[-1].num_llm_powers if step_timings else 0,
+        }
+    )
+
+
+def log_elo_to_wandb(
+    wandb_run_id: str,
+    challenger_elo: float,
+    win_rate: float,
+    total_games: int,
+    training_step: int,
+    all_elos: dict[str, float],
+    all_agents: list[Any],
+) -> None:
+    """Log Elo metrics to WandB."""
+    try:
+        wandb.init(id=wandb_run_id, resume="allow", project="diplomacy-grpo")
+        wandb.log(
+            {
+                "elo/challenger": challenger_elo,
+                "elo/win_rate": win_rate,
+                "elo/games_played": total_games,
+                "elo/evaluation_step": training_step,
+            }
+        )
+        # Log Elo for all tracked agents
+        for agent_name, elo in all_elos.items():
+            if agent_name in [a.name for a in all_agents]:
+                safe_name = agent_name.replace("/", "_")
+                wandb.log({f"elo/{safe_name}": elo})
+    except Exception as e:
+        logger.warning(f"Failed to log to WandB: {e}")
+
+
+# ============================================================================
+# LEAGUE EVALUATION FUNCTION
+# ============================================================================
 
 
 @app.function(
@@ -71,15 +575,17 @@ async def evaluate_league(
         Dict with Elo updates and match results
     """
     # Get InferenceEngine class from the deployed app at runtime
-    # This ensures it's properly hydrated in the combined app context
     InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
 
     eval_start = time.time()
     logger.info(f"🏆 Starting Elo evaluation for {challenger_path}")
 
-    # Load league registry
+    # CRITICAL: Reload volume to get latest registry updates from trainer
     volume.reload()
     registry = LeagueRegistry(Path(league_registry_path))
+
+    # Ensure challenger is in registry (handles race condition)
+    ensure_challenger_in_registry(challenger_path, registry)
 
     # Get gatekeepers: baselines + top checkpoints
     baselines = registry.get_baselines()
@@ -95,27 +601,12 @@ async def evaluate_league(
     gatekeepers = baselines + top_checkpoints
     logger.info(f"📊 Gatekeepers: {[g.name for g in gatekeepers]}")
 
-    # Baseline bots
-    BASELINE_BOTS = {
-        "random_bot": RandomBot(),
-        "chaos_bot": ChaosBot(),
-        "base_model": None,  # Placeholder for base model
-    }
-
-    POWERS = ["AUSTRIA", "ENGLAND", "FRANCE", "GERMANY", "ITALY", "RUSSIA", "TURKEY"]
-
-    # Initialize agents (use same prompt settings as training)
-    prompt_config = PromptConfig(
-        compact_mode=compact_prompts,
-        prefix_cache_optimized=prefix_cache_optimized,
-        show_valid_moves=show_valid_moves,
-        show_map_windows=True,
-    )
-    llm_agent = LLMAgent(config=prompt_config)
+    # Initialize LLM agent
+    llm_agent = create_llm_agent(compact_prompts, prefix_cache_optimized, show_valid_moves)
 
     # Track all matches for Elo updates
-    all_matches = []
-    match_results = []
+    all_matches: list[GameResult] = []
+    match_summaries: list[MatchSummary] = []
 
     for gatekeeper in gatekeepers:
         logger.info(f"  vs {gatekeeper.name}...")
@@ -137,188 +628,41 @@ async def evaluate_league(
                     power_adapters[p] = gatekeeper.path  # Checkpoint path
 
             # Run game
-            game = DiplomacyWrapper(horizon=max_years * 2)
-            step_count = 0
-            step_timings = []  # Track timing per step for analysis
+            game_result = await run_full_game(
+                power_adapters=power_adapters,
+                llm_agent=llm_agent,
+                InferenceEngineCls=InferenceEngineCls,
+                model_id=model_id,
+                max_years=max_years,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                is_league_eval=True,  # CRITICAL: Use league evaluation pool
+            )
 
-            while not game.is_done():
-                step_start = time.time()
-                step_count += 1
-                all_orders = []
+            all_matches.append(game_result)
 
-                # OPTIMIZATION: Batch inference calls by adapter (like run_rollout does)
-                # This dramatically speeds up LLM vs LLM matchups
-                adapter_groups: dict[str | None, list[tuple[str, str, dict]]] = {}
-                baseline_orders: dict[str, list[str]] = {}
-
-                # Phase 1: Collect prompts and group by adapter
-                prompt_start = time.time()
-                for power in POWERS:
-                    adapter = power_adapters.get(power)
-
-                    # Get orders based on adapter type
-                    if adapter in BASELINE_BOTS and adapter is not None:
-                        bot = BASELINE_BOTS[adapter]
-                        if bot:
-                            orders = bot.get_orders(game, power)
-                            baseline_orders[power] = orders
-                        else:
-                            baseline_orders[power] = []
-                    else:
-                        # LLM power - collect prompt for batching
-                        prompt, valid_moves = llm_agent.build_prompt(game, power)
-                        if valid_moves:
-                            adapter_key = adapter or "base_model"
-                            if adapter_key not in adapter_groups:
-                                adapter_groups[adapter_key] = []
-                            adapter_groups[adapter_key].append((power, prompt, valid_moves))
-                        else:
-                            baseline_orders[power] = []
-
-                prompt_time = time.time() - prompt_start
-
-                # Phase 2: Batch inference for each adapter group
-                inference_start = time.time()
-                inference_results: dict[str, list[str]] = {}  # power -> orders
-
-                for adapter_key, group_items in adapter_groups.items():
-                    group_powers = [item[0] for item in group_items]
-                    group_prompts = [item[1] for item in group_items]
-                    group_valid_moves = [item[2] for item in group_items]
-
-                    # Batch inference call (much faster than sequential)
-                    # Use dedicated league evaluation engine pool (isolated from training)
-                    # Note: batch_size=1 is common when only one power uses a particular adapter
-                    # vLLM's continuous batching will still batch these across different calls
-                    batch_start = time.time()
-                    responses = await InferenceEngineCls(  # pyright: ignore[reportCallIssue]
-                        model_id=model_id, is_for_league_evaluation=False
-                    ).generate.remote.aio(
-                        prompts=group_prompts,
-                        valid_moves=group_valid_moves,
-                        lora_name=adapter_key if adapter_key != "base_model" else None,
-                        temperature=temperature,
-                        max_new_tokens=max_new_tokens,
-                    )
-                    batch_time = time.time() - batch_start
-
-                    # Extract orders for each power
-                    for power, response_data in zip(group_powers, responses, strict=True):
-                        orders = extract_orders(response_data["text"])
-                        inference_results[power] = orders
-
-                    # Log batch timing (only warn for very slow single-item batches)
-                    batch_size = len(group_prompts)
-                    if batch_size == 1 and batch_time > 5.0:
-                        logger.warning(
-                            f"  Very slow single-item batch: adapter={adapter_key}, "
-                            f"time={batch_time:.3f}s (normal: 2-3s)"
-                        )
-                    else:
-                        logger.debug(
-                            f"  Batch inference: adapter={adapter_key}, "
-                            f"batch_size={batch_size}, time={batch_time:.3f}s"
-                        )
-
-                inference_time = time.time() - inference_start
-
-                # Phase 3: Combine all orders
-                combine_start = time.time()
-                for power in POWERS:
-                    if power in baseline_orders:
-                        all_orders.extend(baseline_orders[power])
-                    elif power in inference_results:
-                        all_orders.extend(inference_results[power])
-                combine_time = time.time() - combine_start
-
-                # Phase 4: Step game
-                step_game_start = time.time()
-                game.step(all_orders)
-                step_game_time = time.time() - step_game_start
-
-                step_total = time.time() - step_start
-                step_timings.append(
-                    {
-                        "step": step_count,
-                        "prompt_time_s": prompt_time,
-                        "inference_time_s": inference_time,
-                        "combine_time_s": combine_time,
-                        "step_game_time_s": step_game_time,
-                        "total_time_s": step_total,
-                        "num_llm_powers": len(sum(adapter_groups.values(), [])),
-                        "num_baseline_powers": len(baseline_orders),
-                    }
-                )
-
-                # Log every 5 steps to avoid spam
-                if step_count % 5 == 0:
-                    logger.info(
-                        f"  Step {step_count}: {step_total:.3f}s total "
-                        f"(prompt: {prompt_time:.3f}s, inference: {inference_time:.3f}s, "
-                        f"game: {step_game_time:.3f}s)"
-                    )
-
-            # Compute final scores
-            final_scores = calculate_final_scores(game)
-
-            # Log timing summary for this game
-            if step_timings:
-                total_time = sum(s["total_time_s"] for s in step_timings)
-                avg_inference_time = sum(s["inference_time_s"] for s in step_timings) / len(
-                    step_timings
-                )
-                avg_prompt_time = sum(s["prompt_time_s"] for s in step_timings) / len(step_timings)
-                avg_game_time = sum(s["step_game_time_s"] for s in step_timings) / len(step_timings)
-
-                logger.info(
-                    f"  Game {game_idx} complete: {step_count} steps, {total_time:.2f}s total "
-                    f"(avg: prompt={avg_prompt_time:.3f}s, inference={avg_inference_time:.3f}s, "
-                    f"game={avg_game_time:.3f}s)"
-                )
-
-                # Log to Axiom for analysis
-                axiom.log(
-                    {
-                        "event": "league_eval_game_timing",
-                        "challenger_path": challenger_path,
-                        "gatekeeper": gatekeeper.name,
-                        "game_idx": game_idx,
-                        "total_steps": step_count,
-                        "total_time_s": total_time,
-                        "avg_prompt_time_s": avg_prompt_time,
-                        "avg_inference_time_s": avg_inference_time,
-                        "avg_game_time_s": avg_game_time,
-                        "num_llm_powers": step_timings[-1]["num_llm_powers"] if step_timings else 0,
-                    }
-                )
-
-            # Build power_agents mapping
-            power_agents = {p: power_adapters[p] or "base_model" for p in POWERS}
-
-            # Record match
-            match_data = {
-                "power_agents": power_agents,
-                "power_scores": final_scores,
-                "step_timings": step_timings,  # Include timing data
-            }
-            all_matches.append(match_data)
+            # Log timing
+            log_game_timing(game_idx, game_result.step_timings, challenger_path, gatekeeper.name)
 
             # Track for summary
-            challenger_score = final_scores[challenger_power]
-            gatekeeper_avg = sum(
-                final_scores[p]
+            challenger_score = game_result.final_scores[challenger_power]
+            gatekeeper_scores = [
+                game_result.final_scores[p]
                 for p in opponent_powers
                 if power_adapters[p] == gatekeeper.path or power_adapters[p] == gatekeeper.name
-            ) / len(opponent_powers)
+            ]
+            gatekeeper_avg = (
+                sum(gatekeeper_scores) / len(gatekeeper_scores) if gatekeeper_scores else 0.0
+            )
 
-            match_results.append(
-                {
-                    "gatekeeper": gatekeeper.name,
-                    "game_idx": game_idx,
-                    "challenger_score": challenger_score,
-                    "gatekeeper_avg_score": gatekeeper_avg,
-                    "win": challenger_score > gatekeeper_avg,
-                }
+            match_summaries.append(
+                MatchSummary(
+                    gatekeeper=gatekeeper.name,
+                    game_idx=game_idx,
+                    challenger_score=challenger_score,
+                    gatekeeper_avg_score=gatekeeper_avg,
+                    win=challenger_score > gatekeeper_avg,
+                )
             )
 
             logger.info(
@@ -327,105 +671,24 @@ async def evaluate_league(
 
     # Compute Elo updates from all matches
     logger.info("📈 Computing Elo updates...")
-
-    # Get current Elos
-    all_agents = registry.get_all_agents()
-    current_elos = {a.name: a.elo for a in all_agents}
-
-    # Add challenger to registry if not present yet (race condition: eval might start before checkpoint is added)
-    challenger_name = challenger_path  # Name matches path for checkpoints
-    if challenger_name not in [a.name for a in all_agents]:
-        logger.warning(f"⚠️ Challenger {challenger_name} not in registry yet, adding it...")
-
-        # Extract step and run_name from path (e.g., "grpo-20251209-200240/adapter_v20" -> 20)
-        step = 0
-        run_name = None
-        try:
-            parts = challenger_path.rsplit("/", 1)
-            if len(parts) == 2:
-                run_name = parts[0]
-            step_str = challenger_path.split("adapter_v")[-1]
-            step = int(step_str)
-        except (ValueError, IndexError):
-            logger.warning(f"Could not extract step from challenger_path: {challenger_path}")
-
-        # Find parent checkpoint to inherit Elo
-        # Parent is the previous step's checkpoint (e.g., adapter_v19 is parent of adapter_v20)
-        parent_name = None
-        parent_elo = 1000.0
-        if step > 1 and run_name:
-            # Try to find parent checkpoint (previous step)
-            for prev_step in range(step - 1, 0, -1):
-                potential_parent = f"{run_name}/adapter_v{prev_step}"
-                if potential_parent in current_elos:
-                    parent_name = potential_parent
-                    parent_elo = current_elos[potential_parent]
-                    logger.info(f"  Inheriting Elo {parent_elo:.0f} from parent {parent_name}")
-                    break
-        elif step == 1:
-            parent_name = "base_model"
-            parent_elo = current_elos.get("base_model", 1000.0)
-
-        # Add challenger to registry
-        registry.add_checkpoint(
-            name=challenger_name,
-            path=challenger_path,
-            step=step,
-            parent=parent_name,
-            initial_elo=parent_elo,
-        )
-        # Reload current_elos to include the newly added challenger
-        all_agents = registry.get_all_agents()
-        current_elos = {a.name: a.elo for a in all_agents}
-
-    # Apply Elo updates from all matches
-    for match in all_matches:
-        current_elos = update_elo_from_match(
-            power_agents=match["power_agents"],
-            power_scores=match["power_scores"],
-            agent_elos=current_elos,
-            k=32.0,
-        )
+    updated_elos = compute_elo_updates(all_matches, registry)
 
     # Update registry with new Elos
-    # Only update agents that exist in the registry (bulk_update_elos filters automatically)
-    registry.bulk_update_elos(current_elos)
+    registry.bulk_update_elos(updated_elos)
 
-    # Also add match history for tracking
-    from src.league.types import MatchResult
-
-    for idx, match in enumerate(all_matches):
-        # Calculate rankings from scores
-        power_scores = match["power_scores"]
-        sorted_powers = sorted(power_scores.items(), key=lambda x: x[1], reverse=True)
-        rankings = {power: rank + 1 for rank, (power, _) in enumerate(sorted_powers)}
-
-        # Count years (approximate from step count)
-        num_years = len(match.get("step_timings", [])) // 2  # 2 phases per year
-
-        # Determine winner (agent with highest score)
-        winner_power = sorted_powers[0][0] if sorted_powers else None
-        winner_agent = match["power_agents"].get(winner_power) if winner_power else None
-
-        match_result = MatchResult(
-            game_id=f"eval-{challenger_name}-{int(time.time())}-{idx}",
-            step=training_step,
-            power_agents=match["power_agents"],
-            scores=power_scores,
-            rankings=rankings,
-            num_years=num_years,
-            winner=winner_agent,
-        )
+    # Add match history
+    match_results = create_match_results(all_matches, challenger_path, training_step)
+    for match_result in match_results:
         registry.add_match(match_result)
 
-    # Final save to ensure match history is persisted
+    # Final save and commit
     registry._save()
     volume.commit()
 
     # Compute summary stats
-    challenger_new_elo = current_elos.get(challenger_path, 1000.0)
-    wins = sum(1 for m in match_results if m["win"])
-    total_games = len(match_results)
+    challenger_new_elo = updated_elos.get(challenger_path, 1000.0)
+    wins = sum(1 for m in match_summaries if m.win)
+    total_games = len(match_summaries)
     win_rate = wins / total_games if total_games > 0 else 0.0
 
     eval_duration = time.time() - eval_start
@@ -436,23 +699,16 @@ async def evaluate_league(
 
     # Log to WandB if run ID provided
     if wandb_run_id:
-        try:
-            wandb.init(id=wandb_run_id, resume="allow", project="diplomacy-grpo")
-            wandb.log(
-                {
-                    "elo/challenger": challenger_new_elo,
-                    "elo/win_rate": win_rate,
-                    "elo/games_played": total_games,
-                    "elo/evaluation_step": training_step,
-                }
-            )
-            # Log Elo for all tracked agents
-            for agent_name, elo in current_elos.items():
-                if agent_name in [a.name for a in all_agents]:
-                    safe_name = agent_name.replace("/", "_")
-                    wandb.log({f"elo/{safe_name}": elo})
-        except Exception as e:
-            logger.warning(f"Failed to log to WandB: {e}")
+        all_agents = registry.get_all_agents()
+        log_elo_to_wandb(
+            wandb_run_id,
+            challenger_new_elo,
+            win_rate,
+            total_games,
+            training_step,
+            updated_elos,
+            all_agents,
+        )
 
     await axiom.flush()
 
@@ -461,14 +717,14 @@ async def evaluate_league(
         "challenger_elo": challenger_new_elo,
         "win_rate": win_rate,
         "games_played": total_games,
-        "elo_updates": current_elos,
+        "elo_updates": updated_elos,
         "duration_s": eval_duration,
     }
 
 
-# ------------------------------------------------------------------------------
-# 9.2 Standard Evaluation Runner
-# ------------------------------------------------------------------------------
+# ============================================================================
+# STANDARD EVALUATION RUNNER
+# ============================================================================
 
 
 @app.function(
@@ -498,9 +754,6 @@ async def run_evaluation(
     temperature: float = 0.8,
     max_new_tokens: int = 256,
 ) -> dict:
-    # Get InferenceEngine class from the deployed app at runtime
-    # This ensures it's properly hydrated in the combined app context
-    InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
     """
     Evaluate a checkpoint against various opponents.
 
@@ -523,19 +776,12 @@ async def run_evaluation(
     Returns:
         Dict with evaluation metrics and visualization paths
     """
-    import os
-    import random
-    import time
     from datetime import datetime
 
-    import wandb
-
-    from src.agents import LLMAgent, PromptConfig
-    from src.agents.baselines import ChaosBot, RandomBot
-    from src.engine.wrapper import DiplomacyWrapper
-    from src.utils.observability import axiom, logger
-    from src.utils.parsing import extract_orders
     from src.utils.vis import GameVisualizer
+
+    # Get InferenceEngine class from the deployed app at runtime
+    InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
 
     # Ensure evals directory exists
     EVALS_PATH.mkdir(parents=True, exist_ok=True)
@@ -549,6 +795,7 @@ async def run_evaluation(
         eval_powers = ["FRANCE"]
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    original_run_name = "/".join(checkpoint_path.split("/")[:-1])
     checkpoint_name = checkpoint_path.split("/")[-1]
 
     logger.info("=" * 60)
@@ -572,7 +819,7 @@ async def run_evaluation(
 
     # Initialize WandB
     if log_to_wandb:
-        run_name = wandb_run_name or f"eval-{checkpoint_name}-{timestamp}"
+        run_name = wandb_run_name or f"eval-{original_run_name}-{checkpoint_name}-{timestamp}"
         wandb.init(
             project="diplomacy-grpo",
             name=run_name,
@@ -587,14 +834,8 @@ async def run_evaluation(
             },
         )
 
-    # Initialize LLM agent with provided settings
-    prompt_config = PromptConfig(
-        compact_mode=compact_prompts,
-        prefix_cache_optimized=prefix_cache_optimized,
-        show_valid_moves=show_valid_moves,
-        show_map_windows=True,
-    )
-    llm_agent = LLMAgent(config=prompt_config)
+    # Initialize LLM agent
+    llm_agent = create_llm_agent(compact_prompts, prefix_cache_optimized, show_valid_moves)
 
     # Results storage
     all_results = []
@@ -605,15 +846,7 @@ async def run_evaluation(
     for opponent_type in opponents:
         logger.info(f"\n📊 Running {games_per_opponent} games vs {opponent_type}...")
 
-        # Select opponent agent
-        if opponent_type == "random":
-            opponent_agent = RandomBot()
-        elif opponent_type == "chaos":
-            opponent_agent = ChaosBot()
-        else:
-            logger.warning(f"Unknown opponent type: {opponent_type}, using random")
-            opponent_agent = RandomBot()
-
+        opponent_agent = get_baseline_agent(opponent_type)
         opponent_results = []
 
         for game_idx in range(games_per_opponent):
@@ -722,7 +955,7 @@ async def run_evaluation(
             # Save visualization
             if vis:
                 vis_filename = f"eval_{checkpoint_name}_{opponent_type}_{game_idx}.html"
-                vis_path = str(EVALS_PATH / vis_filename)
+                vis_path = str(EVALS_PATH / original_run_name / "replays" / vis_filename)
                 vis.save_html(vis_path)
                 all_visualizations.append(
                     {
