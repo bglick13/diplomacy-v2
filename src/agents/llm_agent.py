@@ -299,7 +299,7 @@ class LLMAgent:
                         f"Your units: {unit_list}\n"
                         f"{board_info}\n"
                         f"OUTPUT {unit_count} ORDERS:\n"
-                        "<orders>\n"
+                        # "<orders>\n"
                     )
             else:
                 # Legacy compact format (dynamic content first)
