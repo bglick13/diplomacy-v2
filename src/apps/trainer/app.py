@@ -1042,7 +1042,10 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
             step_profile: dict[str, Any] | None = {"step": step} if profile_enabled else None
 
             # Determine current adapter for rollouts
-            current_adapter = f"{cfg.run_name}/adapter_v{step}" if step >= 1 else initial_adapter
+            # At step N, use the adapter trained through step N-1
+            current_adapter = (
+                f"{cfg.run_name}/adapter_v{step - 1}" if step >= 1 else initial_adapter
+            )
 
             # Collect rollouts
             with stopwatch(f"Benchmark_Rollout_{step}"):
@@ -1305,9 +1308,10 @@ def _save_and_register_adapter(
     league_ctx: LeagueContext | None,
     evaluate_league_fn: Any,
 ) -> str | None:
-    """Save adapter and register with league if applicable. Returns adapter path."""
-    if step < 1:
-        return None
+    """Save adapter and register with league if applicable. Returns adapter path.
+
+    Saves adapter_v{step} after training step N completes, so step N+1 can use it.
+    """
 
     adapter_rel_path = f"{cfg.run_name}/adapter_v{step}"
     adapter_full_path = MODELS_PATH / cfg.run_name / f"adapter_v{step}"
