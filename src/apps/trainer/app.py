@@ -1396,6 +1396,10 @@ def _run_training_step(
         ).item()
         optimizer.step()
 
+    # Note: reported loss is consistent with gradient scaling because:
+    # - Gradients are scaled by 1/total_chunks before backward()
+    # - Loss is averaged over num_chunks (which equals total_chunks)
+    # Both give the mean loss per sample group.
     return {
         "loss": accum_loss / max(1, num_chunks),
         "kl": accum_kl / max(1, num_chunks),
