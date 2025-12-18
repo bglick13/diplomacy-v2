@@ -186,7 +186,9 @@ class ExperimentConfig(BaseModel):
     # =========================================================================
     learning_rate: float = Field(default=1e-5, description="Learning rate for AdamW optimizer")
     max_grad_norm: float = Field(default=1.0, description="Maximum gradient norm for clipping")
-    chunk_size: int = Field(default=8, description="Mini-batch size for gradient accumulation")
+    chunk_size: int = Field(
+        default=8, ge=1, description="Mini-batch size for gradient accumulation (must be >= 1)"
+    )
 
     # =========================================================================
     # Inference Settings
