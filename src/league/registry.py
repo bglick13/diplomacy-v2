@@ -262,12 +262,14 @@ class LeagueRegistry:
 
             self._save_unlocked()
 
-    def bulk_update_elos(self, elo_updates: dict[str, float]) -> None:
+    def bulk_update_elos(self, elo_updates: dict[str, float], matches_delta: int = 1) -> None:
         """
         Update multiple agent Elo ratings at once.
 
         Args:
             elo_updates: Mapping of agent name to new Elo
+            matches_delta: Number of matches to add to each agent's count.
+                           Use this when the Elo update reflects multiple games.
         """
         with file_lock(self._lock_path):
             # Reload to get latest state before modifying
@@ -277,7 +279,7 @@ class LeagueRegistry:
             for name, new_elo in elo_updates.items():
                 if name in self._agents:
                     self._agents[name].elo = new_elo
-                    self._agents[name].matches += 1
+                    self._agents[name].matches += matches_delta
 
             # Update best agent tracking
             if self._metadata:
