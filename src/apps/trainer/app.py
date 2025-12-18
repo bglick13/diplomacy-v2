@@ -174,12 +174,14 @@ class CheckpointManager:
                 else:
                     logger.warning(f"⚠️ Adapter not found at {adapter_path}")
 
-                # Restore seed
+                # Restore seed (including CUDA RNG for multi-GPU)
                 saved_seed = state.get("seed")
                 if saved_seed is not None:
                     random.seed(saved_seed)
                     np.random.seed(saved_seed)
                     torch.manual_seed(saved_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(saved_seed)
                     logger.info(f"🌱 Restored random seed: {saved_seed}")
 
                 wandb_run_id = state.get("wandb_run_id")
