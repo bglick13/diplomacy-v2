@@ -663,6 +663,13 @@ class InferenceEngine:
             """Score a single sequence using base model."""
             request_id = str(uuid.uuid4())
 
+            # Validate prompt_token_ids - empty means we can't compute valid ref logprobs
+            if not prompt_token_ids:
+                print(
+                    f"⚠️ Empty prompt_token_ids for request {request_id}, cannot compute ref logprobs"
+                )
+                return {"ref_completion_logprobs": None}
+
             # Scoring params: generate 1 token (min required) but only use prompt_logprobs
             sampling_params = SamplingParams(  # type: ignore[call-arg, misc]
                 max_tokens=1,  # type: ignore[arg-type]
@@ -684,15 +691,26 @@ class InferenceEngine:
                 async for output in generator:
                     final_output = output
 
-                # Extract completion logprobs
-                completion_logprobs_sum = 0.0
-                if final_output and final_output.prompt_logprobs and final_output.prompt_token_ids:
-                    prompt_len = len(prompt_token_ids)
-                    completion_logprobs_sum = parse_prompt_logprobs(
-                        final_output.prompt_logprobs,  # pyright: ignore[reportArgumentType]
-                        final_output.prompt_token_ids,
-                        prompt_len,
+                # Extract completion logprobs - return None if data is incomplete
+                if (
+                    not final_output
+                    or not final_output.prompt_logprobs
+                    or not final_output.prompt_token_ids
+                ):
+                    print(
+                        f"⚠️ Incomplete output for request {request_id}: "
+                        f"output={bool(final_output)}, "
+                        f"prompt_logprobs={bool(final_output and final_output.prompt_logprobs)}, "
+                        f"prompt_token_ids={bool(final_output and final_output.prompt_token_ids)}"
                     )
+                    return {"ref_completion_logprobs": None}
+
+                prompt_len = len(prompt_token_ids)
+                completion_logprobs_sum = parse_prompt_logprobs(
+                    final_output.prompt_logprobs,  # pyright: ignore[reportArgumentType]
+                    final_output.prompt_token_ids,
+                    prompt_len,
+                )
 
                 return {"ref_completion_logprobs": completion_logprobs_sum}
 
