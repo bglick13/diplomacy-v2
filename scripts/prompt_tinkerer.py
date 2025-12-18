@@ -339,6 +339,11 @@ def main():
         action="store_true",
         help="Hide valid moves (use logits processor)",
     )
+    parser.add_argument(
+        "--no-map-windows",
+        action="store_true",
+        help="Disable compact per-unit map windows",
+    )
 
     # Game state
     parser.add_argument("--power", default="FRANCE", help="Power to generate prompt for")
@@ -372,6 +377,7 @@ def main():
         compact_mode=not args.no_compact,
         prefix_cache_optimized=not args.no_prefix_cache,
         show_valid_moves=args.show_valid_moves and not args.no_show_valid_moves,
+        show_map_windows=not args.no_map_windows,
     )
 
     agent = LLMAgent(config)
