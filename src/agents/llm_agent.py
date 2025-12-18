@@ -6,7 +6,6 @@ It encapsulates the prompt engineering and response parsing logic,
 making it easy to iterate on prompting strategies.
 """
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,17 +29,21 @@ class PromptConfig:
     # Whether to include compact per-unit map windows (adjacencies + threats)
     show_map_windows: bool = True
 
+    # Whether to show action counts and types per unit (e.g., "15 moves | move,support")
+    show_action_counts: bool = False
+
     # Custom system instructions (appended to base prompt)
     custom_instructions: str = ""
 
     # Temperature hint for the model (informational, actual temp set in SamplingParams)
     temperature_hint: float = 0.7
 
-    compact_mode: bool = False
+    compact_mode: bool = True
 
     # Optimize prompt structure for vLLM prefix caching
     # When True, static instructions come FIRST so they're shared across all requests
     prefix_cache_optimized: bool = True
+    seed_prompt: bool = True
 
 
 # =============================================================================
@@ -57,68 +60,41 @@ class PromptConfig:
 #
 # IMPORTANT: Do NOT include '</orders>' in the prefix - model gets confused!
 
-MOVEMENT_PREFIX = """\
+MOVEMENT_PREFIX_MINIMAL = """\
 ### DIPLOMACY MOVEMENT PHASE ###
 
-You are playing Diplomacy. Your task: output exactly one order per unit.
+You are playing Diplomacy. Output exactly one order per unit.
+
+ORDER FORMATS (use these exact patterns):
+- Move: "A PAR - BUR" (Army Paris moves to Burgundy)
+- Hold: "A PAR H" (Army Paris holds position)
+- Support move: "A PAR S A MAR - BUR" (Paris supports Marseilles to Burgundy)
+- Support hold: "A PAR S A MAR" (Paris supports Marseilles to hold)
+- Convoy: "F NTH C A LON - NWY" (Fleet convoys Army from London to Norway)
 
 RULES:
-- Copy-paste EXACT move strings from the valid moves list below
-- One order per line inside <orders> tags
-- Movement: "A PAR - BUR" means Army Paris moves to Burgundy
-- Hold: "A PAR H" means Army Paris holds
-- Support: "A PAR S A BUR - MAR" means Paris supports Burgundy to Marseilles
-- Convoy: "F NTH C A LON - NWY" means Fleet convoys Army from London to Norway
-
-"""
-
-# Minimal prefix for when valid moves are NOT shown in prompt
-# Model relies on logits processor for valid moves, so we give strategic context only
-# CRITICAL: Strong "orders only" instruction to prevent model from generating analysis
-# NOTE: Don't use "Move:", "Hold:" prefixes - model copies them literally!
-MOVEMENT_PREFIX_MINIMAL = """\
-### DIPLOMACY ENGINE ###
-ROLE: You are playing the board game Diplomacy.
-TASK: Output valid move orders inside <orders> tags.
-FORMAT RULES:
-1. Output MUST start with <orders>.
-2. Output MUST end with </orders>.
-3. Do NOT output any text, analysis, or new scenarios after </orders>.
-4. One order per line.
-Example output:
-<orders>
-A PAR - BUR
-A MAR H
-F BRE - MAO
-</orders>
-"""
-
-ADJUSTMENT_PREFIX = """\
-### DIPLOMACY ADJUSTMENT PHASE ###
-
-You are playing Diplomacy in the adjustment phase. Output build or disband orders.
-
-RULES:
-- Copy-paste EXACT order strings from the valid options below
-- One order per line inside <orders> tags
-- Build Army: "A PAR B"
-- Build Fleet: "F BRE B"
-- Disband: "A PAR D"
-- Waive a build: "WAIVE"
+- Armies move to adjacent land territories (or via convoy)
+- Fleets move to adjacent sea/coastal territories
+- Support strengthens another unit's move or hold
+- Output one order per line inside <orders> tags
 
 """
 
 ADJUSTMENT_PREFIX_MINIMAL = """\
-### DIPLOMACY ORDERS ###
+### DIPLOMACY ADJUSTMENT PHASE ###
 
-Output orders inside <orders> tags, one per line.
-No analysis. No prefixes. Just the orders.
+You are playing Diplomacy in the adjustment phase.
 
-Example output:
-<orders>
-A PAR B
-F BRE B
-</orders>
+ORDER FORMATS (use these exact patterns):
+- Build Army: "A PAR B" (build army in Paris)
+- Build Fleet: "F BRE B" (build fleet in Brest)
+- Disband unit: "A MUN D" (disband army in Munich)
+- Waive build: "WAIVE" (skip building this turn)
+
+RULES:
+- Can only build in unoccupied home supply centers
+- Must disband if you have more units than supply centers
+- Output one order per line inside <orders> tags
 
 """
 
@@ -172,7 +148,11 @@ class LLMAgent:
 
         # Get board context for strategic awareness (used in minimal prompt mode)
         board_context = (
-            game.get_board_context(power_name, include_windows=self.config.show_map_windows)
+            game.get_board_context(
+                power_name,
+                include_windows=self.config.show_map_windows,
+                include_action_counts=self.config.show_action_counts,
+            )
             if not self.config.show_valid_moves
             else None
         )
@@ -189,33 +169,17 @@ class LLMAgent:
             )
         else:
             # Movement or Retreat phase
-            moves_display = self._format_moves_for_prompt(valid_moves)
-            example_move = self._get_example_move(valid_moves)
             prompt = self._construct_prompt(
                 power_name=power_name,
                 phase=phase,
-                moves_display=moves_display,
-                example_move=example_move,
                 valid_moves=valid_moves,
                 board_context=board_context if self.config.show_board_context else None,
             )
 
-        return prompt, valid_moves
+        if self.config.seed_prompt:
+            prompt += "<orders>\n"
 
-    def _format_moves_for_prompt(self, valid_moves: dict[str, list[str]]) -> str:
-        """Format valid moves as a readable JSON block."""
-        # Optionally truncate if too many moves per unit
-        truncated = {}
-        for unit, moves in valid_moves.items():
-            if len(moves) > self.config.max_moves_per_unit:
-                truncated[unit] = moves[: self.config.max_moves_per_unit] + [
-                    f"... and {len(moves) - self.config.max_moves_per_unit} more"
-                ]
-            else:
-                truncated[unit] = moves
-        if self.config.compact_mode:
-            return json.dumps(truncated, separators=(",", ":"))
-        return json.dumps(truncated, indent=2)
+        return prompt, valid_moves
 
     def _get_example_move(self, valid_moves: dict[str, list[str]]) -> str:
         """Get an example move from the valid moves for the prompt."""
@@ -268,8 +232,6 @@ class LLMAgent:
         self,
         power_name: str,
         phase: str,
-        moves_display: str,
-        example_move: str,
         valid_moves: dict[str, list[str]],
         board_context: dict | None = None,
     ) -> str:
@@ -291,77 +253,18 @@ class LLMAgent:
         unit_count = len(valid_moves)
         unit_list = ", ".join(valid_moves.keys())  # e.g., "A PAR, F BRE, A MAR"
 
-        if self.config.compact_mode:
-            if self.config.prefix_cache_optimized:
-                if self.config.show_valid_moves:
-                    # Full mode: show all valid moves
-                    prompt = (
-                        f"{MOVEMENT_PREFIX}"
-                        f"GAME STATE:\n"
-                        f"Power: {power_name}\n"
-                        f"Phase: {phase}\n"
-                        f"You have {unit_count} units.\n\n"
-                        f"VALID MOVES:\n{moves_display}\n\n"
-                        f"Output {unit_count} orders (one per unit):\n"
-                        "<orders>\n"
-                    )
-                else:
-                    # Minimal mode: unit positions + board context for strategy
-                    # Logits processor handles move validity
-                    # Key: Strong "orders only" framing to prevent analysis generation
-                    board_info = self._format_board_context(board_context) if board_context else ""
-                    prompt = (
-                        f"{MOVEMENT_PREFIX_MINIMAL}"
-                        f"SITUATION:\n"
-                        f"You are {power_name}. Phase: {phase}\n"
-                        f"Your units: {unit_list}\n"
-                        f"{board_info}\n"
-                        f"OUTPUT {unit_count} ORDERS:\n"
-                        # "<orders>\n"
-                    )
-            else:
-                # Legacy compact format (dynamic content first)
-                prompt = (
-                    f"You are {power_name} in a game of Diplomacy. Phase:{phase}. Units:{unit_count}. "
-                    "ValidMoves JSON follows"
-                    f"{moves_display}"
-                    "Emit exactly one order per unit using EXACT strings. Output format: <orders>...\n</orders>"
-                    "<orders>\n"
-                )
-        else:
-            if self.config.show_valid_moves:
-                prompt = f"""You are playing Diplomacy as {power_name}.
-    Phase: {phase}
-    Units: {unit_count}
-
-    Your units and their valid moves:
-    {moves_display}
-
-    Output exactly {unit_count} orders, one per line.
-    Use the EXACT move strings from the valid moves list above.
-
-    Example:
-    <orders>
-    A PAR - BUR
-    F BRE - MAO
-    A MAR H
-    </orders>
-    """
-            else:
-                board_info = self._format_board_context(board_context) if board_context else ""
-                prompt = f"""You are {power_name}. Phase: {phase}
-Your units: {unit_list}
-{board_info}
-
-Output ONLY {unit_count} orders (no analysis):
-<orders>
-"""
+        board_info = self._format_board_context(board_context) if board_context else ""
+        prompt = (
+            f"{MOVEMENT_PREFIX_MINIMAL}"
+            f"SITUATION:\n"
+            f"You are {power_name}. Phase: {phase}\n"
+            f"Your units: {unit_list}\n"
+            f"{board_info}\n"
+            f"OUTPUT {unit_count} ORDERS:\n"
+        )
 
         if self.config.custom_instructions:
             prompt += f"\n{self.config.custom_instructions}\n"
-
-        if not self.config.compact_mode:
-            prompt += "<orders>\n"
 
         return prompt
 
@@ -380,7 +283,6 @@ Output ONLY {unit_count} orders (no analysis):
         - adjustment_delta < 0: Power must DISBAND units
         - adjustment_delta == 0: No action needed (but may still have WAIVE option)
         """
-        moves_display = self._format_moves_for_prompt(valid_moves)
 
         if adjustment_delta > 0:
             # BUILD phase
@@ -412,85 +314,20 @@ WAIVE
             order_count = len(valid_moves)
             example = self._get_example_move(valid_moves)
 
-        if self.config.compact_mode:
-            if self.config.prefix_cache_optimized:
-                if self.config.show_valid_moves:
-                    # Full mode: show all valid options
-                    prompt = (
-                        f"{ADJUSTMENT_PREFIX}"
-                        f"GAME STATE:\n"
-                        f"Power: {power_name}\n"
-                        f"Phase: {phase}\n"
-                        f"Action: {action} {order_count} unit(s)\n\n"
-                        f"VALID OPTIONS:\n{moves_display}\n\n"
-                        f"Output {order_count} order(s):\n"
-                        "<orders>\n"
-                    )
-                else:
-                    # Minimal mode: action info + board context
-                    # For adjustment, valid moves list is usually small so savings are modest
-                    board_info = self._format_board_context(board_context) if board_context else ""
-                    prompt = (
-                        f"{ADJUSTMENT_PREFIX_MINIMAL}"
-                        f"SITUATION:\n"
-                        f"You are {power_name}. Phase: {phase}\n"
-                        f"Action: {action} {order_count} unit(s)\n"
-                        f"{board_info}\n"
-                        f"OUTPUT {order_count} ORDER(S):\n"
-                        "<orders>\n"
-                    )
-            else:
-                # Legacy compact format (dynamic content first)
-                prompt = (
-                    f"You are {power_name} in {phase}. Action:{action} count:{order_count}. "
-                    "Valid options JSON follows. Emit EXACT adjustment orders in <orders> "
-                    "immediately with no explanation.\n"
-                    f"{moves_display}\n<orders>\n"
-                )
-        else:
-            if self.config.show_valid_moves:
-                prompt = f"""You are playing Diplomacy as {power_name}.
-Phase: {phase}
-Action: {action} {order_count} unit(s)
-
-Available locations and orders:
-{moves_display}
-
-Output exactly {order_count} order(s), one per line.
-Use the EXACT order strings from the list above.
-
-Order format:
-- Build Army: A <LOC> B
-- Build Fleet: F <LOC> B
-- Disband: A <LOC> D or F <LOC> D
-- Skip build: WAIVE
-
-Example:
-<orders>
-{example}
-</orders>
-"""
-            else:
-                # Minimal mode for non-compact
-                prompt = f"""You are playing Diplomacy as {power_name}.
-Phase: {phase}
-Action: {action} {order_count} unit(s)
-
-Output exactly {order_count} order(s), one per line.
-- Build Army: A <HOME_SC> B (e.g., A PAR B)
-- Build Fleet: F <COASTAL_HOME_SC> B (e.g., F BRE B)
-- Disband: <UNIT> D (e.g., A MUN D)
-- Skip build: WAIVE
-
-<orders>
-"""
+        # Minimal mode: action info + board context
+        # For adjustment, valid moves list is usually small so savings are modest
+        board_info = self._format_board_context(board_context) if board_context else ""
+        prompt = (
+            f"{ADJUSTMENT_PREFIX_MINIMAL}"
+            f"SITUATION:\n"
+            f"You are {power_name}. Phase: {phase}\n"
+            f"Action: {action} {order_count} unit(s)\n"
+            f"{board_info}\n"
+            f"OUTPUT {order_count} ORDER(S):\n"
+        )
 
         if self.config.custom_instructions:
             prompt += f"\n{self.config.custom_instructions}\n"
-
-        # Prime the model
-        if not self.config.compact_mode:
-            prompt += "<orders>\n"
 
         return prompt
 
