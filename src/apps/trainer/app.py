@@ -1174,6 +1174,9 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     "reward_std": traj_stats.reward_std,
                     "total_tokens": traj_stats.total_tokens,
                     "total_time_s": time.time() - step_start,
+                    # Effective speedup from buffered pipeline: time saved by not waiting for rollouts
+                    # Positive = training is bottleneck (rollouts are fast/prefetched)
+                    # Zero = rollout is bottleneck (waiting for results)
                     "pipeline_overlap_s": max(0, training_time - rollout_time) if step > 0 else 0,
                 }
             )
