@@ -259,7 +259,9 @@ class DiplomacyWrapper:
     def get_state_json(self) -> dict[str, Any]:
         return to_saved_game_format(self.game)
 
-    def get_board_context(self, power_name: str, include_windows: bool = True) -> dict[str, Any]:
+    def get_board_context(
+        self, power_name: str, include_windows: bool = True, include_action_counts: bool = False
+    ) -> dict[str, Any]:
         """
         Get board context for strategic decision making.
 
@@ -301,7 +303,11 @@ class DiplomacyWrapper:
                 power_rankings.append((pwr, center_count))
         power_rankings.sort(key=lambda x: x[1], reverse=True)
 
-        compact_map_view = self.get_compact_map_view(power_name) if include_windows else ""
+        compact_map_view = (
+            self.get_compact_map_view(power_name, include_action_counts=include_action_counts)
+            if include_windows
+            else ""
+        )
 
         return {
             "my_units": my_units,
@@ -313,22 +319,29 @@ class DiplomacyWrapper:
             "compact_map_view": compact_map_view,
         }
 
-    def get_compact_map_view(self, power_name: str, max_neighbors: int = 4) -> str:
+    def get_compact_map_view(
+        self, power_name: str, max_neighbors: int = 4, include_action_counts: bool = False
+    ) -> str:
         """
         Return a compact, token-efficient map view focused on the player's units.
 
         Format (one line per unit):
             A PAR: PAR->BUR->PIC->GAS | n=BUR | e=GER:BUR
+            (with action counts): A PAR (15 moves): PAR->BUR->PIC | n=BUR
 
         - Path shows the unit's province followed by up to `max_neighbors` adjacent spaces
         - n= lists adjacent neutral SCs
         - e= lists adjacent enemy units with their owning power
+        - (15 moves) shows number of valid actions for this unit (if include_action_counts=True)
         """
         if power_name not in self.game.powers:
             return ""
 
         game_map = self.game.map
         my_units = list(self.game.powers[power_name].units)
+
+        # Get valid moves for action counts
+        valid_moves = self.get_valid_moves(power_name) if include_action_counts else {}
 
         # Owner lookup for supply centers
         owner_by_center: dict[str, str] = {}
@@ -367,7 +380,27 @@ class DiplomacyWrapper:
             # Enemy units adjacent
             enemy_adj = [f"{owner}:{n}" for n, owner in enemy_units.items() if n in neighbors][:3]
 
-            line_parts = [f"{unit}: {neighbor_path}"]
+            # Build unit description with optional action count
+            if include_action_counts:
+                move_count = len(valid_moves.get(unit, []))
+                # Classify action types
+                moves = valid_moves.get(unit, [])
+                can_move = any(" - " in m for m in moves)
+                can_support = any(" S " in m for m in moves)
+                can_convoy = any(" C " in m for m in moves)
+                actions = []
+                if can_move:
+                    actions.append("move")
+                if can_support:
+                    actions.append("support")
+                if can_convoy:
+                    actions.append("convoy")
+                action_str = ",".join(actions) if actions else "hold"
+                unit_desc = f"{unit} ({move_count} moves | {action_str})"
+            else:
+                unit_desc = unit
+
+            line_parts = [f"{unit_desc}: {neighbor_path}"]
             if neutral_adj:
                 line_parts.append(f"n={','.join(neutral_adj)}")
             if enemy_adj:
