@@ -513,9 +513,18 @@ def build_trajectories(
     game_id: str,
     current_year: int,
     cfg: ExperimentConfig,
-) -> list[dict]:
-    """Build trajectory data for training from game results."""
+) -> tuple[list[dict], dict]:
+    """Build trajectory data for training from game results.
+
+    Returns:
+        Tuple of (trajectories, game_stats) where game_stats contains:
+        - sc_counts: List of SC counts for hero powers at end of games
+        - win_bonus_awarded: Number of games where win bonus was achieved
+        - total_games: Total number of games processed
+    """
     trajectories = []
+    sc_counts: list[int] = []
+    win_bonus_awarded = 0
 
     for g_idx, game in enumerate(games):
         final_scores = calculate_final_scores(
@@ -523,6 +532,19 @@ def build_trajectories(
             win_bonus=cfg.win_bonus,
             winner_threshold_sc=cfg.winner_threshold_sc,
         )
+
+        # Track SC counts for hero power (if set) or all powers
+        for power in fork_data[g_idx].keys():
+            if adapter_config.hero_power and power != adapter_config.hero_power:
+                continue
+            n_sc = len(game.game.powers[power].centers)
+            sc_counts.append(n_sc)
+            # Check if this power got win bonus (sole leader above threshold)
+            if n_sc >= cfg.winner_threshold_sc:
+                # Check if sole leader
+                all_sc = [len(p.centers) for p in game.game.powers.values()]
+                if n_sc == max(all_sc) and all_sc.count(n_sc) == 1:
+                    win_bonus_awarded += 1
 
         for power, data in fork_data[g_idx].items():
             if power not in final_scores:
@@ -552,7 +574,13 @@ def build_trajectories(
 
             trajectories.append(traj)
 
-    return trajectories
+    game_stats = {
+        "sc_counts": sc_counts,
+        "win_bonus_awarded": win_bonus_awarded,
+        "total_games": len(games),
+    }
+
+    return trajectories, game_stats
 
 
 def save_visualizations(
@@ -726,7 +754,7 @@ async def run_rollout(
                 metrics.timing.add("ref_scoring", time.time() - ref_start)
 
         # Build trajectories
-        trajectories = build_trajectories(
+        trajectories, game_stats = build_trajectories(
             games=games,
             fork_data=fork_data,
             adapter_config=adapter_config,
@@ -766,6 +794,7 @@ async def run_rollout(
                 "partial_responses": metrics.partial_responses,
                 "extraction_rate": metrics.get_extraction_rate(),
             },
+            "game_stats": game_stats,
             "timing": {
                 "volume_reload_s": volume_reload_time,
                 "total_s": total_s,

@@ -496,6 +496,7 @@ def log_elo_to_wandb(
     training_step: int,
     all_elos: dict[str, float],
     all_agents: list[Any],
+    opponent_win_rates: dict[str, float] | None = None,
 ) -> None:
     """Log Elo metrics to WandB."""
     try:
@@ -508,6 +509,10 @@ def log_elo_to_wandb(
                 "elo/evaluation_step": training_step,
             }
         )
+        # Log per-opponent-type win rates
+        if opponent_win_rates:
+            for opp_type, opp_rate in opponent_win_rates.items():
+                wandb.log({f"elo/vs_{opp_type}_win_rate": opp_rate})
         # Log Elo for all tracked agents
         for agent_name, elo in all_elos.items():
             if agent_name in [a.name for a in all_agents]:
@@ -691,11 +696,26 @@ async def evaluate_league(
     total_games = len(match_summaries)
     win_rate = wins / total_games if total_games > 0 else 0.0
 
+    # Compute per-opponent-type win rates
+    opponent_win_rates: dict[str, float] = {}
+    for opponent_type in ["random_bot", "chaos_bot", "checkpoint"]:
+        if opponent_type == "checkpoint":
+            # All non-baseline opponents
+            type_matches = [m for m in match_summaries if m.gatekeeper not in BASELINE_BOTS]
+        else:
+            type_matches = [m for m in match_summaries if m.gatekeeper == opponent_type]
+
+        if type_matches:
+            type_wins = sum(1 for m in type_matches if m.win)
+            opponent_win_rates[opponent_type] = type_wins / len(type_matches)
+
     eval_duration = time.time() - eval_start
 
     logger.info(f"✅ Elo evaluation complete in {eval_duration:.1f}s")
     logger.info(f"   Challenger Elo: {challenger_new_elo:.0f}")
     logger.info(f"   Win rate: {win_rate:.1%} ({wins}/{total_games})")
+    for opp_type, opp_rate in opponent_win_rates.items():
+        logger.info(f"   vs {opp_type}: {opp_rate:.1%}")
 
     # Log to WandB if run ID provided
     if wandb_run_id:
@@ -708,6 +728,7 @@ async def evaluate_league(
             training_step,
             updated_elos,
             all_agents,
+            opponent_win_rates,
         )
 
     await axiom.flush()
@@ -716,6 +737,7 @@ async def evaluate_league(
         "challenger_path": challenger_path,
         "challenger_elo": challenger_new_elo,
         "win_rate": win_rate,
+        "opponent_win_rates": opponent_win_rates,
         "games_played": total_games,
         "elo_updates": updated_elos,
         "duration_s": eval_duration,

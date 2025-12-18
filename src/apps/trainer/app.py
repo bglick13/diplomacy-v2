@@ -382,7 +382,10 @@ def add_checkpoint_to_league(
 
 
 class RolloutManager:
-    """Manages rollout spawning, collection, and buffering."""
+    """Manages rollout spawning, collection, and buffering.
+
+    Enforces max_concurrent_containers to avoid hitting Modal's hard limits.
+    """
 
     def __init__(
         self,
@@ -394,18 +397,40 @@ class RolloutManager:
         self.run_rollout_fn = run_rollout_fn
         self.league_ctx = league_ctx
         self.buffer: deque[tuple[Any, str | None, Any]] = deque()
+        self.max_containers = cfg.max_concurrent_containers
+
+    @property
+    def containers_in_flight(self) -> int:
+        """Count of currently in-flight containers (buffer size)."""
+        return len(self.buffer)
+
+    @property
+    def available_capacity(self) -> int:
+        """How many more containers can be spawned before hitting the limit."""
+        return max(0, self.max_containers - self.containers_in_flight)
 
     def spawn_batch(
-        self, hero_adapter_path: str | None, current_step: int
+        self, hero_adapter_path: str | None, current_step: int, max_to_spawn: int | None = None
     ) -> tuple[list[Any], list[Any]]:
-        """Spawn a batch of rollouts with appropriate opponent sampling."""
+        """Spawn a batch of rollouts with appropriate opponent sampling.
+
+        Args:
+            hero_adapter_path: Adapter path for hero power
+            current_step: Current training step
+            max_to_spawn: Maximum rollouts to spawn (respects container limit if None)
+        """
         if self.league_ctx:
             reload_league_registry(self.league_ctx, current_step)
 
         handles = []
         match_results = []
 
-        for _ in range(self.cfg.num_groups_per_step):
+        # Respect container limit
+        batch_size = self.cfg.num_groups_per_step
+        if max_to_spawn is not None:
+            batch_size = min(batch_size, max_to_spawn)
+
+        for _ in range(batch_size):
             if self.league_ctx:
                 handle, match_result = self._spawn_league_rollout(hero_adapter_path)
             else:
@@ -456,13 +481,32 @@ class RolloutManager:
         return self.run_rollout_fn.spawn(self.cfg.model_dump(), lora_name=hero_adapter_path)
 
     def prefill_buffer(self, adapter_path: str | None, buffer_depth: int) -> None:
-        """Prefill rollout buffer with initial batches."""
+        """Prefill rollout buffer with initial batches, respecting container limit."""
+        target_rollouts = buffer_depth * self.cfg.num_groups_per_step
+        actual_target = min(target_rollouts, self.max_containers)
+
+        if actual_target < target_rollouts:
+            logger.warning(
+                f"⚠️ Container cap ({self.max_containers}) limits buffer prefill: "
+                f"requested {target_rollouts}, spawning {actual_target}"
+            )
+
+        spawned = 0
         for _ in range(buffer_depth):
-            handles, match_results = self.spawn_batch(adapter_path, current_step=0)
+            if spawned >= actual_target:
+                break
+            remaining = actual_target - spawned
+            handles, match_results = self.spawn_batch(
+                adapter_path, current_step=0, max_to_spawn=remaining
+            )
             for h, mr in zip(handles, match_results, strict=False):
                 self.buffer.append((h, adapter_path, mr))
+                spawned += 1
 
-        logger.info(f"📦 Buffer initialized: {buffer_depth} batches ({len(self.buffer)} rollouts)")
+        logger.info(
+            f"📦 Buffer initialized: {len(self.buffer)} rollouts "
+            f"(cap: {self.max_containers}, depth: {buffer_depth})"
+        )
 
     def collect_rollouts(
         self, target_count: int, current_adapter: str | None, step: int
@@ -485,13 +529,25 @@ class RolloutManager:
         MAX_POLLS = 50
 
         while len(collected) < target_count:
-            # Spawn emergency rollout if buffer empty
+            # Spawn emergency rollout if buffer empty (still respecting container limit)
             if not self.buffer:
-                logger.warning("Rollout buffer unexpectedly empty; spawning emergency rollout")
-                handles, match_results = self.spawn_batch(current_adapter, step)
-                for h, mr in zip(handles, match_results, strict=False):
-                    self.buffer.append((h, current_adapter, mr))
-                polls_without_progress = 0
+                capacity = self.available_capacity
+                if capacity > 0:
+                    logger.warning(
+                        f"Rollout buffer unexpectedly empty; spawning emergency rollout "
+                        f"(capacity: {capacity})"
+                    )
+                    handles, match_results = self.spawn_batch(
+                        current_adapter, step, max_to_spawn=capacity
+                    )
+                    for h, mr in zip(handles, match_results, strict=False):
+                        self.buffer.append((h, current_adapter, mr))
+                    polls_without_progress = 0
+                else:
+                    logger.error(
+                        f"Buffer empty and at container cap ({self.max_containers}), cannot spawn"
+                    )
+                    break
 
             handle, adapter_used, match_result = self.buffer.popleft()
 
@@ -546,14 +602,34 @@ class RolloutManager:
     def spawn_replacement_rollouts(
         self, consumed_count: int, adapter_path: str | None, step: int
     ) -> int:
-        """Spawn rollouts to replace consumed ones. Returns count spawned."""
+        """Spawn rollouts to replace consumed ones, respecting container limit.
+
+        Returns count of rollouts actually spawned.
+        """
+        # Calculate how many we want vs how many we can spawn
+        capacity = self.available_capacity
+        to_spawn = min(consumed_count, capacity)
+
+        if to_spawn < consumed_count:
+            logger.info(
+                f"📊 Container cap limits replacement: "
+                f"wanted {consumed_count}, can spawn {to_spawn} "
+                f"(in-flight: {self.containers_in_flight}, cap: {self.max_containers})"
+            )
+
+        if to_spawn <= 0:
+            return 0
+
         batches_needed = max(
-            1, (consumed_count + self.cfg.num_groups_per_step - 1) // self.cfg.num_groups_per_step
+            1, (to_spawn + self.cfg.num_groups_per_step - 1) // self.cfg.num_groups_per_step
         )
 
         spawned = 0
         for _ in range(batches_needed):
-            handles, match_results = self.spawn_batch(adapter_path, step)
+            if spawned >= to_spawn:
+                break
+            remaining = to_spawn - spawned
+            handles, match_results = self.spawn_batch(adapter_path, step, max_to_spawn=remaining)
             for h, mr in zip(handles, match_results, strict=False):
                 self.buffer.append((h, adapter_path, mr))
                 spawned += 1
@@ -591,10 +667,45 @@ def aggregate_extraction_stats(results: list[RolloutResult]) -> ExtractionStats:
     return stats
 
 
+class GameStats(TypedDict):
+    """Aggregated game statistics from rollouts."""
+
+    sc_counts: list[int]
+    win_bonus_awarded: int
+    total_games: int
+    avg_sc_count: float
+    win_bonus_rate: float
+
+
+def aggregate_game_stats(results: list[RolloutResult]) -> GameStats:
+    """Aggregate game statistics from multiple rollout results."""
+    all_sc_counts: list[int] = []
+    total_win_bonus = 0
+    total_games = 0
+
+    for result in results:
+        game_stats = result.data.get("game_stats", {})
+        all_sc_counts.extend(game_stats.get("sc_counts", []))
+        total_win_bonus += game_stats.get("win_bonus_awarded", 0)
+        total_games += game_stats.get("total_games", 0)
+
+    avg_sc = sum(all_sc_counts) / len(all_sc_counts) if all_sc_counts else 0.0
+    win_rate = total_win_bonus / total_games if total_games > 0 else 0.0
+
+    return GameStats(
+        sc_counts=all_sc_counts,
+        win_bonus_awarded=total_win_bonus,
+        total_games=total_games,
+        avg_sc_count=avg_sc,
+        win_bonus_rate=win_rate,
+    )
+
+
 def build_wandb_metrics(
     step: int,
     step_metrics: dict[str, Any],
     extraction_stats: ExtractionStats,
+    game_stats: GameStats,
     traj_stats: Any,
     cache_stats: dict | None,
     league_ctx: LeagueContext | None,
@@ -624,12 +735,24 @@ def build_wandb_metrics(
         "buffer/consumed": step_metrics["rollouts_consumed"],
         "buffer/spawned": step_metrics.get("rollouts_spawned", 0),
         "buffer/collection_polls": step_metrics["collection_polls"],
+        # Container utilization
+        "containers/in_flight": step_metrics.get("containers_in_flight", 0),
+        "containers/cap": step_metrics.get("container_cap", 0),
+        "containers/utilization": (
+            step_metrics.get("containers_in_flight", 0) / step_metrics.get("container_cap", 1)
+            if step_metrics.get("container_cap", 0) > 0
+            else 0.0
+        ),
         # Extraction
         "extraction/rate": extraction_stats["extraction_rate"],
         "extraction/orders_expected": extraction_stats["orders_expected"],
         "extraction/orders_extracted": extraction_stats["orders_extracted"],
         "extraction/empty_responses": extraction_stats["empty_responses"],
         "extraction/partial_responses": extraction_stats["partial_responses"],
+        # Game outcome stats
+        "game/avg_sc_count": game_stats["avg_sc_count"],
+        "game/win_bonus_rate": game_stats["win_bonus_rate"],
+        "game/total_games": game_stats["total_games"],
         # Power law
         "power_law/cumulative_simulated_years": cumulative_sim_years,
         "power_law/simulated_years_per_step": sim_years_per_step,
@@ -933,6 +1056,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 raw_trajectories.extend(result.data["trajectories"])
 
             extraction_stats = aggregate_extraction_stats(collected)
+            game_stats = aggregate_game_stats(collected)
             match_results = [r.match_result for r in collected if r.match_result is not None]
 
             # Update metrics
@@ -943,6 +1067,8 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     "raw_trajectories": len(raw_trajectories),
                     "rollout_lora": "mixed",
                     "buffer_depth_actual": len(rollout_mgr.buffer),
+                    "containers_in_flight": rollout_mgr.containers_in_flight,
+                    "container_cap": rollout_mgr.max_containers,
                     "extraction_stats": extraction_stats,
                     "failed_rollouts": timing_stats["failed_count"],
                     "rollouts_consumed": len(collected) + timing_stats["failed_count"],
@@ -1049,6 +1175,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 step,
                 step_metrics,
                 extraction_stats,
+                game_stats,
                 traj_stats,
                 cache_stats,
                 league_ctx,

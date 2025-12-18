@@ -172,6 +172,14 @@ class ExperimentConfig(BaseModel):
         default=4,
         description="Number of rollout batches to keep in flight ahead of trainer (2-4 recommended)",
     )
+    max_concurrent_containers: int = Field(
+        default=100,
+        description=(
+            "Maximum number of concurrent Modal containers for rollouts. "
+            "Modal has hard limits (~250-500 depending on plan). "
+            "Set this below the limit to leave headroom for inference containers."
+        ),
+    )
 
     # =========================================================================
     # Optimizer Settings
