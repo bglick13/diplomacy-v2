@@ -2,6 +2,7 @@ import asyncio
 import os
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -327,6 +328,7 @@ def handle_fatal_error(error: Exception) -> None:
         str(VOLUME_PATH): volume,
         str(HF_CACHE_PATH): hf_cache_volume,
     },
+    secrets=[modal.Secret.from_name("axiom-secrets")],
     scaledown_window=60 * 10,
     buffer_containers=2,
 )
@@ -641,12 +643,31 @@ class InferenceEngine:
                 print(f"❌ Generation Error: {e}")
                 raise e
 
-        return await asyncio.gather(
-            *[
-                _generate_single(p, m, lr)
-                for p, m, lr in zip(prompts, valid_moves, lora_reqs, strict=True)
-            ]
+        # Group prompts by adapter for efficient batching
+        # This reduces GPU context switching between different LoRA adapters
+        adapter_groups: dict[str | None, list[tuple[int, str, dict, LoRARequest | None]]] = (
+            defaultdict(list)
         )
+        for i, (prompt, moves, lora_req) in enumerate(
+            zip(prompts, valid_moves, lora_reqs, strict=True)
+        ):
+            adapter_key = lora_req.lora_name if lora_req else None
+            adapter_groups[adapter_key].append((i, prompt, moves, lora_req))
+
+        # Process each adapter group - vLLM batches same-adapter requests efficiently
+        results: list[GenerationResponse | None] = [None] * len(prompts)
+        for _adapter_key, group in adapter_groups.items():
+            group_results = await asyncio.gather(
+                *[_generate_single(prompt, moves, lora_req) for _, prompt, moves, lora_req in group]
+            )
+            for (orig_idx, _, _, _), result in zip(group, group_results, strict=True):
+                results[orig_idx] = result
+
+        # Verify all results were filled (should always be true unless there's a bug)
+        assert len([r for r in results if r is not None]) == len(prompts), (
+            f"Result count mismatch: expected {len(prompts)}, got {len([r for r in results if r is not None])}"
+        )
+        return [r for r in results if r is not None]
 
     def _log_generation_metrics(
         self,
@@ -674,6 +695,11 @@ class InferenceEngine:
             prefix_cache_hits=cache_hits,
         )
 
+        # Calculate per-phase throughput
+        gen_time_s = timing.get("generation_time_s", 0) or 0.001
+        input_tps = total_prompt_tokens / gen_time_s
+        output_tps = total_tokens / gen_time_s
+
         # Detailed timing breakdown
         axiom.log(
             {
@@ -685,6 +711,8 @@ class InferenceEngine:
                 "total_time_s": timing["total_time_s"],
                 "tokens_generated": total_tokens,
                 "tokens_per_second": tokens_per_second,
+                "input_tokens_per_second": round(input_tps, 1),
+                "output_tokens_per_second": round(output_tps, 1),
                 "prompt_tokens": total_prompt_tokens,
                 "prefix_cache_hit_rate": cache_hit_rate,
             }

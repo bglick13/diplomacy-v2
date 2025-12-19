@@ -1088,9 +1088,13 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
         league_ctx = initialize_league_training(cfg)
 
         # Get Modal function handles
-        run_rollout_fn = modal.Function.from_name("diplomacy-grpo", "run_rollout")
-        InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
-        evaluate_league_fn = modal.Function.from_name("diplomacy-grpo", "evaluate_league")
+        run_rollout_fn = modal.Function.from_name("diplomacy-grpo-rollouts", "run_rollout")
+        InferenceEngineCls = modal.Cls.from_name(
+            "diplomacy-grpo-inference-engine", "InferenceEngine"
+        )
+        evaluate_league_fn = modal.Function.from_name(
+            "diplomacy-grpo-evaluation", "evaluate_league"
+        )
 
         # Initialize rollout manager
         rollout_mgr = RolloutManager(cfg, run_rollout_fn, league_ctx)

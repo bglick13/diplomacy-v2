@@ -10,3 +10,4 @@ wheels/
 .venv
 adapter_v*
 blog**
+.env

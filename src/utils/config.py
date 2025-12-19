@@ -165,12 +165,12 @@ class ExperimentConfig(BaseModel):
         description="Number of rollout groups per step (G in GRPO). I.e., how many different game states to start from",
     )
     samples_per_group: int = Field(
-        default=10,
+        default=6,
         description="Number of trajectory samples per group (N in GRPO). I.e., how many different forked games to simulate for each starting state",
     )
     buffer_depth: int = Field(
-        default=4,
-        description="Number of rollout batches to keep in flight ahead of trainer (2-4 recommended)",
+        default=2,
+        description="Number of rollout batches to keep in flight ahead of trainer (1-2 recommended after fork sync)",
     )
     max_concurrent_containers: int = Field(
         default=100,

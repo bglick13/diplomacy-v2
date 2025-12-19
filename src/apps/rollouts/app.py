@@ -492,6 +492,285 @@ async def run_game_fork(
     return {"g_idx": g_idx, "fork_data": game_fork_data}
 
 
+# ============================================================================
+# SYNCHRONIZED FORK EXECUTION
+# ============================================================================
+
+
+def _log_fork_timing_breakdown(rollout_id: str, step_timings: list[dict]) -> None:
+    """Log detailed per-step timing for debugging slow rollouts."""
+    if not step_timings:
+        return
+
+    total_inference = sum(s.get("inference_ms", 0) for s in step_timings)
+    total_game_step = sum(s.get("game_step_ms", 0) for s in step_timings)
+    total_input = sum(s.get("input_collection_ms", 0) for s in step_timings)
+    total_vis = sum(s.get("visualization_ms", 0) for s in step_timings)
+    n_steps = len(step_timings)
+
+    logger.info(
+        f"📊 Fork timing breakdown for {rollout_id}:\n"
+        f"   Steps: {n_steps}\n"
+        f"   Inference: {total_inference:.0f}ms ({total_inference / n_steps:.0f}ms/step)\n"
+        f"   Game step: {total_game_step:.0f}ms\n"
+        f"   Input collection: {total_input:.0f}ms\n"
+        f"   Visualization: {total_vis:.0f}ms"
+    )
+
+    # Log to Axiom for dashboard visualization
+    axiom.log(
+        {
+            "event": "fork_timing_breakdown",
+            "rollout_id": rollout_id,
+            "steps": n_steps,
+            "total_inference_ms": total_inference,
+            "total_game_step_ms": total_game_step,
+            "total_input_collection_ms": total_input,
+            "total_visualization_ms": total_vis,
+            "avg_inference_per_step_ms": total_inference / max(1, n_steps),
+        }
+    )
+
+
+async def process_synchronized_step(
+    fork_inputs: list[tuple[int, DiplomacyWrapper, dict]],
+    adapter_config: "AdapterConfig",
+    inference_engine_cls,
+    cfg: ExperimentConfig,
+    metrics: RolloutMetrics,
+    rollout_id: str,
+    step_count: int,
+    collect_fork_data: bool = False,
+) -> dict[int, tuple[list[str], dict]]:
+    """
+    Process one step for multiple forks in a single batched inference call.
+
+    Args:
+        fork_inputs: List of (g_idx, game, inputs_dict) tuples
+        adapter_config: Configuration for power adapters
+        inference_engine_cls: Modal inference engine class
+        cfg: Experiment configuration
+        metrics: Rollout metrics tracker
+        rollout_id: ID for logging
+        step_count: Current step number
+        collect_fork_data: Whether to collect trajectory data
+
+    Returns:
+        Dict mapping g_idx → (orders_list, fork_data_dict)
+    """
+    # 1. Flatten all prompts from all forks
+    all_prompts: list[str] = []
+    all_valid_moves: list[dict] = []
+    all_lora_names: list[str | None] = []
+    # Track (g_idx, power_idx, power_name, inputs) for each prompt
+    fork_power_map: list[tuple[int, int, str, dict]] = []
+    # Track baseline bot results per fork
+    baseline_results_by_fork: dict[int, dict[int, PowerResult]] = {}
+
+    for g_idx, game, inputs in fork_inputs:
+        baseline_results_by_fork[g_idx] = {}
+
+        # Handle baseline bots first (no inference needed)
+        for idx, power in enumerate(inputs["power_names"]):
+            adapter = adapter_config.power_adapters.get(power)
+            if adapter in BASELINE_BOTS:
+                baseline_results_by_fork[g_idx][idx] = process_baseline_bot(
+                    game, power, adapter, inputs["valid_moves"][idx]
+                )
+
+        # Collect LLM powers
+        indices, prompts, valid_moves_list, lora_names = collect_llm_powers(
+            inputs,
+            adapter_config.power_adapters,
+            exclude_indices=set(baseline_results_by_fork[g_idx].keys()),
+        )
+
+        # Add to batch with tracking
+        for idx, prompt, moves, lora_name in zip(
+            indices, prompts, valid_moves_list, lora_names, strict=True
+        ):
+            all_prompts.append(prompt)
+            all_valid_moves.append(moves)
+            all_lora_names.append(lora_name)
+            fork_power_map.append((g_idx, idx, inputs["power_names"][idx], inputs))
+
+    # 2. Single batched inference call for ALL forks
+    inference_results: dict[int, dict] = {}
+    if all_prompts:
+        batch_indices = list(range(len(all_prompts)))
+        inference_results = await run_batched_inference(
+            inference_engine_cls,
+            cfg.base_model_id,
+            batch_indices,
+            all_prompts,
+            all_valid_moves,
+            all_lora_names,
+            cfg.temperature,
+            cfg.max_new_tokens,
+            metrics,
+            f"Sync Step {step_count} ",
+        )
+
+    # 3. Distribute results back to forks
+    results: dict[int, tuple[list[str], dict]] = {}
+
+    for g_idx, game, inputs in fork_inputs:
+        power_orders: dict[int, list[str]] = {}
+        fork_data_for_step: dict[str, dict] = {}
+
+        # Get baseline bot orders
+        for idx, result in baseline_results_by_fork[g_idx].items():
+            power_orders[idx] = result.orders
+
+        # Get LLM orders from batch results
+        for batch_idx, (fg_idx, power_idx, power_name, fork_inputs_dict) in enumerate(
+            fork_power_map
+        ):
+            if fg_idx != g_idx:
+                continue
+
+            response_data = inference_results.get(batch_idx, {})
+            response_text = response_data.get("text", "")
+            orders = extract_orders(response_text)
+            power_orders[power_idx] = orders
+
+            # Log and record metrics
+            expected_count = len(fork_inputs_dict["valid_moves"][power_idx])
+            log_and_record_orders(
+                rollout_id=rollout_id,
+                power=power_name,
+                orders=orders,
+                expected_count=expected_count,
+                response_text=response_text,
+                phase=game.get_current_phase(),
+                metrics=metrics,
+            )
+
+            # Collect fork data if needed
+            if collect_fork_data and adapter_config.should_collect_power(power_name):
+                fork_data_for_step[power_name] = {
+                    "prompt": fork_inputs_dict["prompts"][power_idx],
+                    "completion": response_text,
+                    "prompt_token_ids": response_data.get("prompt_token_ids", []),
+                    "completion_token_ids": response_data.get("token_ids", []),
+                    "completion_logprobs": response_data.get("completion_logprobs", []),
+                }
+
+        # Combine all orders in correct order
+        all_orders: list[str] = []
+        for idx in range(len(inputs["power_names"])):
+            all_orders.extend(power_orders.get(idx, []))
+
+        results[g_idx] = (all_orders, fork_data_for_step)
+
+    return results
+
+
+async def run_synchronized_forks(
+    games: list[DiplomacyWrapper],
+    agent: LLMAgent,
+    adapter_config: "AdapterConfig",
+    inference_engine_cls,
+    cfg: ExperimentConfig,
+    metrics: RolloutMetrics,
+    rollout_id: str,
+    target_year: int,
+    visualizers: list[GameVisualizer] | None = None,
+) -> dict[int, dict]:
+    """
+    Run all game forks with synchronized inference calls.
+
+    Instead of each fork making independent inference calls,
+    batch all forks' prompts together at each step. This reduces
+    Modal round-trips from (N_forks × N_steps) to N_steps.
+
+    Args:
+        games: List of game instances (one per fork)
+        agent: LLM agent for prompt building
+        adapter_config: Configuration for power adapters
+        inference_engine_cls: Modal inference engine class
+        cfg: Experiment configuration
+        metrics: Rollout metrics tracker
+        rollout_id: ID for logging
+        target_year: Year to run games until
+        visualizers: Optional list of visualizers (one per fork)
+
+    Returns:
+        Dict mapping g_idx → fork_data (trajectory data from step 1)
+    """
+    fork_data: dict[int, dict] = {g_idx: {} for g_idx in range(len(games))}
+    step_count = 0
+
+    # Track which forks are still active (not ended)
+    active_forks = set(range(len(games)))
+
+    # Timing accumulators
+    step_timings: list[dict] = []
+
+    while active_forks:
+        step_count += 1
+        step_timing: dict[str, float | int] = {
+            "step": step_count,
+            "active_forks": len(active_forks),
+        }
+
+        # Time: Collect inputs from all active forks
+        t0 = time.time()
+        fork_inputs: list[tuple[int, DiplomacyWrapper, dict]] = []
+        for g_idx in list(active_forks):
+            game = games[g_idx]
+            if game.get_year() >= target_year or game.is_done():
+                active_forks.remove(g_idx)
+                continue
+            inputs = game.get_all_inputs(agent=agent)
+            fork_inputs.append((g_idx, game, inputs))
+        step_timing["input_collection_ms"] = (time.time() - t0) * 1000
+
+        if not fork_inputs:
+            break
+
+        step_timing["prompts_batched"] = sum(len(inputs["prompts"]) for _, _, inputs in fork_inputs)
+
+        # Time: Process synchronized step (includes inference)
+        t0 = time.time()
+        results = await process_synchronized_step(
+            fork_inputs=fork_inputs,
+            adapter_config=adapter_config,
+            inference_engine_cls=inference_engine_cls,
+            cfg=cfg,
+            metrics=metrics,
+            rollout_id=rollout_id,
+            step_count=step_count,
+            collect_fork_data=(step_count == 1),
+        )
+        step_timing["inference_ms"] = (time.time() - t0) * 1000
+
+        # Time: Apply results to forks
+        t0 = time.time()
+        for g_idx, game, _ in fork_inputs:
+            orders, step_fork_data = results[g_idx]
+            game.step(orders)
+
+            if step_count == 1 and step_fork_data:
+                fork_data[g_idx] = step_fork_data
+        step_timing["game_step_ms"] = (time.time() - t0) * 1000
+
+        # Time: Visualization
+        if visualizers:
+            t0 = time.time()
+            for g_idx, game, _ in fork_inputs:
+                if g_idx < len(visualizers) and visualizers[g_idx]:
+                    visualizers[g_idx].capture_turn(game.game, f"Sync step {step_count}")
+            step_timing["visualization_ms"] = (time.time() - t0) * 1000
+
+        step_timings.append(step_timing)
+
+    # Log detailed timing breakdown
+    _log_fork_timing_breakdown(rollout_id, step_timings)
+
+    return fork_data
+
+
 async def compute_reference_logprobs(
     fork_data: dict[int, dict],
     inference_engine_cls,
@@ -694,7 +973,9 @@ async def run_rollout(
         adapter_config = AdapterConfig.from_params(lora_name, power_adapters, hero_power)
 
         # Get InferenceEngine class from deployed app
-        InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
+        InferenceEngineCls = modal.Cls.from_name(
+            "diplomacy-grpo-inference-engine", "InferenceEngine"
+        )
 
         # Ensure LoRA adapters are loaded
         volume_reload_time = ensure_adapters_loaded(adapter_config)
@@ -764,27 +1045,21 @@ async def run_rollout(
         current_year = main_game.get_year()
         target_year = current_year + cfg.rollout_horizon_years
 
-        # Run all game forks concurrently
-        with stopwatch("Async Group Rollout"):
-            game_tasks = [
-                run_game_fork(
-                    g_idx=g_idx,
-                    game=game,
-                    agent=agent,
-                    adapter_config=adapter_config,
-                    inference_engine_cls=InferenceEngineCls,
-                    cfg=cfg,
-                    metrics=metrics,
-                    rollout_id=rollout_id,
-                    target_year=target_year,
-                    vis_obj=visualizers[g_idx] if visualizers else None,
-                )
-                for g_idx, game in enumerate(games)
-            ]
-            game_results = await asyncio.gather(*game_tasks)
-
-        # Collect fork data
-        fork_data = {result["g_idx"]: result["fork_data"] for result in game_results}
+        # Run all game forks with synchronized inference calls
+        # This batches all forks' prompts together at each step, reducing Modal round-trips
+        # from 60 (4 forks × 15 steps) to 15 (1 call per step)
+        with stopwatch("Synchronized Fork Rollout"):
+            fork_data = await run_synchronized_forks(
+                games=games,
+                agent=agent,
+                adapter_config=adapter_config,
+                inference_engine_cls=InferenceEngineCls,
+                cfg=cfg,
+                metrics=metrics,
+                rollout_id=rollout_id,
+                target_year=target_year,
+                visualizers=visualizers,
+            )
 
         # Compute reference logprobs if needed
         ref_logprobs_map = {}

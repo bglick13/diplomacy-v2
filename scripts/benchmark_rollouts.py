@@ -73,7 +73,7 @@ def main():
 
     # Warmup: Ensure InferenceEngine is ready
     print("\n🔥 Warming up InferenceEngine...")
-    InferenceEngine = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
+    InferenceEngine = modal.Cls.from_name("diplomacy-grpo-inference-engine", "InferenceEngine")
     engine = InferenceEngine(model_id=cfg.base_model_id)
     _ = engine.generate.remote(
         prompts=["<orders>"],
@@ -82,7 +82,7 @@ def main():
     print("✅ InferenceEngine ready!")
 
     # Run rollouts
-    run_rollout = modal.Function.from_name("diplomacy-grpo", "run_rollout")
+    run_rollout = modal.Function.from_name("diplomacy-grpo-rollouts", "run_rollout")
 
     start_time = time.time()
     results = []

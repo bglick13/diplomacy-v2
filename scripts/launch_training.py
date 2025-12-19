@@ -112,7 +112,7 @@ def warmup_inference_engine(model_id: str = "Qwen/Qwen2.5-7B-Instruct") -> float
     print("🔥 Warming up InferenceEngine...")
     start = time.time()
 
-    InferenceEngine = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
+    InferenceEngine = modal.Cls.from_name("diplomacy-grpo-inference-engine", "InferenceEngine")
     engine = InferenceEngine(model_id=model_id)
 
     # Make a minimal call to trigger container startup
@@ -152,7 +152,7 @@ def run_training(cfg: ExperimentConfig, skip_warmup: bool = False) -> TrainingRe
         print("⏭️  Skipping warmup (--no-warmup)")
 
     # 2. Launch the training function
-    train_grpo = modal.Function.from_name("diplomacy-grpo", "train_grpo")
+    train_grpo = modal.Function.from_name("diplomacy-grpo-trainer", "train_grpo")
 
     print("\n🏋️ Launching training job on Modal...")
     result = train_grpo.remote(config_dict=cfg.model_dump())
@@ -231,7 +231,7 @@ def main():
 
     if args.detach:
         # Fire and forget
-        train_grpo = modal.Function.from_name("diplomacy-grpo", "train_grpo")
+        train_grpo = modal.Function.from_name("diplomacy-grpo-trainer", "train_grpo")
 
         # Warmup first if needed
         if not args.no_warmup:
