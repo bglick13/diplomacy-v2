@@ -830,19 +830,36 @@ def _add_cache_metrics(metrics: dict, cache_stats: dict) -> None:
     batch_size_total = cache_stats.get("batch_size_total", 0)
     real_stats = cache_stats.get("real_stats_available", False)
 
+    # Check for vLLM-specific stats (more accurate than cumulative estimates)
+    vllm_queries = cache_stats.get("vllm_queries")
+    vllm_hits = cache_stats.get("vllm_hits")
+    vllm_hit_rate = cache_stats.get("vllm_hit_rate")
+
     cache_metrics = {
         "cache/prompt_tokens": total_prompt_tokens,
         "cache/batches": batches,
         "cache/total_requests": batch_size_total,
     }
 
-    if total_queries > 0:
+    # Prefer vLLM stats if available (direct from Prometheus counters)
+    if vllm_queries is not None and vllm_queries > 0:
+        cache_metrics.update(
+            {
+                "cache/hit_rate": vllm_hit_rate,
+                "cache/total_queries": vllm_queries,
+                "cache/total_hits": vllm_hits,
+                "cache/vllm_stats_available": 1,
+            }
+        )
+    elif total_queries > 0:
+        # Fallback to cumulative estimates
         cache_hit_rate = total_hits / total_queries
         cache_metrics.update(
             {
                 "cache/hit_rate": cache_hit_rate,
                 "cache/total_queries": total_queries,
                 "cache/total_hits": total_hits,
+                "cache/vllm_stats_available": 0,
             }
         )
 
@@ -1388,11 +1405,21 @@ def _get_cache_stats(inference_engine_cls: Any, model_id: str, step: int) -> dic
         result = inference_engine_cls(model_id=model_id).get_cache_stats.remote()
         cache_stats = result.get("cumulative", {})
         vllm_stats = result.get("vllm_stats")
+
+        # Build info string
+        vllm_info = "None"
+        if vllm_stats:
+            vllm_info = (
+                f"queries={vllm_stats.get('queries')}, "
+                f"hits={vllm_stats.get('hits')}, "
+                f"hit_rate={vllm_stats.get('hit_rate', 0):.1%}"
+            )
+
         logger.info(
             f"📊 Cache stats for step {step}: "
             f"batches={cache_stats.get('batches_processed', 0)}, "
             f"prompt_tokens={cache_stats.get('total_prompt_tokens', 0)}, "
-            f"vllm_stats={'available' if vllm_stats else 'None'}"
+            f"vllm=[{vllm_info}]"
         )
         return cache_stats
     except Exception as e:

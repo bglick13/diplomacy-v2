@@ -1183,6 +1183,178 @@ def get_cache_stats(
     return result
 
 
+@cli.command("get-traces")
+@click.option(
+    "--project",
+    "-p",
+    default="diplomacy-grpo",
+    help="Weave project name",
+    show_default=True,
+)
+@click.option(
+    "--op-name",
+    default="log_trajectory",
+    help="Operation name to filter by",
+    show_default=True,
+)
+@click.option("--limit", "-l", default=10, help="Maximum traces to return", show_default=True)
+@click.option("--power", default=None, help="Filter by power (e.g., FRANCE)")
+@click.option("--run-name", "-r", default=None, help="Filter by training run name")
+@click.option(
+    "--extraction-status",
+    type=click.Choice(["full", "partial", "empty"]),
+    default=None,
+    help="Filter by extraction status",
+)
+@click.option("--min-reward", type=float, default=None, help="Minimum reward filter")
+@click.option("--max-reward", type=float, default=None, help="Maximum reward filter")
+@click.option(
+    "--output-format",
+    "-o",
+    type=click.Choice(["json", "table"]),
+    default="json",
+    help="Output format",
+    show_default=True,
+)
+def get_traces_cmd(
+    project: str,
+    op_name: str,
+    limit: int,
+    power: str | None,
+    run_name: str | None,
+    extraction_status: str | None,
+    min_reward: float | None,
+    max_reward: float | None,
+    output_format: str,
+) -> None:
+    """Get trajectory traces from Weave."""
+    result = get_traces(
+        project=project,
+        op_name=op_name,
+        limit=limit,
+        power=power,
+        run_name=run_name,
+        extraction_status=extraction_status,
+        min_reward=min_reward,
+        max_reward=max_reward,
+        output_format=output_format,
+    )
+    if output_format == "json":
+        click.echo(json.dumps(result, indent=2, default=str))
+
+
+def get_traces(
+    project: str,
+    op_name: str = "log_trajectory",
+    limit: int = 10,
+    power: str | None = None,
+    run_name: str | None = None,
+    extraction_status: str | None = None,
+    min_reward: float | None = None,
+    max_reward: float | None = None,
+    output_format: str = "json",
+) -> dict[str, Any]:
+    """
+    Get trajectory traces from Weave.
+
+    Args:
+        project: Weave project name
+        op_name: Operation name to filter by (default: log_trajectory)
+        limit: Maximum number of traces to return
+        power: Filter by power (e.g., FRANCE)
+        run_name: Filter by training run name
+        extraction_status: Filter by extraction status (full, partial, empty)
+        min_reward: Minimum reward filter
+        max_reward: Maximum reward filter
+        output_format: Output format (json, table)
+
+    Returns:
+        Dictionary with traces data
+    """
+    try:
+        import weave
+    except ImportError:
+        return {"error": "weave package not installed. Run: pip install weave"}
+
+    try:
+        # Initialize Weave client
+        client = weave.init(project)
+
+        # Get calls for the specified operation
+        # Note: Weave API may vary across versions - this uses a defensive approach
+        calls_result = client.get_calls(limit=limit)  # type: ignore[call-arg]
+        calls = [c for c in calls_result if op_name in str(getattr(c, "op_name", ""))][:limit]
+
+        traces = []
+        for call in calls:
+            # Extract input data from the call
+            inputs = call.inputs if hasattr(call, "inputs") else {}
+            trajectory = inputs.get("trajectory", {})
+
+            # Apply filters
+            if power and trajectory.get("power") != power:
+                continue
+            if run_name and trajectory.get("run_name") != run_name:
+                continue
+            if extraction_status and trajectory.get("extraction_status") != extraction_status:
+                continue
+
+            reward = trajectory.get("reward", 0)
+            if min_reward is not None and reward < min_reward:
+                continue
+            if max_reward is not None and reward > max_reward:
+                continue
+
+            trace_data = {
+                "id": str(call.id) if hasattr(call, "id") else None,
+                "created_at": str(call.started_at) if hasattr(call, "started_at") else None,
+                "trajectory": trajectory,
+            }
+            traces.append(trace_data)
+
+        result: dict[str, Any] = {
+            "project": project,
+            "op_name": op_name,
+            "count": len(traces),
+            "traces": traces,
+        }
+
+        if output_format == "table" and traces:
+            click.echo(f"\nTrajectory Traces from Weave ({project})")
+            click.echo("-" * 80)
+            click.echo(
+                f"{'Power':<10} {'Year':<6} {'Reward':<10} {'Status':<10} "
+                f"{'Orders':<15} {'Run':<20}"
+            )
+            click.echo("-" * 80)
+
+            for trace in traces:
+                traj = trace.get("trajectory", {})
+                orders_str = f"{traj.get('orders_extracted', 0)}/{traj.get('orders_expected', 0)}"
+                click.echo(
+                    f"{traj.get('power', 'N/A'):<10} "
+                    f"{traj.get('year', 'N/A'):<6} "
+                    f"{traj.get('reward', 0):<10.2f} "
+                    f"{traj.get('extraction_status', 'N/A'):<10} "
+                    f"{orders_str:<15} "
+                    f"{traj.get('run_name', 'N/A')[:20]:<20}"
+                )
+
+            click.echo(f"\nTotal: {len(traces)} traces")
+
+        return result
+
+    except Exception as e:
+        return {
+            "error": str(e),
+            "project": project,
+            "message": (
+                "Failed to fetch traces from Weave. "
+                "Make sure you have logged trajectories using log_trajectory()."
+            ),
+        }
+
+
 def main() -> None:
     """Main CLI entry point."""
     cli()

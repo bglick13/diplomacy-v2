@@ -279,10 +279,12 @@ def log_rollout_start(
     warmup_phases: int,
     samples_per_group: int,
     horizon_years: int,
+    horizon_type: str = "short",
 ):
     """Log the start of a rollout."""
     console_logger.info(
-        f"🚀 Rollout {rollout_id}: warmup={warmup_phases}, samples={samples_per_group}, horizon={horizon_years}"
+        f"🚀 Rollout {rollout_id}: warmup={warmup_phases}, samples={samples_per_group}, "
+        f"horizon={horizon_years} ({horizon_type})"
     )
     axiom.log(
         {
@@ -291,6 +293,7 @@ def log_rollout_start(
             "warmup_phases": warmup_phases,
             "samples_per_group": samples_per_group,
             "horizon_years": horizon_years,
+            "horizon_type": horizon_type,
         }
     )
 

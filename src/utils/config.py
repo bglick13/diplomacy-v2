@@ -58,11 +58,22 @@ class ExperimentConfig(BaseModel):
     # Rollout/Environment Settings
     # =========================================================================
     rollout_horizon_years: int = Field(
-        default=3, description="Number of game years to simulate per rollout"
+        default=4, description="Default/short rollout horizon in game years"
+    )
+    rollout_long_horizon_years: int = Field(
+        default=6, description="Long horizon for a subset of rollouts"
+    )
+    rollout_long_horizon_chance: float = Field(
+        default=0.2,
+        description="Probability of using long horizon (0.0-1.0). 0.2 = 20% long, 80% short",
     )
     rollout_visualize_chance: float = Field(
         default=0.0,
         description="Probability of generating visualization for a rollout (0.0-1.0)",
+    )
+    trajectory_sample_rate: float = Field(
+        default=0.01,
+        description="Fraction of trajectories to log to Weave for debugging (0.01 = 1%)",
     )
     rollout_no_warmup_chance: float = Field(
         default=0.2,
@@ -73,7 +84,7 @@ class ExperimentConfig(BaseModel):
     # Reward / Scoring Settings
     # =========================================================================
     win_bonus: float = Field(
-        default=10.0,
+        default=15.0,
         description=(
             "Bonus reward for the sole leader when they have >= winner_threshold_sc supply centers. "
             "Creates pressure to WIN outright, breaking cooperative stalemate equilibria."
@@ -112,7 +123,7 @@ class ExperimentConfig(BaseModel):
         description="Save checkpoint to league every N steps (for recent curriculum)",
     )
     elo_eval_every_n_steps: int = Field(
-        default=35,
+        default=50,
         description="Run async Elo evaluation every N steps (0 to disable)",
     )
     elo_eval_games_per_opponent: int = Field(
@@ -159,17 +170,17 @@ class ExperimentConfig(BaseModel):
     # =========================================================================
     # Training Loop
     # =========================================================================
-    total_steps: int = Field(default=10, description="Total number of training steps")
+    total_steps: int = Field(default=250, description="Total number of training steps")
     num_groups_per_step: int = Field(
-        default=16,
+        default=24,
         description="Number of rollout groups per step (G in GRPO). I.e., how many different game states to start from",
     )
     samples_per_group: int = Field(
-        default=6,
+        default=8,
         description="Number of trajectory samples per group (N in GRPO). I.e., how many different forked games to simulate for each starting state",
     )
     buffer_depth: int = Field(
-        default=2,
+        default=3,
         description="Number of rollout batches to keep in flight ahead of trainer (1-2 recommended after fork sync)",
     )
     max_concurrent_containers: int = Field(
@@ -194,11 +205,11 @@ class ExperimentConfig(BaseModel):
     # KL Penalty / GRPO Stability Settings
     # =========================================================================
     kl_beta: float = Field(
-        default=0.04,
+        default=0.01,
         description="KL penalty coefficient. Higher values constrain policy closer to reference.",
     )
     kl_beta_warmup_steps: int = Field(
-        default=0,
+        default=20,
         ge=0,
         description=(
             "Number of steps to linearly warmup KL beta from 0 to kl_beta. "
@@ -233,7 +244,7 @@ class ExperimentConfig(BaseModel):
     # Advantage Processing Settings
     # =========================================================================
     advantage_clip: float | None = Field(
-        default=None,
+        default=5,
         description=(
             "Clip advantages to [-clip, +clip] after normalization. "
             "Prevents extreme gradients from outlier rewards. "
@@ -253,7 +264,7 @@ class ExperimentConfig(BaseModel):
     # Inference Settings
     # =========================================================================
     max_new_tokens: int = Field(default=256, description="Maximum tokens to generate per inference")
-    temperature: float = Field(default=0.9, description="Sampling temperature for generation")
+    temperature: float = Field(default=0.8, description="Sampling temperature for generation")
     compact_prompts: bool = Field(
         default=True, description="Use compact prompt format (reduces token count)"
     )
@@ -326,9 +337,17 @@ class ExperimentConfig(BaseModel):
         return self.num_groups_per_step * self.samples_per_group
 
     @property
+    def expected_horizon_years(self) -> float:
+        """Expected rollout horizon accounting for variable horizons."""
+        return (
+            self.rollout_horizon_years * (1 - self.rollout_long_horizon_chance)
+            + self.rollout_long_horizon_years * self.rollout_long_horizon_chance
+        )
+
+    @property
     def simulated_years_per_step(self) -> int:
-        """Calculate total simulated years per training step."""
-        return self.num_groups_per_step * self.samples_per_group * self.rollout_horizon_years
+        """Calculate expected simulated years per training step."""
+        return int(self.num_groups_per_step * self.samples_per_group * self.expected_horizon_years)
 
     @property
     def total_simulated_years(self) -> int:

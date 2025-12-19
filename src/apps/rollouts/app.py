@@ -26,6 +26,12 @@ from src.utils.observability import (
 from src.utils.parsing import extract_orders
 from src.utils.scoring import calculate_final_scores
 from src.utils.vis import GameVisualizer
+from src.utils.weave_traces import (
+    TrajectoryTrace,
+    init_weave,
+    is_weave_initialized,
+    log_trajectory,
+)
 
 app = modal.App("diplomacy-grpo-rollouts")
 
@@ -929,6 +935,124 @@ def save_visualizations(
         logger.info(f"✅ Saved group replay {g_idx} to {output_file}")
 
 
+def sample_and_log_trajectories(
+    trajectories: list[dict],
+    fork_data: dict[int, dict],
+    games: list[DiplomacyWrapper],
+    cfg: ExperimentConfig,
+    rollout_id: str,
+    horizon_type: str,
+    adapter_config: AdapterConfig,
+) -> int:
+    """
+    Sample and log trajectories to Weave for debugging.
+
+    Args:
+        trajectories: List of trajectory dicts from build_trajectories
+        fork_data: Fork data with prompts/completions per power
+        games: List of game instances (one per fork)
+        cfg: Experiment configuration
+        rollout_id: Rollout identifier
+        horizon_type: "short" or "long"
+        adapter_config: Configuration for power adapters
+
+    Returns:
+        Number of trajectories logged to Weave
+    """
+    if cfg.trajectory_sample_rate <= 0:
+        return 0
+
+    # Initialize Weave if not already done
+    if not is_weave_initialized():
+        try:
+            init_weave(cfg.wandb_project)
+        except Exception as e:
+            logger.warning(f"Failed to initialize Weave: {e}")
+            return 0
+
+    logged_count = 0
+
+    for g_idx, power_data in fork_data.items():
+        game = games[g_idx]
+        year = game.get_year()
+        phase = game.get_current_phase()
+
+        for power, data in power_data.items():
+            # Sample based on configured rate
+            if random.random() >= cfg.trajectory_sample_rate:
+                continue
+
+            # Find matching trajectory for reward
+            prompt = data.get("prompt", "")
+            completion = data.get("completion", "")
+            reward = 0.0
+
+            # Match by group_id pattern
+            group_pattern = f"_{power}_"
+            for traj in trajectories:
+                if group_pattern in traj.get("group_id", "") and traj.get("prompt") == prompt:
+                    reward = traj.get("reward", 0.0)
+                    break
+
+            # Extract orders from completion
+            extracted_orders = extract_orders(completion)
+            expected_count = len(game.game.powers[power].units)
+
+            # Determine extraction status
+            if len(extracted_orders) == expected_count:
+                extraction_status = "full"
+            elif len(extracted_orders) > 0:
+                extraction_status = "partial"
+            else:
+                extraction_status = "empty"
+
+            try:
+                trace = TrajectoryTrace(
+                    game_id=game.game.game_id,
+                    rollout_id=rollout_id,
+                    run_name=cfg.run_name,
+                    power=power,
+                    year=year,
+                    phase=phase,
+                    prompt=prompt,
+                    completion=completion,
+                    reward=reward,
+                    orders_expected=expected_count,
+                    orders_extracted=len(extracted_orders),
+                    extraction_status=extraction_status,
+                    extracted_orders=extracted_orders,
+                    horizon_type=horizon_type,
+                    hero_adapter=adapter_config.power_adapters.get(adapter_config.hero_power)
+                    if adapter_config.hero_power
+                    else None,
+                    opponent_adapters=[
+                        a
+                        for p, a in adapter_config.power_adapters.items()
+                        if a and p != adapter_config.hero_power
+                    ],
+                    prompt_tokens=len(data.get("prompt_token_ids", [])),
+                    completion_tokens=len(data.get("completion_token_ids", [])),
+                )
+                log_trajectory(trace)
+                logged_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to log trajectory to Weave: {e}")
+
+    if logged_count > 0:
+        logger.info(
+            f"📊 Logged {logged_count} trajectories to Weave (sample_rate={cfg.trajectory_sample_rate})"
+        )
+    elif cfg.trajectory_sample_rate > 0:
+        # Log that we tried but didn't sample any (for debugging)
+        total_candidates = sum(len(pd) for pd in fork_data.values())
+        logger.debug(
+            f"📊 Weave sampling: 0/{total_candidates} trajectories sampled "
+            f"(sample_rate={cfg.trajectory_sample_rate})"
+        )
+
+    return logged_count
+
+
 # ============================================================================
 # MAIN ROLLOUT FUNCTION
 # ============================================================================
@@ -939,7 +1063,10 @@ def save_visualizations(
     cpu=1.0,
     memory=2048,
     timeout=3600,
-    secrets=[modal.Secret.from_name("axiom-secrets")],
+    secrets=[
+        modal.Secret.from_name("axiom-secrets"),
+        modal.Secret.from_name("wandb-secret"),  # For Weave trajectory logging
+    ],
     volumes={str(VOLUME_PATH): volume},
 )
 async def run_rollout(
@@ -992,6 +1119,14 @@ async def run_rollout(
         if random.random() < cfg.rollout_no_warmup_chance:
             warmup_phases = 0
 
+        # Determine rollout horizon (variable: 80% short, 20% long by default)
+        if random.random() < cfg.rollout_long_horizon_chance:
+            horizon_years = cfg.rollout_long_horizon_years
+            horizon_type = "long"
+        else:
+            horizon_years = cfg.rollout_horizon_years
+            horizon_type = "short"
+
         # Initialize main game and metrics
         main_game = DiplomacyWrapper(horizon=99)
         rollout_id = main_game.game.game_id
@@ -1001,7 +1136,8 @@ async def run_rollout(
             rollout_id=rollout_id,
             warmup_phases=warmup_phases,
             samples_per_group=cfg.samples_per_group,
-            horizon_years=cfg.rollout_horizon_years,
+            horizon_years=horizon_years,
+            horizon_type=horizon_type,
         )
 
         # Initialize visualization
@@ -1041,7 +1177,7 @@ async def run_rollout(
         metrics.timing.add("forking", time.time() - fork_start)
 
         current_year = main_game.get_year()
-        target_year = current_year + cfg.rollout_horizon_years
+        target_year = current_year + horizon_years
 
         # Run all game forks with synchronized inference calls
         # This batches all forks' prompts together at each step, reducing Modal round-trips
@@ -1080,6 +1216,17 @@ async def run_rollout(
             game_id=main_game.game.game_id,
             current_year=current_year,
             cfg=cfg,
+        )
+
+        # Sample and log trajectories to Weave for debugging
+        sample_and_log_trajectories(
+            trajectories=trajectories,
+            fork_data=fork_data,
+            games=games,
+            cfg=cfg,
+            rollout_id=rollout_id,
+            horizon_type=horizon_type,
+            adapter_config=adapter_config,
         )
 
         # Save visualizations

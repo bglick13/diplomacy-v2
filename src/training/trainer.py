@@ -257,7 +257,24 @@ def process_trajectories(
         total_completion_tokens / len(processed_batch) if processed_batch else 0.0
     )
 
-    # Compute advantage statistics
+    # Global batch normalization (REINFORCE++ style)
+    # After group-level normalization, we apply global normalization across the entire batch.
+    # This eliminates the bias from group-level normalization that only vanishes as batch size → ∞.
+    # Reference: https://arxiv.org/html/2501.03262
+    if all_advantages and len(all_advantages) > 1:
+        adv_array = np.array(all_advantages)
+        global_mean = float(adv_array.mean())
+        global_std = float(adv_array.std())
+
+        if global_std > 1e-8:  # Avoid division by zero
+            # Re-normalize all advantages with global stats
+            for i, item in enumerate(processed_batch):
+                old_adv = item["advantages"]
+                new_adv = (old_adv - global_mean) / global_std
+                item["advantages"] = new_adv
+                all_advantages[i] = new_adv
+
+    # Compute advantage statistics (now on globally normalized advantages)
     if all_advantages:
         adv_array = np.array(all_advantages)
         stats.advantage_mean = float(adv_array.mean())

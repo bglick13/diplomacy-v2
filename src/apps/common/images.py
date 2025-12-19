@@ -8,6 +8,7 @@ requirements = [
     "tqdm",
     "cloudpickle",
     "wandb",
+    "weave",  # For trajectory tracing in rollouts
 ]
 
 cpu_image = (

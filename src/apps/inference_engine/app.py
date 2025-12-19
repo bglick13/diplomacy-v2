@@ -174,42 +174,126 @@ class CacheStatsTracker:
         }
 
 
+# Cache for discovered metric names (set once on first successful discovery)
+_cache_metric_names: dict[str, str] = {}
+_cache_metrics_logged: bool = False
+
+
 def get_vllm_cache_stats() -> dict | None:
     """
     Extract prefix cache stats from vLLM's Prometheus metrics.
 
-    vLLM v1 exposes prefix cache metrics as Prometheus counters:
-    - vllm:prefix_cache_queries (Counter)
-    - vllm:prefix_cache_hits (Counter)
+    vLLM v1 exposes prefix cache metrics as Prometheus counters with various
+    possible naming conventions depending on version:
+    - vllm:prefix_cache_queries / vllm:prefix_cache_hits (v1)
+    - vllm_prefix_cache_queries_total (prometheus-style)
+    - prefix_cache_hit_rate (gauge)
+    - gpu_prefix_cache_hit_rate (gpu-specific gauge)
 
     Returns:
         dict with hit_rate, queries, hits if available, else None
     """
+    global _cache_metric_names, _cache_metrics_logged
+
     try:
         from prometheus_client import REGISTRY
 
         queries = 0
         hits = 0
+        hit_rate_gauge = None
 
-        # Look for vLLM prefix cache counters
-        for metric in REGISTRY.collect():
-            metric_name = metric.name.replace(":", "_")
+        # Collect all metrics and their samples
+        all_metrics = list(REGISTRY.collect())
 
-            if "prefix_cache_queries" in metric_name:
+        # Debug: log available metrics once per container lifecycle
+        if not _cache_metrics_logged:
+            cache_related_metrics = []
+            for metric in all_metrics:
+                metric_name = metric.name.lower()
+                if any(
+                    kw in metric_name for kw in ["cache", "prefix", "kv", "block", "hit", "miss"]
+                ):
+                    sample_info = [
+                        f"{s.name}={s.value}" for s in metric.samples[:3]
+                    ]  # First 3 samples
+                    cache_related_metrics.append(f"{metric.name}: {sample_info}")
+
+            if cache_related_metrics:
+                print(f"📊 Cache-related Prometheus metrics found: {cache_related_metrics}")
+            else:
+                print(
+                    "⚠️ No cache-related Prometheus metrics found. "
+                    "vLLM may not expose cache stats via Prometheus."
+                )
+            _cache_metrics_logged = True
+
+        # Search patterns for cache metrics (order by likelihood)
+        query_patterns = [
+            "prefix_cache_queries",
+            "prefix_cache_query",
+            "cache_queries",
+            "kv_cache_queries",
+        ]
+        hit_patterns = [
+            "prefix_cache_hits",
+            "prefix_cache_hit",
+            "cache_hits",
+            "kv_cache_hits",
+        ]
+        rate_patterns = [
+            "prefix_cache_hit_rate",
+            "gpu_prefix_cache_hit_rate",
+            "cache_hit_rate",
+        ]
+
+        for metric in all_metrics:
+            metric_name = metric.name.replace(":", "_").lower()
+
+            # Check for query counter
+            if any(pattern in metric_name for pattern in query_patterns):
                 for sample in metric.samples:
-                    if sample.name.endswith("_total") or sample.name == metric.name:
+                    sample_name = sample.name.lower()
+                    if sample_name.endswith("_total") or sample_name == metric_name:
                         queries = int(sample.value)
+                        if not _cache_metric_names.get("queries"):
+                            _cache_metric_names["queries"] = metric.name
                         break
 
-            elif "prefix_cache_hits" in metric_name:
+            # Check for hit counter
+            elif any(pattern in metric_name for pattern in hit_patterns):
                 for sample in metric.samples:
-                    if sample.name.endswith("_total") or sample.name == metric.name:
+                    sample_name = sample.name.lower()
+                    if sample_name.endswith("_total") or sample_name == metric_name:
                         hits = int(sample.value)
+                        if not _cache_metric_names.get("hits"):
+                            _cache_metric_names["hits"] = metric.name
                         break
 
+            # Check for hit rate gauge (fallback if counters not available)
+            elif any(pattern in metric_name for pattern in rate_patterns):
+                for sample in metric.samples:
+                    if sample.value is not None:
+                        hit_rate_gauge = float(sample.value)
+                        if not _cache_metric_names.get("hit_rate"):
+                            _cache_metric_names["hit_rate"] = metric.name
+                        break
+
+        # Return stats if we found anything useful
         if queries > 0:
             hit_rate = hits / queries
             return {"hit_rate": hit_rate, "queries": queries, "hits": hits}
+        elif hit_rate_gauge is not None:
+            # Use gauge if counters not available
+            return {"hit_rate": hit_rate_gauge, "queries": None, "hits": None}
+        else:
+            # Debug: log why we're returning None
+            # Only log occasionally to avoid spam (when _cache_metric_names is populated)
+            if _cache_metric_names:
+                print(
+                    f"⚠️ Cache stats extraction returned None: "
+                    f"queries={queries}, hits={hits}, hit_rate_gauge={hit_rate_gauge}, "
+                    f"known_metrics={_cache_metric_names}"
+                )
 
     except ImportError:
         pass
@@ -424,9 +508,17 @@ class InferenceEngine:
     def get_cache_stats(self) -> dict:
         """Get current prefix cache statistics."""
         vllm_stats = get_vllm_cache_stats()
+        cumulative = self.cache_stats.to_dict()
+
+        # Merge vLLM stats into cumulative for easier consumption
+        if vllm_stats:
+            cumulative["vllm_hit_rate"] = vllm_stats.get("hit_rate")
+            cumulative["vllm_queries"] = vllm_stats.get("queries")
+            cumulative["vllm_hits"] = vllm_stats.get("hits")
+
         return {
             "vllm_stats": vllm_stats,
-            "cumulative": self.cache_stats.to_dict(),
+            "cumulative": cumulative,
         }
 
     @modal.method()
