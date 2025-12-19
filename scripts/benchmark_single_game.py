@@ -83,7 +83,7 @@ class TokenMetrics:
 
 def run_single_game(cfg: ExperimentConfig) -> tuple[dict, float]:
     """Run a single game and return full result dict with wall time."""
-    run_rollout = modal.Function.from_name("diplomacy-grpo-rollouts", "run_rollout")
+    run_rollout = modal.Function.from_name("diplomacy-grpo", "run_rollout")
 
     start_time = time.time()
     result = run_rollout.remote(cfg.model_dump())
@@ -134,7 +134,7 @@ def main():
     # Warmup
     if not args.skip_warmup:
         print("\n🔥 Warming up InferenceEngine...")
-        InferenceEngine = modal.Cls.from_name("diplomacy-grpo-inference-engine", "InferenceEngine")
+        InferenceEngine = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
         engine = InferenceEngine(model_id=cfg.base_model_id)
         _ = engine.generate.remote(
             prompts=["<orders>"],

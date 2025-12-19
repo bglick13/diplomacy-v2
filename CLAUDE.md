@@ -33,7 +33,9 @@ uv run python scripts/launch_training.py --total-steps 100          # Standard r
 uv run python scripts/run_eval.py --checkpoint "run-name/adapter_v50"
 
 # Deploy to Modal
-modal deploy -m src.apps.deploy
+uv run modal deploy -m src.apps.deploy
+- This results in all apps being composed into a single modal app. E.g., to reference the inference engine you'd do:
+`InferenceEngine = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")` NOT `InferenceEngine = modal.Cls.from_name("diplomacy-grpo-inference-engine", "InferenceEngine")`
 
 # Web app (development)
 INFERENCE_MODE=mock PYTHONPATH=. uvicorn web.backend.server:app --reload --port 8000

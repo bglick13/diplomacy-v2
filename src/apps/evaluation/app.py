@@ -580,7 +580,7 @@ async def evaluate_league(
         Dict with Elo updates and match results
     """
     # Get InferenceEngine class from the deployed app at runtime
-    InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo-inference-engine", "InferenceEngine")
+    InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
 
     eval_start = time.time()
     logger.info(f"🏆 Starting Elo evaluation for {challenger_path}")
@@ -803,7 +803,7 @@ async def run_evaluation(
     from src.utils.vis import GameVisualizer
 
     # Get InferenceEngine class from the deployed app at runtime
-    InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo-inference-engine", "InferenceEngine")
+    InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
 
     # Ensure evals directory exists
     EVALS_PATH.mkdir(parents=True, exist_ok=True)

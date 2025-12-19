@@ -354,7 +354,7 @@ def add_checkpoint_to_league(
     logger.info(f"🏆 Added checkpoint {checkpoint_key} to league")
 
     # Spawn Elo evaluation if enabled
-    if cfg.elo_eval_every_n_steps > 0 and step % cfg.elo_eval_every_n_steps == 0:
+    if cfg.elo_eval_every_n_steps > 0 and step % cfg.elo_eval_every_n_steps == 0 and step > 1:
         logger.info(f"🎯 Spawning Elo evaluation for {checkpoint_key}")
         registry_path_str = str(
             f"/data/league_{cfg.run_name}.json"
@@ -1088,13 +1088,9 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
         league_ctx = initialize_league_training(cfg)
 
         # Get Modal function handles
-        run_rollout_fn = modal.Function.from_name("diplomacy-grpo-rollouts", "run_rollout")
-        InferenceEngineCls = modal.Cls.from_name(
-            "diplomacy-grpo-inference-engine", "InferenceEngine"
-        )
-        evaluate_league_fn = modal.Function.from_name(
-            "diplomacy-grpo-evaluation", "evaluate_league"
-        )
+        run_rollout_fn = modal.Function.from_name("diplomacy-grpo", "run_rollout")
+        InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
+        evaluate_league_fn = modal.Function.from_name("diplomacy-grpo", "evaluate_league")
 
         # Initialize rollout manager
         rollout_mgr = RolloutManager(cfg, run_rollout_fn, league_ctx)

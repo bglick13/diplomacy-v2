@@ -2,7 +2,6 @@ import asyncio
 import os
 import time
 import uuid
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -332,7 +331,7 @@ def handle_fatal_error(error: Exception) -> None:
     scaledown_window=60 * 10,
     buffer_containers=2,
 )
-@modal.concurrent(max_inputs=512, target_inputs=400)
+@modal.concurrent(max_inputs=20, target_inputs=8)
 class InferenceEngine:
     model_id: str = modal.parameter(default="Qwen/Qwen2.5-7B-Instruct")
     is_for_league_evaluation: bool = modal.parameter(default=False)
@@ -643,31 +642,16 @@ class InferenceEngine:
                 print(f"❌ Generation Error: {e}")
                 raise e
 
-        # Group prompts by adapter for efficient batching
-        # This reduces GPU context switching between different LoRA adapters
-        adapter_groups: dict[str | None, list[tuple[int, str, dict, LoRARequest | None]]] = (
-            defaultdict(list)
+        # Process all prompts concurrently - vLLM handles multi-adapter batching internally
+        # with max_loras=8 and dynamic batching
+        results = await asyncio.gather(
+            *[
+                _generate_single(prompt, moves, lora_req)
+                for prompt, moves, lora_req in zip(prompts, valid_moves, lora_reqs, strict=True)
+            ]
         )
-        for i, (prompt, moves, lora_req) in enumerate(
-            zip(prompts, valid_moves, lora_reqs, strict=True)
-        ):
-            adapter_key = lora_req.lora_name if lora_req else None
-            adapter_groups[adapter_key].append((i, prompt, moves, lora_req))
 
-        # Process each adapter group - vLLM batches same-adapter requests efficiently
-        results: list[GenerationResponse | None] = [None] * len(prompts)
-        for _adapter_key, group in adapter_groups.items():
-            group_results = await asyncio.gather(
-                *[_generate_single(prompt, moves, lora_req) for _, prompt, moves, lora_req in group]
-            )
-            for (orig_idx, _, _, _), result in zip(group, group_results, strict=True):
-                results[orig_idx] = result
-
-        # Verify all results were filled (should always be true unless there's a bug)
-        assert len([r for r in results if r is not None]) == len(prompts), (
-            f"Result count mismatch: expected {len(prompts)}, got {len([r for r in results if r is not None])}"
-        )
-        return [r for r in results if r is not None]
+        return list(results)
 
     def _log_generation_metrics(
         self,

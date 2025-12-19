@@ -973,9 +973,7 @@ async def run_rollout(
         adapter_config = AdapterConfig.from_params(lora_name, power_adapters, hero_power)
 
         # Get InferenceEngine class from deployed app
-        InferenceEngineCls = modal.Cls.from_name(
-            "diplomacy-grpo-inference-engine", "InferenceEngine"
-        )
+        InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
 
         # Ensure LoRA adapters are loaded
         volume_reload_time = ensure_adapters_loaded(adapter_config)

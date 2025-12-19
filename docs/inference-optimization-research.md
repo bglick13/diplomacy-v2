@@ -174,10 +174,16 @@ max_loras = 8
 ```python
 gpu = "A100"
 scaledown_window = 600  # 10 minutes
-buffer_containers = 2
-max_inputs = 512
-target_inputs = 400
+min_containers = 2
+max_inputs = 20  # Updated from 512 - allow burst to 20 concurrent batches
+target_inputs = 8  # Updated from 400 - scale up at 8 queued batches (~16-40s work)
 ```
+
+**Rationale for tuning (2024-12-19):**
+- Old `target_inputs=400` meant Modal wouldn't scale until 400 batches queued (~13-33 min of work!)
+- New `target_inputs=8` scales up when ~16-40s of work is queued
+- This reduces latency without significantly increasing container count
+- Container count depends on actual concurrent requests, not the threshold
 
 ---
 
