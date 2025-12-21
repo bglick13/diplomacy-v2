@@ -176,7 +176,7 @@ class ExperimentConfig(BaseModel):
         description="Number of rollout groups per step (G in GRPO). I.e., how many different game states to start from",
     )
     samples_per_group: int = Field(
-        default=8,
+        default=16,
         description="Number of trajectory samples per group (N in GRPO). I.e., how many different forked games to simulate for each starting state",
     )
     buffer_depth: int = Field(
@@ -195,7 +195,7 @@ class ExperimentConfig(BaseModel):
     # =========================================================================
     # Optimizer Settings
     # =========================================================================
-    learning_rate: float = Field(default=1e-5, description="Learning rate for AdamW optimizer")
+    learning_rate: float = Field(default=5e-6, description="Learning rate for AdamW optimizer")
     max_grad_norm: float = Field(default=1.0, description="Maximum gradient norm for clipping")
     chunk_size: int = Field(
         default=8, ge=1, description="Mini-batch size for gradient accumulation (must be >= 1)"

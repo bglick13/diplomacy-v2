@@ -13,6 +13,16 @@ Usage:
     from src.league.types import AgentInfo, OpponentType
 """
 
+from src.league.benchmarks import (
+    BENCHMARK_SUITE,
+    QUICK_BENCHMARK_SUITE,
+    BenchmarkAgent,
+    BenchmarkResult,
+    BenchmarkSuiteResult,
+    BenchmarkTier,
+    get_benchmark_by_name,
+    get_benchmarks_by_tier,
+)
 from src.league.elo import (
     batch_update_elo,
     calculate_expected_score,
@@ -67,6 +77,15 @@ __all__ = [
     # Matchmaker
     "PFSPMatchmaker",
     "PFSPConfig",
+    # Benchmarks
+    "BENCHMARK_SUITE",
+    "QUICK_BENCHMARK_SUITE",
+    "BenchmarkAgent",
+    "BenchmarkResult",
+    "BenchmarkSuiteResult",
+    "BenchmarkTier",
+    "get_benchmark_by_name",
+    "get_benchmarks_by_tier",
     # Elo
     "update_elo_multiplayer",
     "update_elo_from_match",

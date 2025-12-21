@@ -9,11 +9,23 @@ import modal
 import wandb
 
 from src.agents import LLMAgent, PromptConfig
-from src.agents.baselines import ChaosBot, RandomBot
+from src.agents.baselines import (
+    ChaosBot,
+    CoordinatedBot,
+    DefensiveBot,
+    RandomBot,
+    TerritorialBot,
+)
 from src.apps.common.images import cpu_image
 from src.apps.common.volumes import EVALS_PATH, VOLUME_PATH, volume
 from src.engine.wrapper import DiplomacyWrapper
 from src.league import LeagueRegistry, update_elo_from_match
+from src.league.benchmarks import (
+    BENCHMARK_SUITE,
+    QUICK_BENCHMARK_SUITE,
+    BenchmarkResult,
+    BenchmarkSuiteResult,
+)
 from src.league.types import MatchResult
 from src.utils.observability import axiom, logger
 from src.utils.parsing import extract_orders
@@ -26,6 +38,9 @@ POWERS = ["AUSTRIA", "ENGLAND", "FRANCE", "GERMANY", "ITALY", "RUSSIA", "TURKEY"
 BASELINE_BOTS = {
     "random_bot": RandomBot(),
     "chaos_bot": ChaosBot(),
+    "defensive_bot": DefensiveBot(),
+    "territorial_bot": TerritorialBot(),
+    "coordinated_bot": CoordinatedBot(),
     "base_model": None,  # Placeholder for base model
 }
 
@@ -1144,4 +1159,218 @@ async def run_evaluation(
             for r in all_results
         ],
         "visualization_paths": [v["path"] for v in all_visualizations],
+    }
+
+
+# ============================================================================
+# BENCHMARK EVALUATION FUNCTION
+# ============================================================================
+
+
+@app.function(
+    image=cpu_image,
+    timeout=60 * 60 * 2,  # 2 hours max for full benchmark suite
+    retries=0,
+    secrets=[
+        modal.Secret.from_name("axiom-secrets"),
+        modal.Secret.from_name("wandb-secret"),
+    ],
+    volumes={str(VOLUME_PATH): volume},
+)
+async def evaluate_against_benchmarks(
+    challenger_path: str,
+    games_per_benchmark: int = 5,
+    max_years: int = 8,
+    model_id: str = "Qwen/Qwen2.5-7B-Instruct",
+    wandb_run_id: str | None = None,
+    training_step: int = 0,
+    use_quick_suite: bool = False,
+    # Prompt/inference settings
+    show_valid_moves: bool = True,
+    compact_prompts: bool = True,
+    prefix_cache_optimized: bool = True,
+    temperature: float = 0.8,
+    max_new_tokens: int = 256,
+) -> dict:
+    """
+    Evaluate a checkpoint against the fixed benchmark suite.
+
+    This provides absolute skill measurement independent of PFSP dynamics.
+    Unlike league evaluation (which compares against similar-skill peers),
+    benchmarks provide consistent reference points across training runs.
+
+    Args:
+        challenger_path: Path to the checkpoint to evaluate
+        games_per_benchmark: Number of games per benchmark agent
+        max_years: Maximum game length (longer = more signal)
+        model_id: Base model ID
+        wandb_run_id: WandB run ID to log to (from training)
+        training_step: Current training step (for logging)
+        use_quick_suite: Use reduced benchmark set for faster evaluation
+        show_valid_moves: Include valid moves in prompts
+        compact_prompts: Use compact prompt format
+        prefix_cache_optimized: Optimize prompts for prefix caching
+        temperature: Sampling temperature
+        max_new_tokens: Max tokens to generate
+
+    Returns:
+        Dict with benchmark results and overall score
+    """
+    # Get InferenceEngine class from the deployed app at runtime
+    InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
+
+    eval_start = time.time()
+    benchmark_suite = QUICK_BENCHMARK_SUITE if use_quick_suite else BENCHMARK_SUITE
+
+    logger.info(f"📊 Starting benchmark evaluation for {challenger_path}")
+    logger.info(f"   Benchmarks: {[b.name for b in benchmark_suite]}")
+    logger.info(f"   Games per benchmark: {games_per_benchmark}")
+    logger.info(f"   Max years: {max_years}")
+
+    # Initialize LLM agent
+    llm_agent = create_llm_agent(compact_prompts, prefix_cache_optimized, show_valid_moves)
+
+    # Track results
+    suite_result = BenchmarkSuiteResult(challenger_path=challenger_path)
+
+    for benchmark in benchmark_suite:
+        logger.info(f"\n  vs {benchmark.name} ({benchmark.description})...")
+
+        wins = 0
+        total_challenger_score = 0.0
+        total_benchmark_score = 0.0
+
+        for game_idx in range(games_per_benchmark):
+            # Randomly assign challenger to a power
+            challenger_power = random.choice(POWERS)
+            opponent_powers = [p for p in POWERS if p != challenger_power]
+
+            # Build power_adapters
+            power_adapters: dict[str, str | None] = {}
+            power_adapters[challenger_power] = challenger_path
+
+            # Assign benchmark to all other powers
+            for p in opponent_powers:
+                if benchmark.is_baseline():
+                    power_adapters[p] = benchmark.path  # Bot name
+                else:
+                    power_adapters[p] = benchmark.path  # Checkpoint path
+
+            # Run game
+            game_result = await run_full_game(
+                power_adapters=power_adapters,
+                llm_agent=llm_agent,
+                InferenceEngineCls=InferenceEngineCls,
+                model_id=model_id,
+                max_years=max_years,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                is_league_eval=False,
+            )
+
+            # Extract scores
+            challenger_score = game_result.final_scores[challenger_power]
+            benchmark_scores = [game_result.final_scores[p] for p in opponent_powers]
+            benchmark_avg = (
+                sum(benchmark_scores) / len(benchmark_scores) if benchmark_scores else 0.0
+            )
+
+            # Track win (challenger beats average of benchmark agents)
+            if challenger_score > benchmark_avg:
+                wins += 1
+
+            total_challenger_score += challenger_score
+            total_benchmark_score += benchmark_avg
+
+            logger.info(
+                f"    Game {game_idx + 1}: Challenger {challenger_score:.1f} vs "
+                f"Benchmark avg {benchmark_avg:.1f} "
+                f"({'WIN' if challenger_score > benchmark_avg else 'LOSS'})"
+            )
+
+        # Compute benchmark result
+        win_rate = wins / games_per_benchmark
+        avg_score = total_challenger_score / games_per_benchmark
+        avg_benchmark_score = total_benchmark_score / games_per_benchmark
+
+        result = BenchmarkResult(
+            benchmark_name=benchmark.name,
+            games_played=games_per_benchmark,
+            wins=wins,
+            win_rate=win_rate,
+            avg_score=avg_score,
+            avg_benchmark_score=avg_benchmark_score,
+            meets_floor=win_rate >= benchmark.expected_winrate_floor,
+        )
+
+        suite_result.results[benchmark.name] = result
+        suite_result.total_games += games_per_benchmark
+
+        if result.meets_floor:
+            suite_result.benchmarks_passed += 1
+
+        status = "PASS" if result.meets_floor else "FAIL"
+        logger.info(
+            f"  vs {benchmark.name}: {win_rate:.1%} win rate "
+            f"(target: {benchmark.expected_winrate_floor:.0%}) [{status}]"
+        )
+
+    suite_result.benchmarks_total = len(benchmark_suite)
+    suite_result.overall_win_rate = (
+        sum(r.wins for r in suite_result.results.values()) / suite_result.total_games
+        if suite_result.total_games > 0
+        else 0.0
+    )
+
+    eval_duration = time.time() - eval_start
+    overall_score = suite_result.compute_overall_score()
+
+    logger.info("\n" + "=" * 60)
+    logger.info("📊 BENCHMARK EVALUATION COMPLETE")
+    logger.info("=" * 60)
+    logger.info(f"Duration: {eval_duration:.1f}s")
+    logger.info(f"Overall Benchmark Score: {overall_score:.1f}/100")
+    logger.info(
+        f"Benchmarks Passed: {suite_result.benchmarks_passed}/{suite_result.benchmarks_total}"
+    )
+
+    # Log to WandB if run ID provided
+    if wandb_run_id:
+        try:
+            wandb.init(id=wandb_run_id, resume="allow", project="diplomacy-grpo")
+            wandb.log(suite_result.to_wandb_dict())
+            wandb.log({"benchmark/evaluation_step": training_step})
+        except Exception as e:
+            logger.warning(f"Failed to log to WandB: {e}")
+
+    # Log to Axiom
+    axiom.log(
+        {
+            "event": "benchmark_evaluation_complete",
+            "challenger_path": challenger_path,
+            "overall_score": overall_score,
+            "benchmarks_passed": suite_result.benchmarks_passed,
+            "benchmarks_total": suite_result.benchmarks_total,
+            "total_games": suite_result.total_games,
+            "duration_s": eval_duration,
+            "training_step": training_step,
+        }
+    )
+    await axiom.flush()
+
+    return {
+        "challenger_path": challenger_path,
+        "overall_score": overall_score,
+        "overall_win_rate": suite_result.overall_win_rate,
+        "benchmarks_passed": suite_result.benchmarks_passed,
+        "benchmarks_total": suite_result.benchmarks_total,
+        "results": {
+            name: {
+                "win_rate": r.win_rate,
+                "avg_score": r.avg_score,
+                "meets_floor": r.meets_floor,
+            }
+            for name, r in suite_result.results.items()
+        },
+        "duration_s": eval_duration,
     }
