@@ -187,6 +187,23 @@ def process_baseline_bot(
     )
 
 
+def create_no_orders_response() -> PowerResult:
+    """Create a canned response for phases where no orders are needed.
+
+    This avoids wasteful token generation (~200 tokens of "advice") when
+    the model has no valid moves during adjustment phases.
+    """
+    return PowerResult(
+        orders=[],
+        response_data={
+            "text": "<orders>\nWAIVE\n</orders>",
+            "prompt_token_ids": [],
+            "token_ids": [],
+            "completion_logprobs": [],
+        },
+    )
+
+
 def collect_llm_powers(
     inputs: dict,
     power_adapters: dict[str, str | None],
@@ -323,12 +340,16 @@ async def process_game_step(
     power_results: dict[int, PowerResult] = {}
     fork_data = {}
 
-    # 1. Handle baseline bots directly
+    # 1. Handle baseline bots and no-orders cases directly (skip inference)
     for idx, power in enumerate(inputs["power_names"]):
         adapter = adapter_config.power_adapters.get(power)
         if adapter in BASELINE_BOTS:
             result = process_baseline_bot(game, power, adapter, inputs["valid_moves"][idx])
             power_results[idx] = result
+        elif not inputs["valid_moves"][idx]:
+            # No valid moves (e.g., adjustment phase with balanced units/SCs)
+            # Skip inference to avoid wasteful token generation
+            power_results[idx] = create_no_orders_response()
 
     # 2. Collect LLM powers for batched inference (single call with per-prompt adapters)
     indices, prompts, valid_moves_list, lora_names = collect_llm_powers(
@@ -592,13 +613,16 @@ async def process_synchronized_step(
     for g_idx, game, inputs in fork_inputs:
         baseline_results_by_fork[g_idx] = {}
 
-        # Handle baseline bots first (no inference needed)
+        # Handle baseline bots and no-orders cases first (no inference needed)
         for idx, power in enumerate(inputs["power_names"]):
             adapter = adapter_config.power_adapters.get(power)
             if adapter in BASELINE_BOTS:
                 baseline_results_by_fork[g_idx][idx] = process_baseline_bot(
                     game, power, adapter, inputs["valid_moves"][idx]
                 )
+            elif not inputs["valid_moves"][idx]:
+                # No valid moves - skip inference to avoid wasteful token generation
+                baseline_results_by_fork[g_idx][idx] = create_no_orders_response()
 
         # Collect LLM powers
         indices, prompts, valid_moves_list, lora_names = collect_llm_powers(
@@ -691,6 +715,10 @@ async def process_synchronized_step(
                     "prompt_token_ids": response_data.get("prompt_token_ids", []),
                     "completion_token_ids": response_data.get("token_ids", []),
                     "completion_logprobs": response_data.get("completion_logprobs", []),
+                    # Store step-time metadata (not final game state)
+                    "orders_expected": expected_count,
+                    "year": game.get_year(),
+                    "phase": game.get_current_phase(),
                 }
 
         # Combine all orders in correct order
@@ -1060,8 +1088,6 @@ def sample_and_log_trajectories(
 
     for (g_idx, _step_count), power_data in fork_data.items():
         game = games[g_idx]
-        year = game.get_year()
-        phase = game.get_current_phase()
 
         for power, data in power_data.items():
             # Sample based on configured rate
@@ -1082,7 +1108,10 @@ def sample_and_log_trajectories(
 
             # Extract orders from completion
             extracted_orders = extract_orders(completion)
-            expected_count = len(game.game.powers[power].units)
+            # Use step-time metadata stored in fork_data (not final game state)
+            expected_count = data.get("orders_expected", len(extracted_orders))
+            year = data.get("year", game.get_year())
+            phase = data.get("phase", game.get_current_phase())
 
             # Determine extraction status
             if len(extracted_orders) == expected_count:

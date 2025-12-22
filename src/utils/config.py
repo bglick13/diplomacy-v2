@@ -302,7 +302,7 @@ class ExperimentConfig(BaseModel):
     # =========================================================================
     # Inference Settings
     # =========================================================================
-    max_new_tokens: int = Field(default=256, description="Maximum tokens to generate per inference")
+    max_new_tokens: int = Field(default=120, description="Maximum tokens to generate per inference")
     temperature: float = Field(default=0.8, description="Sampling temperature for generation")
     compact_prompts: bool = Field(
         default=True, description="Use compact prompt format (reduces token count)"
