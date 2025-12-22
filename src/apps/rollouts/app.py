@@ -259,6 +259,19 @@ async def run_batched_inference(
         )
         metrics.timing.add("inference", time.time() - inference_start)
 
+    # Validate response structure before returning
+    if not isinstance(responses, list):
+        logger.error(
+            f"generate() returned {type(responses).__name__}, expected list. Returning empty dict."
+        )
+        return {}
+
+    for i, resp in enumerate(responses):
+        if not isinstance(resp, dict):
+            logger.error(
+                f"responses[{i}] is {type(resp).__name__}, expected dict: {repr(resp)[:200]}"
+            )
+
     # Map responses back to original indices
     return dict(zip(indices, responses, strict=True))
 
@@ -478,12 +491,12 @@ async def run_game_fork(
             metrics=metrics,
             rollout_id=rollout_id,
             step_count=step_count,
-            collect_fork_data=(step_count == 1),  # Only collect first step
+            collect_fork_data=True,  # Collect all steps for credit assignment
         )
 
-        # Store fork data from first step
-        if step_count == 1:
-            game_fork_data.update(fork_data)
+        # Store fork data for each step (keyed by step_count)
+        if fork_data:
+            game_fork_data[step_count] = fork_data
 
         # Track game engine time
         engine_start = time.time()
@@ -638,7 +651,22 @@ async def process_synchronized_step(
             if fg_idx != g_idx:
                 continue
 
-            response_data = inference_results.get(batch_idx, {})
+            # Defensive check for inference_results structure
+            if not isinstance(inference_results, dict):
+                logger.error(
+                    f"inference_results is {type(inference_results).__name__}, expected dict"
+                )
+                response_data = {}
+            else:
+                response_data = inference_results.get(batch_idx, {})
+
+            if not isinstance(response_data, dict):
+                logger.error(
+                    f"response_data[{batch_idx}] is {type(response_data).__name__}, "
+                    f"expected dict: {repr(response_data)[:200]}"
+                )
+                response_data = {}
+
             response_text = response_data.get("text", "")
             orders = extract_orders(response_text)
             power_orders[power_idx] = orders
@@ -685,7 +713,7 @@ async def run_synchronized_forks(
     rollout_id: str,
     target_year: int,
     visualizers: list[GameVisualizer] | None = None,
-) -> dict[int, dict]:
+) -> dict[tuple[int, int], dict]:
     """
     Run all game forks with synchronized inference calls.
 
@@ -705,9 +733,9 @@ async def run_synchronized_forks(
         visualizers: Optional list of visualizers (one per fork)
 
     Returns:
-        Dict mapping g_idx → fork_data (trajectory data from step 1)
+        Dict mapping (g_idx, step_count) → fork_data (trajectory data for each step)
     """
-    fork_data: dict[int, dict] = {g_idx: {} for g_idx in range(len(games))}
+    fork_data: dict[tuple[int, int], dict] = {}
     step_count = 0
 
     # Track which forks are still active (not ended)
@@ -750,7 +778,7 @@ async def run_synchronized_forks(
             metrics=metrics,
             rollout_id=rollout_id,
             step_count=step_count,
-            collect_fork_data=(step_count == 1),
+            collect_fork_data=True,  # Collect all steps for credit assignment
         )
         step_timing["inference_ms"] = (time.time() - t0) * 1000
 
@@ -760,8 +788,9 @@ async def run_synchronized_forks(
             orders, step_fork_data = results[g_idx]
             game.step(orders)
 
-            if step_count == 1 and step_fork_data:
-                fork_data[g_idx] = step_fork_data
+            # Store fork data for each step (keyed by (g_idx, step_count))
+            if step_fork_data:
+                fork_data[(g_idx, step_count)] = step_fork_data
         step_timing["game_step_ms"] = (time.time() - t0) * 1000
 
         # Time: Visualization
@@ -781,29 +810,29 @@ async def run_synchronized_forks(
 
 
 async def compute_reference_logprobs(
-    fork_data: dict[int, dict],
+    fork_data: dict[tuple[int, int], dict],
     inference_engine_cls,
     base_model_id: str,
-) -> dict[tuple[int, str], float]:
+) -> dict[tuple[int, int, str], float]:
     """
     Compute base model logprobs for all completions.
 
     Returns:
-        Map of (g_idx, power) -> ref_logprobs
+        Map of (g_idx, step_count, power) -> ref_logprobs
     """
     score_prompts = []
     score_completions = []
     score_prompt_token_ids = []
     score_keys = []
 
-    for g_idx, power_data in fork_data.items():
+    for (g_idx, step_count), power_data in fork_data.items():
         for power, data in power_data.items():
             prompt_tids = data.get("prompt_token_ids", [])
             if prompt_tids:
                 score_prompts.append(data["prompt"])
                 score_completions.append(data["completion"])
                 score_prompt_token_ids.append(prompt_tids)
-                score_keys.append((g_idx, power))
+                score_keys.append((g_idx, step_count, power))
 
     if not score_prompts:
         return {}
@@ -816,7 +845,14 @@ async def compute_reference_logprobs(
 
     ref_logprobs_map = {}
     for key, result in zip(score_keys, score_results, strict=True):
-        ref_logprobs_map[key] = result.get("ref_completion_logprobs")
+        if isinstance(result, dict):
+            ref_logprobs_map[key] = result.get("ref_completion_logprobs")
+        else:
+            logger.error(
+                f"Unexpected score result type at key {key}: "
+                f"{type(result).__name__}, value: {repr(result)[:200]}"
+            )
+            ref_logprobs_map[key] = None
 
     logger.info(f"📊 Computed {len(score_results)} reference logprobs (using base model)")
     return ref_logprobs_map
@@ -824,14 +860,21 @@ async def compute_reference_logprobs(
 
 def build_trajectories(
     games: list[DiplomacyWrapper],
-    fork_data: dict[int, dict],
+    fork_data: dict[tuple[int, int], dict],
     adapter_config: AdapterConfig,
-    ref_logprobs_map: dict[tuple[int, str], float],
+    ref_logprobs_map: dict[tuple[int, int, str], float],
     game_id: str,
-    current_year: int,
     cfg: ExperimentConfig,
 ) -> tuple[list[dict], dict]:
     """Build trajectory data for training from game results.
+
+    Args:
+        games: List of completed game forks
+        fork_data: Dict mapping (g_idx, step_count) → {power: trajectory_data}
+        adapter_config: Configuration for power adapters
+        ref_logprobs_map: Dict mapping (g_idx, step_count, power) → ref_logprobs
+        game_id: Base game identifier for group_id construction
+        cfg: Experiment configuration
 
     Returns:
         Tuple of (trajectories, game_stats) where game_stats contains:
@@ -843,48 +886,46 @@ def build_trajectories(
     sc_counts: list[int] = []
     win_bonus_awarded = 0
 
+    # Pre-compute final scores for all games (only need to do this once per game)
+    final_scores_by_game: dict[int, dict[str, float]] = {}
     for g_idx, game in enumerate(games):
-        # Check for missing or empty fork data - indicates collection failure
-        if g_idx not in fork_data:
-            print(
-                f"⚠️ Warning: Game index {g_idx} missing from fork_data. "
-                "This may indicate a rollout collection failure."
-            )
-            continue
-        if not fork_data[g_idx]:
-            print(
-                f"⚠️ Warning: Empty fork_data for game index {g_idx} (game_id={game_id}). "
-                "No trajectories will be generated for this fork. "
-                "Check if powers are correctly configured for data collection."
-            )
-            # Continue to calculate scores but will skip trajectory creation
-            # (the inner loops will naturally skip since fork_data[g_idx] is empty)
-
-        final_scores = calculate_final_scores(
+        final_scores_by_game[g_idx] = calculate_final_scores(
             game,
             win_bonus=cfg.win_bonus,
             winner_threshold_sc=cfg.winner_threshold_sc,
         )
 
-        # Track SC counts for hero power (if set) or all powers
-        for power in fork_data.get(g_idx, {}).keys():
-            if adapter_config.hero_power and power != adapter_config.hero_power:
-                continue
-            n_sc = len(game.game.powers[power].centers)
-            sc_counts.append(n_sc)
-            # Check if this power got win bonus (sole leader above threshold)
-            if n_sc >= cfg.winner_threshold_sc:
-                # Check if sole leader
-                all_sc = [len(p.centers) for p in game.game.powers.values()]
-                if n_sc == max(all_sc) and all_sc.count(n_sc) == 1:
-                    win_bonus_awarded += 1
+    # Track SC counts for hero powers (one entry per game, not per step)
+    seen_games_for_sc: set[int] = set()
 
-        for power, data in fork_data.get(g_idx, {}).items():
+    # Iterate over all (g_idx, step_count) entries in fork_data
+    for (g_idx, step_count), power_data in fork_data.items():
+        if not power_data:
+            continue
+
+        game = games[g_idx]
+        final_scores = final_scores_by_game[g_idx]
+
+        # Track SC counts once per game (not per step)
+        if g_idx not in seen_games_for_sc:
+            seen_games_for_sc.add(g_idx)
+            for power in power_data.keys():
+                if adapter_config.hero_power and power != adapter_config.hero_power:
+                    continue
+                n_sc = len(game.game.powers[power].centers)
+                sc_counts.append(n_sc)
+                # Check if this power got win bonus (sole leader above threshold)
+                if n_sc >= cfg.winner_threshold_sc:
+                    all_sc = [len(p.centers) for p in game.game.powers.values()]
+                    if n_sc == max(all_sc) and all_sc.count(n_sc) == 1:
+                        win_bonus_awarded += 1
+
+        for power, data in power_data.items():
             if power not in final_scores:
                 continue
 
-            # Get reference logprobs if computed
-            ref_logprobs = ref_logprobs_map.get((g_idx, power))
+            # Get reference logprobs if computed (now keyed by step_count too)
+            ref_logprobs = ref_logprobs_map.get((g_idx, step_count, power))
 
             # If no LoRA used, generation logprobs ARE reference logprobs
             if ref_logprobs is None and not adapter_config.uses_lora(power):
@@ -892,11 +933,13 @@ def build_trajectories(
                 if completion_logprobs:
                     ref_logprobs = sum(completion_logprobs)
 
+            # Use step_count in group_id for proper credit assignment
+            # This ensures trajectories from the same step across forks are grouped together
             traj = {
                 "prompt": data["prompt"],
                 "completion": data["completion"],
                 "reward": final_scores[power],
-                "group_id": f"{game_id}_{power}_{current_year}",
+                "group_id": f"{game_id}_{power}_step{step_count}",
                 "prompt_token_ids": data.get("prompt_token_ids", []),
                 "completion_token_ids": data.get("completion_token_ids", []),
                 "completion_logprobs": data.get("completion_logprobs", []),
@@ -940,7 +983,7 @@ def save_visualizations(
 
 def sample_and_log_trajectories(
     trajectories: list[dict],
-    fork_data: dict[int, dict],
+    fork_data: dict[tuple[int, int], dict],
     games: list[DiplomacyWrapper],
     cfg: ExperimentConfig,
     rollout_id: str,
@@ -952,7 +995,7 @@ def sample_and_log_trajectories(
 
     Args:
         trajectories: List of trajectory dicts from build_trajectories
-        fork_data: Fork data with prompts/completions per power
+        fork_data: Fork data mapping (g_idx, step_count) → {power: data}
         games: List of game instances (one per fork)
         cfg: Experiment configuration
         rollout_id: Rollout identifier
@@ -975,7 +1018,7 @@ def sample_and_log_trajectories(
 
     logged_count = 0
 
-    for g_idx, power_data in fork_data.items():
+    for (g_idx, _step_count), power_data in fork_data.items():
         game = games[g_idx]
         year = game.get_year()
         phase = game.get_current_phase()
@@ -1217,7 +1260,6 @@ async def run_rollout(
             adapter_config=adapter_config,
             ref_logprobs_map=ref_logprobs_map,
             game_id=main_game.game.game_id,
-            current_year=current_year,
             cfg=cfg,
         )
 

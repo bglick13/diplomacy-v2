@@ -227,7 +227,11 @@ class TestProcessTrajectories:
         assert 0.9 < np.std(advantages) < 1.1
 
     def test_identical_rewards_handling(self, mock_tokenizer):
-        """Test handling when all rewards in a group are identical."""
+        """Test handling when all rewards in a group are identical.
+
+        Groups with identical rewards have zero variance, so they provide
+        no gradient signal and are correctly skipped during processing.
+        """
         from src.training.trainer import process_trajectories
 
         trajectories = [
@@ -237,10 +241,9 @@ class TestProcessTrajectories:
 
         batch, stats = process_trajectories(trajectories, mock_tokenizer)
 
-        # Should not crash, advantages should be ~0
-        assert len(batch) == 2
-        for item in batch:
-            assert abs(item["advantages"]) < 0.01
+        # Groups with zero variance are skipped (no gradient signal)
+        assert len(batch) == 0
+        assert stats.skipped_zero_variance_groups == 1
 
     def test_reward_statistics(self, mock_tokenizer, sample_trajectories):
         """Test that reward statistics are computed correctly."""
