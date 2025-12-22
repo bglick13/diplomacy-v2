@@ -211,10 +211,13 @@ class LeagueMetadata:
 
 
 # Default baseline agents to initialize the league with
+# Removed random_bot (too exploitable at Elo 800)
 DEFAULT_BASELINES: list[AgentInfo] = [
     AgentInfo.create_baseline("base_model", elo=1000.0),
-    AgentInfo.create_baseline("random_bot", elo=800.0),
     AgentInfo.create_baseline("chaos_bot", elo=900.0),
+    AgentInfo.create_baseline("defensive_bot", elo=950.0),
+    AgentInfo.create_baseline("territorial_bot", elo=950.0),
+    AgentInfo.create_baseline("coordinated_bot", elo=1000.0),
 ]
 
 

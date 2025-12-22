@@ -19,18 +19,25 @@ from src.league.types import AgentInfo, AgentType
 class PFSPConfig:
     """Configuration for PFSP opponent sampling."""
 
-    # Sampling distribution weights
+    # Sampling distribution weights (biased toward positive EV matchups)
     self_play_weight: float = 0.30  # Current policy (stability)
-    peer_weight: float = 0.40  # Similar Elo agents (learning)
-    exploitable_weight: float = 0.20  # Weaker agents we should beat
-    baseline_weight: float = 0.10  # RandomBot/ChaosBot (regression)
+    peer_weight: float = 0.30  # Similar Elo agents (learning)
+    exploitable_weight: float = 0.35  # Weaker agents we should beat (positive EV)
+    baseline_weight: float = 0.05  # Baseline bots (regression testing)
 
     # Elo thresholds for peer matching
     peer_elo_range: int = 100  # +/- from hero Elo
     near_peer_elo_range: int = 300  # Extended range for near-peers
 
-    # Baseline sampling
-    baseline_agents: list[str] = field(default_factory=lambda: ["random_bot", "chaos_bot"])
+    # Baseline sampling (stronger baselines for better signal)
+    baseline_agents: list[str] = field(
+        default_factory=lambda: [
+            "chaos_bot",  # Elo ~900 - aggressive random
+            "defensive_bot",  # Elo ~950 - supports/holds
+            "territorial_bot",  # Elo ~950 - greedy expansion
+            "coordinated_bot",  # Elo ~1000 - team coordination
+        ]
+    )
 
     def validate(self) -> None:
         """Ensure weights sum to 1.0."""
@@ -279,7 +286,14 @@ class PFSPMatchmaker:
     def _agent_to_adapter(self, agent_name: str) -> str | None:
         """Convert agent name to adapter path or bot identifier."""
         # Baseline bots use their name directly
-        if agent_name in ("random_bot", "chaos_bot"):
+        baseline_bots = {
+            "random_bot",
+            "chaos_bot",
+            "defensive_bot",
+            "territorial_bot",
+            "coordinated_bot",
+        }
+        if agent_name in baseline_bots:
             return agent_name
 
         # Base model uses None

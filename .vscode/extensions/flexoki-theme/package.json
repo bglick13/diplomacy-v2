@@ -1,0 +1,24 @@
+{
+  "name": "flexoki-theme",
+  "displayName": "Flexoki Light Theme",
+  "description": "Custom Flexoki light theme for this workspace",
+  "version": "1.0.0",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Themes"
+  ],
+  "contributes": {
+    "themes": [
+      {
+        "label": "Flexoki",
+        "uiTheme": "vs",
+        "path": "./flexoki-light.json"
+      }
+    ]
+  }
+}
+
+
+

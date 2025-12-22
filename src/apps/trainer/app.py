@@ -4,7 +4,7 @@ import os
 import random
 import tempfile
 import time
-from collections import deque
+from collections import Counter, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -739,6 +739,7 @@ def build_wandb_metrics(
     league_ctx: LeagueContext | None,
     match_results: list[Any],
     sim_years_per_step: float,
+    collected_results: list["RolloutResult"] | None = None,
 ) -> dict[str, Any]:
     """Build comprehensive WandB metrics dict."""
     cumulative_sim_years = (step + 1) * sim_years_per_step
@@ -816,7 +817,7 @@ def build_wandb_metrics(
 
     # Add league metrics
     if league_ctx:
-        _add_league_metrics(metrics, league_ctx, match_results)
+        _add_league_metrics(metrics, league_ctx, match_results, collected_results)
 
     return metrics
 
@@ -867,7 +868,70 @@ def _add_cache_metrics(metrics: dict, cache_stats: dict) -> None:
     metrics.update(cache_metrics)
 
 
-def _add_league_metrics(metrics: dict, league_ctx: LeagueContext, match_results: list[Any]) -> None:
+def aggregate_rewards_by_opponent_type(
+    collected_results: list["RolloutResult"],
+) -> dict[str, dict[str, float]]:
+    """
+    Aggregate rewards by dominant opponent category.
+
+    For each game, we determine the "dominant" opponent category
+    (most common among the 6 opponents) and attribute all rewards
+    from that game to that category.
+
+    Returns:
+        Dict mapping category -> {"reward_mean", "reward_count", "game_count"}
+    """
+    from collections import defaultdict
+
+    category_rewards: dict[str, list[float]] = defaultdict(list)
+    category_games: dict[str, int] = defaultdict(int)
+
+    for result in collected_results:
+        match_result = result.match_result
+        trajectories = result.data.get("trajectories", [])
+
+        if not match_result or not trajectories:
+            continue
+
+        # Determine dominant opponent category for this game
+        opponent_categories = getattr(match_result, "opponent_categories", None)
+        if not opponent_categories:
+            continue
+
+        # Count categories (excluding "hero")
+        cat_counts = Counter(c for c in opponent_categories.values() if c != "hero")
+        if not cat_counts:
+            dominant_cat = "self"  # Pure self-play fallback
+        else:
+            dominant_cat = cat_counts.most_common(1)[0][0]
+
+        # Aggregate rewards for this category
+        for traj in trajectories:
+            reward = traj.get("reward", 0.0)
+            category_rewards[dominant_cat].append(reward)
+
+        category_games[dominant_cat] += 1
+
+    # Compute means
+    result: dict[str, dict[str, float]] = {}
+    for cat in ["self", "peer", "exploitable", "baseline"]:
+        rewards = category_rewards.get(cat, [])
+        if rewards:
+            result[cat] = {
+                "reward_mean": float(np.mean(rewards)),
+                "reward_count": len(rewards),
+                "game_count": category_games.get(cat, 0),
+            }
+
+    return result
+
+
+def _add_league_metrics(
+    metrics: dict,
+    league_ctx: LeagueContext,
+    match_results: list[Any],
+    collected_results: list["RolloutResult"] | None = None,
+) -> None:
     """Add league training metrics to dict."""
     metrics.update(
         {
@@ -889,6 +953,14 @@ def _add_league_metrics(metrics: dict, league_ctx: LeagueContext, match_results:
         total_games = sum(hero_powers.values()) or 1
         for power, count in hero_powers.items():
             metrics[f"pfsp/hero_{power.lower()}"] = count / total_games
+
+    # Add per-opponent-type reward metrics
+    if collected_results:
+        opponent_metrics = aggregate_rewards_by_opponent_type(collected_results)
+        for cat, cat_metrics in opponent_metrics.items():
+            metrics[f"opponent/{cat}/reward_mean"] = cat_metrics["reward_mean"]
+            metrics[f"opponent/{cat}/game_count"] = cat_metrics["game_count"]
+            metrics[f"opponent/{cat}/trajectory_count"] = cat_metrics["reward_count"]
 
 
 # ============================================================================
@@ -1041,6 +1113,7 @@ def setup_profiler(cfg: ExperimentConfig) -> tuple[Any | None, Path | None]:
         modal.Secret.from_name("axiom-secrets"),
         modal.Secret.from_name("wandb-secret"),
     ],
+    max_containers=1,
 )
 def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
     """
@@ -1301,6 +1374,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 league_ctx,
                 match_results,
                 sim_years_per_step,
+                collected_results=collected,  # For per-opponent-type metrics
             )
             wandb.log(wandb_metrics)
 

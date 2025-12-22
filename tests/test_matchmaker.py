@@ -169,7 +169,15 @@ class TestPFSPMatchmaker:
             checkpoints=[],
             baselines=baselines,
         )
-        assert agent in ("random_bot", "chaos_bot", "base_model")
+        # Baselines are: chaos_bot, defensive_bot, territorial_bot, coordinated_bot
+        # base_model is also a baseline but not in baseline_agents config
+        assert agent in (
+            "chaos_bot",
+            "defensive_bot",
+            "territorial_bot",
+            "coordinated_bot",
+            "base_model",
+        )
 
     def test_peer_prefers_similar_elo(self, matchmaker, registry):
         """Peer category should prefer agents with similar Elo."""

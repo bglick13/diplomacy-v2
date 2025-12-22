@@ -84,15 +84,54 @@ class ExperimentConfig(BaseModel):
     # Reward / Scoring Settings
     # =========================================================================
     win_bonus: float = Field(
-        default=15.0,
+        default=50.0,
         description=(
             "Bonus reward for the sole leader when they have >= winner_threshold_sc supply centers. "
-            "Creates pressure to WIN outright, breaking cooperative stalemate equilibria."
+            "Creates pressure to WIN outright, breaking cooperative stalemate equilibria. "
+            "Note: Scaled by final_reward_weight (0.2), so 50 * 0.2 = 10 effective bonus."
         ),
     )
     winner_threshold_sc: int = Field(
         default=5,
         description="Minimum supply centers required to be eligible for win bonus",
+    )
+    step_reward_weight: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Weight for per-step reward shaping (board state delta). "
+            "Higher values emphasize immediate consequences of each decision."
+        ),
+    )
+    final_reward_weight: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Weight for final game outcome in reward. "
+            "Higher values emphasize winning the overall game vs immediate gains."
+        ),
+    )
+    step_dislodgment_weight: float = Field(
+        default=0.5,
+        ge=0.0,
+        description="Weight for dislodgment signals in step scoring (+/- per dislodged unit)",
+    )
+    step_territory_weight: float = Field(
+        default=0.2,
+        ge=0.0,
+        description="Weight for territory expansion in step scoring (+ per new province)",
+    )
+    step_threat_weight: float = Field(
+        default=0.3,
+        ge=0.0,
+        description="Weight for SC threat penalty in step scoring (- per threatened SC)",
+    )
+    step_forward_weight: float = Field(
+        default=0.1,
+        ge=0.0,
+        description="Weight for forward unit positioning in step scoring (+ per unit outside home)",
     )
 
     # =========================================================================
@@ -123,11 +162,11 @@ class ExperimentConfig(BaseModel):
         description="Save checkpoint to league every N steps (for recent curriculum)",
     )
     elo_eval_every_n_steps: int = Field(
-        default=50,
+        default=20,
         description="Run async Elo evaluation every N steps (0 to disable)",
     )
     elo_eval_games_per_opponent: int = Field(
-        default=3,
+        default=2,
         description="Games per gatekeeper during Elo evaluation",
     )
     pfsp_self_play_weight: float = Field(
@@ -135,16 +174,16 @@ class ExperimentConfig(BaseModel):
         description="PFSP: Weight for self-play (current policy)",
     )
     pfsp_peer_weight: float = Field(
-        default=0.40,
+        default=0.30,
         description="PFSP: Weight for peer opponents (similar Elo)",
     )
     pfsp_exploitable_weight: float = Field(
-        default=0.20,
+        default=0.35,
         description="PFSP: Weight for exploitable opponents (weaker)",
     )
     pfsp_baseline_weight: float = Field(
-        default=0.10,
-        description="PFSP: Weight for baseline opponents (RandomBot, ChaosBot)",
+        default=0.05,
+        description="PFSP: Weight for baseline opponents (bots)",
     )
 
     # =========================================================================
@@ -195,8 +234,8 @@ class ExperimentConfig(BaseModel):
     # =========================================================================
     # Optimizer Settings
     # =========================================================================
-    learning_rate: float = Field(default=1e-5, description="Learning rate for AdamW optimizer")
-    max_grad_norm: float = Field(default=3.0, description="Maximum gradient norm for clipping")
+    learning_rate: float = Field(default=5e-6, description="Learning rate for AdamW optimizer")
+    max_grad_norm: float = Field(default=5.0, description="Maximum gradient norm for clipping")
     chunk_size: int = Field(
         default=8, ge=1, description="Mini-batch size for gradient accumulation (must be >= 1)"
     )
@@ -205,7 +244,7 @@ class ExperimentConfig(BaseModel):
     # KL Penalty / GRPO Stability Settings
     # =========================================================================
     kl_beta: float = Field(
-        default=0.01,
+        default=0.04,
         description="KL penalty coefficient. Higher values constrain policy closer to reference.",
     )
     kl_beta_warmup_steps: int = Field(
@@ -217,7 +256,7 @@ class ExperimentConfig(BaseModel):
         ),
     )
     kl_target: float | None = Field(
-        default=None,
+        default=0.02,
         description=(
             "Target KL divergence for adaptive KL control. If set, beta is adjusted "
             "each step to achieve this target. Typical values: 0.01-0.1. "
@@ -244,7 +283,7 @@ class ExperimentConfig(BaseModel):
     # Advantage Processing Settings
     # =========================================================================
     advantage_clip: float | None = Field(
-        default=5,
+        default=10,
         description=(
             "Clip advantages to [-clip, +clip] after normalization. "
             "Prevents extreme gradients from outlier rewards. "

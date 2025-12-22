@@ -1,6 +1,138 @@
 from src.engine.wrapper import DiplomacyWrapper
 
 
+def calculate_step_score(
+    game: DiplomacyWrapper,
+    prev_influence: dict[str, set[str]] | None = None,
+    dislodgment_weight: float = 0.5,
+    territory_weight: float = 0.2,
+    threat_weight: float = 0.3,
+    forward_weight: float = 0.1,
+) -> dict[str, float]:
+    """
+    Compute a richer score for each power based on current board state.
+
+    Used for per-step reward shaping to provide immediate feedback on decisions.
+    This includes tactical signals that change during movement phases, not just
+    build phases (when SC counts change).
+
+    Formula:
+    - 2.0 points per Supply Center (SC)
+    - 0.3 points per Unit (Army/Fleet)
+    - +dislodgment_weight per enemy unit dislodged
+    - -dislodgment_weight per own unit dislodged
+    - +territory_weight per new province in influence (vs prev_influence)
+    - -threat_weight per SC threatened by adjacent enemy unit
+    - +forward_weight per unit outside home centers
+
+    Args:
+        game: The Diplomacy game wrapper
+        prev_influence: Optional dict of power -> set of provinces in influence
+                        before this step. Used to calculate territory delta.
+        dislodgment_weight: Weight for dislodgment signals (default 0.5)
+        territory_weight: Weight for territory expansion (default 0.2)
+        threat_weight: Weight for SC threats (default 0.3)
+        forward_weight: Weight for forward unit positioning (default 0.1)
+
+    Returns:
+        Dictionary mapping power name to score
+    """
+    scores = {}
+    map_home_centers = {p: set(game.game.map.homes[p]) for p in game.game.powers}
+
+    # Build a map of which units are where (for threat detection)
+    unit_locations: dict[str, str] = {}  # location -> power_name
+    for power_name, power in game.game.powers.items():
+        for unit_str in power.units:
+            parts = unit_str.split()
+            if len(parts) >= 2:
+                loc = parts[1].split("/")[0]  # Remove coast
+                unit_locations[loc] = power_name
+
+    for power_name, power in game.game.powers.items():
+        n_sc = len(power.centers)
+        n_units = len(power.units)
+
+        # Base score: SCs and units
+        score = (n_sc * 2.0) + (n_units * 0.3)
+
+        # 1. Dislodgment signal - per-power attribution
+        # +reward for dislodging enemy, -reward for being dislodged
+        n_own_dislodged = 0
+        n_enemy_dislodged = 0
+
+        if hasattr(game.game, "dislodged") and game.game.dislodged:
+            for dislodged_unit, attacker_site in game.game.dislodged.items():
+                # Find owner of dislodged unit
+                dislodged_owner = None
+                for pn, p in game.game.powers.items():
+                    if dislodged_unit in p.units:
+                        dislodged_owner = pn
+                        break
+
+                # Find attacker unit at that site
+                attacker_unit = (
+                    game.game._occupant(attacker_site) if hasattr(game.game, "_occupant") else None
+                )
+                attacker_owner = None
+                if attacker_unit:
+                    for pn, p in game.game.powers.items():
+                        if attacker_unit in p.units:
+                            attacker_owner = pn
+                            break
+
+                # Attribute to current power
+                if dislodged_owner == power_name:
+                    n_own_dislodged += 1  # We got dislodged (bad)
+                if attacker_owner == power_name:
+                    n_enemy_dislodged += 1  # We dislodged someone (good)
+
+        # Apply rewards: +bonus for dislodging, -penalty for being dislodged
+        score += n_enemy_dislodged * dislodgment_weight
+        score -= n_own_dislodged * dislodgment_weight
+
+        # 2. Territory expansion (influence delta)
+        if prev_influence is not None and power_name in prev_influence:
+            current_influence = set(power.influence) if hasattr(power, "influence") else set()
+            prev_inf = prev_influence.get(power_name, set())
+            new_territory = len(current_influence - prev_inf)
+            score += new_territory * territory_weight
+
+        # 3. SC threat detection
+        # A SC is "threatened" if an adjacent tile has an enemy unit
+        n_threatened_scs = 0
+        for sc in power.centers:
+            # Get adjacent locations
+            try:
+                adjacent = game.game.map.abut_list(sc, incl_no_coast=True)
+                for adj_loc in adjacent:
+                    adj_loc_clean = adj_loc.split("/")[0]
+                    if adj_loc_clean in unit_locations:
+                        if unit_locations[adj_loc_clean] != power_name:
+                            n_threatened_scs += 1
+                            break  # Only count each SC once
+            except (AttributeError, KeyError):
+                pass  # Skip if map data unavailable
+
+        score -= n_threatened_scs * threat_weight
+
+        # 4. Forward unit positioning
+        my_homes = map_home_centers.get(power_name, set())
+        forward_units = 0
+        for unit_str in power.units:
+            parts = unit_str.split()
+            if len(parts) >= 2:
+                loc = parts[1].split("/")[0]
+                if loc not in my_homes:
+                    forward_units += 1
+
+        score += forward_units * forward_weight
+
+        scores[power_name] = score
+
+    return scores
+
+
 def calculate_final_scores(
     game: DiplomacyWrapper,
     win_bonus: float = 0.0,

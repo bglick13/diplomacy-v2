@@ -24,7 +24,7 @@ from src.utils.observability import (
     stopwatch,
 )
 from src.utils.parsing import extract_orders
-from src.utils.scoring import calculate_final_scores
+from src.utils.scoring import calculate_final_scores, calculate_step_score
 from src.utils.vis import GameVisualizer
 from src.utils.weave_traces import (
     TrajectoryTrace,
@@ -782,14 +782,42 @@ async def run_synchronized_forks(
         )
         step_timing["inference_ms"] = (time.time() - t0) * 1000
 
-        # Time: Apply results to forks
+        # Time: Apply results to forks (with reward shaping score capture)
         t0 = time.time()
         for g_idx, game, _ in fork_inputs:
             orders, step_fork_data = results[g_idx]
+
+            # Capture influence and score BEFORE applying orders (for reward shaping)
+            prev_influence = {
+                pn: set(p.influence) if hasattr(p, "influence") else set()
+                for pn, p in game.game.powers.items()
+            }
+            score_before = calculate_step_score(
+                game,
+                prev_influence=None,  # No delta for "before" score
+                dislodgment_weight=cfg.step_dislodgment_weight,
+                territory_weight=cfg.step_territory_weight,
+                threat_weight=cfg.step_threat_weight,
+                forward_weight=cfg.step_forward_weight,
+            )
+
             game.step(orders)
 
-            # Store fork data for each step (keyed by (g_idx, step_count))
+            # Capture board score AFTER applying orders (with territory delta)
+            score_after = calculate_step_score(
+                game,
+                prev_influence=prev_influence,  # Pass for territory expansion signal
+                dislodgment_weight=cfg.step_dislodgment_weight,
+                territory_weight=cfg.step_territory_weight,
+                threat_weight=cfg.step_threat_weight,
+                forward_weight=cfg.step_forward_weight,
+            )
+
+            # Store scores in fork_data for per-step reward computation
             if step_fork_data:
+                for power in step_fork_data:
+                    step_fork_data[power]["score_before"] = score_before.get(power, 0.0)
+                    step_fork_data[power]["score_after"] = score_after.get(power, 0.0)
                 fork_data[(g_idx, step_count)] = step_fork_data
         step_timing["game_step_ms"] = (time.time() - t0) * 1000
 
@@ -933,12 +961,24 @@ def build_trajectories(
                 if completion_logprobs:
                     ref_logprobs = sum(completion_logprobs)
 
+            # Compute blended reward: step delta + final outcome
+            # This provides immediate feedback (step delta) while preserving
+            # long-term incentives (final game outcome)
+            score_before = data.get("score_before", 0.0)
+            score_after = data.get("score_after", 0.0)
+            step_delta = score_after - score_before
+
+            # Blend step reward with final game outcome
+            step_component = step_delta * cfg.step_reward_weight
+            final_component = final_scores[power] * cfg.final_reward_weight
+            blended_reward = step_component + final_component
+
             # Use step_count in group_id for proper credit assignment
             # This ensures trajectories from the same step across forks are grouped together
             traj = {
                 "prompt": data["prompt"],
                 "completion": data["completion"],
-                "reward": final_scores[power],
+                "reward": blended_reward,
                 "group_id": f"{game_id}_{power}_step{step_count}",
                 "prompt_token_ids": data.get("prompt_token_ids", []),
                 "completion_token_ids": data.get("completion_token_ids", []),
