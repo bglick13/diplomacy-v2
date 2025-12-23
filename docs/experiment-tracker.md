@@ -206,26 +206,43 @@ python scripts/launch_training.py \
 
 **Key Config Changes**:
 - `--kl-beta 0.0`: Disable KL penalty entirely
-- `--advantage-clip 5.0`: Keep advantage clipping for stability
+- `--advantage-clip 10.0`: Advantage clipping for stability
+- `--rollout-horizon-years 4`: Slightly shorter horizon
+- `--winner-threshold-sc 5`: Lower win threshold
 
 **Command**:
 ```bash
 python scripts/launch_training.py \
-  --league-training \
-  --rollout-horizon-years 5 \
-  --winner-threshold-sc 7 \
+  --rollout-horizon-years 4 \
+  --winner-threshold-sc 5 \
   --buffer-depth 3 \
   --num-groups-per-step 16 \
   --total-steps 250 \
   --kl-beta 0.0 \
-  --advantage-clip 5.0
+  --advantage-clip 10.0
 ```
 
-**Status**: `planned`
+**Status**: `completed`
+- wandb: https://wandb.ai/bglick13/diplomacy-grpo/runs/fobg1kbv
+- run name: grpo-20251222-191408
 
-**Results**: _pending_
+**Results**:
+- **Learning signal**: POSITIVE - older checkpoints (v0-v25) declined to ~960 Elo while mid-training checkpoints (v80-v150) peaked at 1050-1068
+- **Best checkpoint**: adapter_v150 at 1067.9 Elo (+69 over base_model)
+- **Baseline exploitation**: 484 total Elo lost by bots
+  - defensive_bot: 943 → 700 (-243)
+  - coordinated_bot: 991 → 797 (-195)
+  - territorial_bot: 955 → 940 (-15)
+  - chaos_bot: 901 → 892 (-9)
+- **Training stability**: KL spikes up to 392K but recovered within 5 steps; grad_norm increased 10x (3.7 → 34.5 mean)
+- **Reward trajectory**: 3.60 → 3.46 (stable, not climbing)
+- **Risk confirmed**: Policy did drift significantly (transient KL spikes) but training didn't collapse
 
-**Risk**: Without KL, policy could drift too far and become unstable. Monitor `benchmark/loss` for divergence.
+**Key learnings**:
+1. Zero KL is survivable but produces chaotic training dynamics
+2. +69 Elo improvement shows real learning occurred
+3. Diminishing returns after step ~150 (best checkpoint)
+4. Grad norm escalation (10x) suggests instability accumulating
 
 ---
 

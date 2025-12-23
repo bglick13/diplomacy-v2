@@ -373,10 +373,13 @@ def should_add_to_league(
     """
     Determine if a checkpoint should be added to the league.
 
-    Uses a geometric checkpoint schedule:
-    1. Recent curriculum: every 10 steps for last 100 steps
-    2. Historical anchors: every 100 steps forever
-    3. Elite: new high score in Elo
+    Uses an adaptive checkpoint schedule that's more aggressive early in training
+    (when model changes are larger) and sparser later (when changes are smaller):
+
+    1. Early training (step < 50): every 5 steps
+    2. Mid training (step < 200): every 10 steps
+    3. Late training: every 20 steps for recent (last 100), every 100 for historical
+    4. Elite: new high score in Elo (always)
 
     Args:
         step: Current training step
@@ -390,11 +393,19 @@ def should_add_to_league(
     if registry.num_checkpoints == 0:
         return True
 
-    # Recent curriculum: every 10 steps for last 100
-    if step % 10 == 0 and step > registry.latest_step - 100:
+    # Early training: every 5 steps (model changing rapidly)
+    if step < 50 and step % 5 == 0:
         return True
 
-    # Historical anchors: every 100 steps
+    # Mid training: every 10 steps
+    if step < 200 and step % 10 == 0:
+        return True
+
+    # Late training: every 20 steps for recent curriculum
+    if step >= 200 and step % 20 == 0 and step > registry.latest_step - 100:
+        return True
+
+    # Historical anchors: every 100 steps (forever)
     if step % 100 == 0:
         return True
 

@@ -66,6 +66,7 @@ class AdapterConfig:
     """Configuration for managing LoRA adapters."""
 
     power_adapters: dict[str, str | None]
+    power_agent_names: dict[str, str]  # For Elo updates (uses names, not paths)
     unique_loras: set[str]
     hero_power: str | None
 
@@ -75,6 +76,7 @@ class AdapterConfig:
         lora_name: str | None,
         power_adapters: dict[str, str | None] | None,
         hero_power: str | None,
+        power_agent_names: dict[str, str] | None = None,
     ) -> "AdapterConfig":
         """Build adapter config from legacy and new parameters."""
         # Build power_adapters from legacy lora_name if not provided
@@ -104,8 +106,18 @@ class AdapterConfig:
             if adapter and adapter not in BASELINE_BOTS and adapter != "base_model"
         }
 
+        # Build power_agent_names if not provided (legacy fallback uses adapter paths)
+        if power_agent_names is None:
+            # For legacy callers, use adapter paths as names (old behavior)
+            # This won't work correctly for Elo updates but maintains backwards compat
+            power_agent_names = {
+                power: adapter if adapter else "base_model"
+                for power, adapter in power_adapters.items()
+            }
+
         return cls(
             power_adapters=power_adapters,
+            power_agent_names=power_agent_names,
             unique_loras=unique_loras,
             hero_power=hero_power,
         )
@@ -1189,6 +1201,7 @@ async def run_rollout(
     lora_name: str | None = None,
     *,
     power_adapters: dict[str, str | None] | None = None,
+    power_agent_names: dict[str, str] | None = None,
     hero_power: str | None = None,
 ):
     """
@@ -1203,6 +1216,8 @@ async def run_rollout(
                        - None or "base_model": Use base LLM (no LoRA)
                        - str: LoRA adapter path (e.g., "run/adapter_v50")
                        If None, falls back to using lora_name for all powers.
+        power_agent_names: Mapping of power name to agent name (for Elo updates).
+                          Uses proper agent names (e.g., "adapter_v50") not paths.
         hero_power: Which power's trajectories to collect for training.
                    If None, collects trajectories for ALL powers (original behavior).
     """
@@ -1212,7 +1227,9 @@ async def run_rollout(
 
     try:
         cfg = ExperimentConfig(**config_dict)
-        adapter_config = AdapterConfig.from_params(lora_name, power_adapters, hero_power)
+        adapter_config = AdapterConfig.from_params(
+            lora_name, power_adapters, hero_power, power_agent_names
+        )
 
         # Get InferenceEngine class from deployed app
         InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
@@ -1380,6 +1397,18 @@ async def run_rollout(
                 # Detailed timing breakdown for waterfall charts
                 **metrics.timing.to_dict(),
             },
+            # Match results for Elo updates (one per game fork)
+            # Uses power_agent_names (e.g., "adapter_v50") not paths for registry lookups
+            "match_results": [
+                {
+                    "power_agents": dict(adapter_config.power_agent_names),
+                    "power_scores": calculate_final_scores(
+                        game, cfg.win_bonus, cfg.winner_threshold_sc
+                    ),
+                    "game_id": game.game.game_id,
+                }
+                for game in games
+            ],
         }
 
     except Exception as e:

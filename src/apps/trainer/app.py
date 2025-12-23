@@ -328,6 +328,70 @@ def reload_league_registry(league_ctx: LeagueContext, step: int) -> None:
         logger.warning(f"⚠️ Failed to reload registry: {e}")
 
 
+def update_elo_from_rollouts(
+    collected_results: list[RolloutResult],
+    league_ctx: LeagueContext,
+    k_factor: float = 16.0,
+) -> dict[str, float]:
+    """
+    Update Elo ratings from rollout game outcomes.
+
+    Args:
+        collected_results: List of RolloutResult from current step
+        league_ctx: League context with registry
+        k_factor: K-factor for Elo updates (lower = more stable)
+
+    Returns:
+        Dict of agent_name -> new_elo for agents that were updated
+    """
+    from collections import defaultdict
+
+    from src.league.elo import update_elo_from_match
+
+    all_elo_deltas: dict[str, list[float]] = defaultdict(list)
+
+    for result in collected_results:
+        # Get game outcomes from rollout data
+        match_results_data = result.data.get("match_results", [])
+
+        for match in match_results_data:
+            power_agents = match.get("power_agents", {})
+            power_scores = match.get("power_scores", {})
+
+            if not power_agents or not power_scores:
+                continue
+
+            # Get current Elos for all agents in this match
+            unique_agents = {a for a in power_agents.values() if a}
+            agent_elos = {}
+            for agent in unique_agents:
+                # Handle bot agents (they're in registry as baselines)
+                info = league_ctx.registry.get_agent(agent)
+                agent_elos[agent] = info.elo if info else 1000.0
+
+            # Compute new Elos using pairwise decomposition
+            new_elos = update_elo_from_match(power_agents, power_scores, agent_elos, k=k_factor)
+
+            # Accumulate deltas for averaging
+            for agent, new_elo in new_elos.items():
+                delta = new_elo - agent_elos[agent]
+                all_elo_deltas[agent].append(delta)
+
+    # Apply average delta for each agent
+    final_updates = {}
+    for agent, deltas in all_elo_deltas.items():
+        current = league_ctx.registry.get_agent(agent)
+        if current:
+            avg_delta = sum(deltas) / len(deltas)
+            final_updates[agent] = current.elo + avg_delta
+
+    if final_updates:
+        league_ctx.registry.bulk_update_elos(final_updates)
+        logger.info(f"📊 Elo updated for {len(final_updates)} agents from rollouts (k={k_factor})")
+
+    return final_updates
+
+
 def add_checkpoint_to_league(
     step: int,
     adapter_rel_path: str,
@@ -339,10 +403,25 @@ def add_checkpoint_to_league(
     from src.league import should_add_to_league
 
     checkpoint_key = adapter_rel_path
-    parent_key = f"{cfg.run_name}/adapter_v{step - 1}" if step > 1 else "base_model"
 
     if not should_add_to_league(step, league_ctx.registry):
         return
+
+    # Find the most recent registered checkpoint as parent (not just step-1)
+    # This ensures Elo inheritance works even when some steps are skipped
+    if step > 0:
+        # Get all registered checkpoints and find the one with highest step < current
+        checkpoints = league_ctx.registry.get_checkpoints()
+        earlier_checkpoints = [c for c in checkpoints if c.step < step]
+        if earlier_checkpoints:
+            # Use the most recent registered checkpoint
+            parent_checkpoint = max(earlier_checkpoints, key=lambda c: c.step)
+            parent_key = parent_checkpoint.name
+        else:
+            # No earlier checkpoints, use base_model
+            parent_key = "base_model"
+    else:
+        parent_key = "base_model"
 
     league_ctx.registry.add_checkpoint(
         name=checkpoint_key,
@@ -454,10 +533,10 @@ class RolloutManager:
         assert self.league_ctx is not None
 
         hero_power = random.choice(self.league_ctx.matchmaker.POWERS)
+        hero_agent_name = hero_adapter_path or "base_model"
 
         # Sample opponents
         if self.league_ctx.registry.num_checkpoints > 0:
-            hero_agent_name = hero_adapter_path or "base_model"
             hero_info = self.league_ctx.registry.get_agent(hero_agent_name)
             estimated_hero_elo = hero_info.elo if hero_info else self.league_ctx.registry.best_elo
 
@@ -471,13 +550,17 @@ class RolloutManager:
         else:
             match_result = self.league_ctx.matchmaker.get_cold_start_opponents(hero_power)
 
-        # Override hero adapter
+        # Override hero adapter (path) and agent name
         power_adapters = match_result.power_adapters.copy()
         power_adapters[hero_power] = hero_adapter_path
+
+        power_agent_names = match_result.power_agent_names.copy()
+        power_agent_names[hero_power] = hero_agent_name
 
         handle = self.run_rollout_fn.spawn(
             self.cfg.model_dump(),
             power_adapters=power_adapters,
+            power_agent_names=power_agent_names,
             hero_power=hero_power,
         )
 
@@ -811,61 +894,15 @@ def build_wandb_metrics(
         "processing/total_samples_skipped": traj_stats.total_samples_skipped,
     }
 
-    # Add cache metrics
-    if cache_stats:
-        _add_cache_metrics(metrics, cache_stats)
+    # NOTE: Cache metrics (cache/hit_rate, etc.) were removed because they never
+    # worked correctly - vllm_queries and total_queries were never populated,
+    # resulting in 0% hit rate regardless of actual cache performance.
 
     # Add league metrics
     if league_ctx:
         _add_league_metrics(metrics, league_ctx, match_results, collected_results)
 
     return metrics
-
-
-def _add_cache_metrics(metrics: dict, cache_stats: dict) -> None:
-    """Add cache statistics to metrics dict."""
-    total_queries = cache_stats.get("total_queries", 0)
-    total_hits = cache_stats.get("total_hits", 0)
-    total_prompt_tokens = cache_stats.get("total_prompt_tokens", 0)
-    batches = cache_stats.get("batches_processed", 0)
-    batch_size_total = cache_stats.get("batch_size_total", 0)
-    real_stats = cache_stats.get("real_stats_available", False)
-
-    # Check for vLLM-specific stats (more accurate than cumulative estimates)
-    vllm_queries = cache_stats.get("vllm_queries")
-    vllm_hits = cache_stats.get("vllm_hits")
-    vllm_hit_rate = cache_stats.get("vllm_hit_rate")
-
-    cache_metrics = {
-        "cache/prompt_tokens": total_prompt_tokens,
-        "cache/batches": batches,
-        "cache/total_requests": batch_size_total,
-    }
-
-    # Prefer vLLM stats if available (direct from Prometheus counters)
-    if vllm_queries is not None and vllm_queries > 0:
-        cache_metrics.update(
-            {
-                "cache/hit_rate": vllm_hit_rate,
-                "cache/total_queries": vllm_queries,
-                "cache/total_hits": vllm_hits,
-                "cache/vllm_stats_available": 1,
-            }
-        )
-    elif total_queries > 0:
-        # Fallback to cumulative estimates
-        cache_hit_rate = total_hits / total_queries
-        cache_metrics.update(
-            {
-                "cache/hit_rate": cache_hit_rate,
-                "cache/total_queries": total_queries,
-                "cache/total_hits": total_hits,
-                "cache/vllm_stats_available": 0,
-            }
-        )
-
-    cache_metrics["cache/real_stats"] = 1 if real_stats else 0
-    metrics.update(cache_metrics)
 
 
 def aggregate_rewards_by_opponent_type(
@@ -1376,6 +1413,21 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 sim_years_per_step,
                 collected_results=collected,  # For per-opponent-type metrics
             )
+            # Update Elo from rollout game outcomes (if league training enabled)
+            # Note: We add Elo metrics to wandb_metrics BEFORE logging to avoid
+            # double-incrementing WandB's step counter (each wandb.log() call = 1 step)
+            if league_ctx is not None:
+                elo_updates = update_elo_from_rollouts(
+                    collected, league_ctx, k_factor=cfg.rollout_elo_k_factor
+                )
+                if elo_updates:
+                    # Add count and individual agent Elos to wandb_metrics
+                    wandb_metrics["elo/rollout_updates_count"] = len(elo_updates)
+                    for agent_name, new_elo in elo_updates.items():
+                        # Sanitize agent name for WandB (replace / with _)
+                        safe_name = agent_name.replace("/", "_")
+                        wandb_metrics[f"elo/{safe_name}"] = new_elo
+
             wandb.log(wandb_metrics)
 
             if profiler:

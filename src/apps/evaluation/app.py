@@ -689,23 +689,25 @@ async def evaluate_league(
                 f"    Game {game_idx + 1}: Challenger {challenger_score:.1f} vs Gatekeeper avg {gatekeeper_avg:.1f}"
             )
 
-    # Compute Elo updates from all matches
-    logger.info("📈 Computing Elo updates...")
+    # Compute Elo updates from all matches (for monitoring/logging only)
+    # NOTE: Elo is now primarily updated from rollouts, not evaluation.
+    # This evaluation serves as a calibration check / monitoring signal.
+    logger.info("📈 Computing Elo updates (monitoring only, not applied to registry)...")
     updated_elos = compute_elo_updates(all_matches, registry)
 
-    # Update registry with new Elos
-    registry.bulk_update_elos(updated_elos)
+    # DO NOT update registry - Elo is now updated from rollouts
+    # registry.bulk_update_elos(updated_elos)  # DISABLED: rollouts handle Elo updates
 
-    # Add match history
+    # Add match history for record keeping
     match_results = create_match_results(all_matches, challenger_path, training_step)
     for match_result in match_results:
         registry.add_match(match_result)
 
-    # Final save and commit
+    # Save match history only (Elo not updated)
     registry._save_unlocked()
     volume.commit()
 
-    # Compute summary stats
+    # Compute summary stats (what Elo WOULD be if we applied the update)
     challenger_new_elo = updated_elos.get(challenger_path, 1000.0)
     wins = sum(1 for m in match_summaries if m.win)
     total_games = len(match_summaries)
@@ -726,8 +728,8 @@ async def evaluate_league(
 
     eval_duration = time.time() - eval_start
 
-    logger.info(f"✅ Elo evaluation complete in {eval_duration:.1f}s")
-    logger.info(f"   Challenger Elo: {challenger_new_elo:.0f}")
+    logger.info(f"✅ Elo evaluation complete in {eval_duration:.1f}s (monitoring only)")
+    logger.info(f"   Calibrated Elo (from eval): {challenger_new_elo:.0f}")
     logger.info(f"   Win rate: {win_rate:.1%} ({wins}/{total_games})")
     for opp_type, opp_rate in opponent_win_rates.items():
         logger.info(f"   vs {opp_type}: {opp_rate:.1%}")

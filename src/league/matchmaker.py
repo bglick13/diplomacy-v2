@@ -7,6 +7,7 @@ This module implements opponent sampling for training, balancing:
 - Regression testing (playing against baselines)
 """
 
+import math
 import random
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,17 +16,30 @@ from src.league.registry import LeagueRegistry
 from src.league.types import AgentInfo, AgentType
 
 
+def _elo_bucket(hero_elo: float, opponent_elo: float) -> str:
+    """Categorize opponent by Elo distance for logging."""
+    diff = opponent_elo - hero_elo
+    if diff > 100:
+        return "stronger"
+    elif diff > -100:
+        return "peer"
+    elif diff > -200:
+        return "weaker"
+    else:
+        return "much_weaker"
+
+
 @dataclass
 class PFSPConfig:
     """Configuration for PFSP opponent sampling."""
 
-    # Sampling distribution weights (biased toward positive EV matchups)
+    # Legacy sampling distribution weights (ignored if elo_based_sampling=True)
     self_play_weight: float = 0.30  # Current policy (stability)
     peer_weight: float = 0.30  # Similar Elo agents (learning)
     exploitable_weight: float = 0.35  # Weaker agents we should beat (positive EV)
     baseline_weight: float = 0.05  # Baseline bots (regression testing)
 
-    # Elo thresholds for peer matching
+    # Elo thresholds for peer matching (legacy, used when elo_based_sampling=False)
     peer_elo_range: int = 100  # +/- from hero Elo
     near_peer_elo_range: int = 300  # Extended range for near-peers
 
@@ -39,16 +53,22 @@ class PFSPConfig:
         ]
     )
 
+    # New Elo-based sampling params (replaces category-based when enabled)
+    elo_based_sampling: bool = True  # Enable pure Elo-based Gaussian sampling
+    elo_sampling_sigma: float = 150.0  # Std dev of Gaussian (in Elo points)
+    min_self_play_prob: float = 0.15  # Minimum probability of self-play
+
     def validate(self) -> None:
-        """Ensure weights sum to 1.0."""
-        total = (
-            self.self_play_weight
-            + self.peer_weight
-            + self.exploitable_weight
-            + self.baseline_weight
-        )
-        if abs(total - 1.0) > 0.01:
-            raise ValueError(f"PFSP weights must sum to 1.0, got {total}")
+        """Ensure weights sum to 1.0 (only matters for legacy mode)."""
+        if not self.elo_based_sampling:
+            total = (
+                self.self_play_weight
+                + self.peer_weight
+                + self.exploitable_weight
+                + self.baseline_weight
+            )
+            if abs(total - 1.0) > 0.01:
+                raise ValueError(f"PFSP weights must sum to 1.0, got {total}")
 
 
 @dataclass
@@ -59,6 +79,7 @@ class MatchmakingResult:
     hero_agent: str
     hero_elo: float  # Hero's Elo used for matchmaking
     power_adapters: dict[str, str | None]  # Power -> adapter path or bot name
+    power_agent_names: dict[str, str]  # Power -> agent name (for Elo updates)
     opponent_categories: dict[str, str]  # Power -> category (self, peer, baseline, etc.)
 
     def to_wandb_dict(self) -> dict[str, Any]:
@@ -148,23 +169,36 @@ class PFSPMatchmaker:
         # Categorize opponents
         opponents: list[tuple[str, str]] = []  # (agent_name, category)
 
-        # Sample opponents according to PFSP distribution
-        for _ in range(num_opponents):
-            category = self._sample_category()
-            agent = self._sample_agent_for_category(
-                category, hero_agent, hero_elo, checkpoints, baselines
-            )
-            opponents.append((agent, category))
+        if self.config.elo_based_sampling:
+            # New: Pure Elo-based Gaussian sampling
+            # All agents (checkpoints + baselines) are in the same pool
+            for _ in range(num_opponents):
+                agent_name, _, bucket = self._sample_agent_by_elo(
+                    hero_elo=hero_elo,
+                    hero_agent=hero_agent,
+                    all_agents=all_agents,
+                )
+                opponents.append((agent_name, bucket))
+        else:
+            # Legacy: Sample opponents according to PFSP category distribution
+            for _ in range(num_opponents):
+                category = self._sample_category()
+                agent = self._sample_agent_for_category(
+                    category, hero_agent, hero_elo, checkpoints, baselines
+                )
+                opponents.append((agent, category))
 
         # Build power_adapters mapping
         opponent_powers = [p for p in self.POWERS if p != hero_power]
         random.shuffle(opponent_powers)
 
         power_adapters: dict[str, str | None] = {}
+        power_agent_names: dict[str, str] = {}  # For Elo updates (uses names, not paths)
         opponent_categories: dict[str, str] = {}
 
         # Assign hero
         power_adapters[hero_power] = self._agent_to_adapter(hero_agent)
+        power_agent_names[hero_power] = hero_agent
         opponent_categories[hero_power] = "hero"
 
         # Assign opponents
@@ -172,10 +206,12 @@ class PFSPMatchmaker:
             if i < len(opponents):
                 agent_name, category = opponents[i]
                 power_adapters[power] = self._agent_to_adapter(agent_name)
+                power_agent_names[power] = agent_name
                 opponent_categories[power] = category
             else:
                 # Fallback: use self-play
                 power_adapters[power] = self._agent_to_adapter(hero_agent)
+                power_agent_names[power] = hero_agent
                 opponent_categories[power] = "self"
 
         return MatchmakingResult(
@@ -183,6 +219,7 @@ class PFSPMatchmaker:
             hero_agent=hero_agent,
             hero_elo=hero_elo,
             power_adapters=power_adapters,
+            power_agent_names=power_agent_names,
             opponent_categories=opponent_categories,
         )
 
@@ -283,6 +320,49 @@ class PFSPMatchmaker:
         # Unknown category - default to self-play
         return hero_agent
 
+    def _sample_agent_by_elo(
+        self,
+        hero_elo: float,
+        hero_agent: str,
+        all_agents: list[AgentInfo],
+    ) -> tuple[str, float, str]:
+        """
+        Sample opponent using Gaussian probability centered on hero Elo.
+
+        Args:
+            hero_elo: The hero's current Elo rating
+            hero_agent: Name of the hero agent (for self-play handling)
+            all_agents: List of all available agents (checkpoints + baselines)
+
+        Returns:
+            Tuple of (agent_name, agent_elo, elo_bucket)
+        """
+        sigma = self.config.elo_sampling_sigma
+        min_self_play_prob = self.config.min_self_play_prob
+
+        # Always include self-play with minimum probability
+        if random.random() < min_self_play_prob:
+            return hero_agent, hero_elo, "self"
+
+        # Filter out hero from candidates
+        candidates = [a for a in all_agents if a.name != hero_agent]
+
+        if not candidates:
+            # Fallback to self-play if no other agents
+            return hero_agent, hero_elo, "self"
+
+        # Compute Gaussian weights based on Elo distance
+        weights = []
+        for agent in candidates:
+            elo_diff = hero_elo - agent.elo
+            weight = math.exp(-(elo_diff**2) / (2 * sigma**2))
+            weights.append(weight)
+
+        # Sample weighted by Gaussian
+        chosen = random.choices(candidates, weights=weights, k=1)[0]
+        bucket = _elo_bucket(hero_elo, chosen.elo)
+        return chosen.name, chosen.elo, bucket
+
     def _agent_to_adapter(self, agent_name: str) -> str | None:
         """Convert agent name to adapter path or bot identifier."""
         # Baseline bots use their name directly
@@ -328,10 +408,12 @@ class PFSPMatchmaker:
         opponent_powers = [p for p in self.POWERS if p != hero_power]
 
         power_adapters: dict[str, str | None] = {}
+        power_agent_names: dict[str, str] = {}
         opponent_categories: dict[str, str] = {}
 
         # Hero uses base model initially
         power_adapters[hero_power] = None
+        power_agent_names[hero_power] = "base_model"
         opponent_categories[hero_power] = "hero"
 
         # Opponents alternate between random_bot and chaos_bot
@@ -344,7 +426,9 @@ class PFSPMatchmaker:
             "chaos_bot",
         ]
         for i, power in enumerate(opponent_powers):
-            power_adapters[power] = baseline_cycle[i % len(baseline_cycle)]
+            bot_name = baseline_cycle[i % len(baseline_cycle)]
+            power_adapters[power] = bot_name
+            power_agent_names[power] = bot_name
             opponent_categories[power] = "baseline"
 
         return MatchmakingResult(
@@ -352,6 +436,7 @@ class PFSPMatchmaker:
             hero_agent="base_model",
             hero_elo=1000.0,  # Base model defaults to 1000 Elo
             power_adapters=power_adapters,
+            power_agent_names=power_agent_names,
             opponent_categories=opponent_categories,
         )
 

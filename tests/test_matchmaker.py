@@ -25,23 +25,25 @@ class TestPFSPConfig:
         assert abs(total - 1.0) < 0.01
 
     def test_validate_raises_on_invalid_weights(self):
-        """Should raise if weights don't sum to 1.0."""
+        """Should raise if weights don't sum to 1.0 in legacy mode."""
         config = PFSPConfig(
             self_play_weight=0.5,
             peer_weight=0.5,
             exploitable_weight=0.5,
             baseline_weight=0.5,
+            elo_based_sampling=False,  # Legacy mode validates weights
         )
         with pytest.raises(ValueError, match="must sum to 1.0"):
             config.validate()
 
     def test_custom_weights_valid(self):
-        """Custom weights that sum to 1.0 should be valid."""
+        """Custom weights that sum to 1.0 should be valid in legacy mode."""
         config = PFSPConfig(
             self_play_weight=0.25,
             peer_weight=0.25,
             exploitable_weight=0.25,
             baseline_weight=0.25,
+            elo_based_sampling=False,  # Legacy mode validates weights
         )
         config.validate()  # Should not raise
 
@@ -272,6 +274,15 @@ class TestMatchmakingResult:
                 "AUSTRIA": "test/adapter_v30",
                 "ITALY": None,
                 "TURKEY": "test/adapter_v50",
+            },
+            power_agent_names={
+                "FRANCE": "adapter_v50",
+                "ENGLAND": "random_bot",
+                "GERMANY": "chaos_bot",
+                "RUSSIA": "adapter_v40",
+                "AUSTRIA": "adapter_v30",
+                "ITALY": "base_model",
+                "TURKEY": "adapter_v50",
             },
             opponent_categories={
                 "FRANCE": "hero",

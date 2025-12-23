@@ -162,12 +162,18 @@ class ExperimentConfig(BaseModel):
         description="Save checkpoint to league every N steps (for recent curriculum)",
     )
     elo_eval_every_n_steps: int = Field(
-        default=20,
-        description="Run async Elo evaluation every N steps (0 to disable)",
+        default=50,
+        description="Run async Elo evaluation every N steps for monitoring (0 to disable). "
+        "Note: Primary Elo updates now come from rollouts, not evaluation.",
     )
     elo_eval_games_per_opponent: int = Field(
         default=2,
         description="Games per gatekeeper during Elo evaluation",
+    )
+    rollout_elo_k_factor: float = Field(
+        default=16.0,
+        description="K-factor for Elo updates from rollouts. Lower = more stable ratings. "
+        "Default 16 (half of standard 32) since updates happen every step.",
     )
     pfsp_self_play_weight: float = Field(
         default=0.30,
@@ -244,8 +250,8 @@ class ExperimentConfig(BaseModel):
     # KL Penalty / GRPO Stability Settings
     # =========================================================================
     kl_beta: float = Field(
-        default=0.04,
-        description="KL penalty coefficient. Higher values constrain policy closer to reference.",
+        default=0.0,
+        description="KL penalty coefficient. Set to 0 to disable KL regularization entirely.",
     )
     kl_beta_warmup_steps: int = Field(
         default=20,
@@ -256,7 +262,7 @@ class ExperimentConfig(BaseModel):
         ),
     )
     kl_target: float | None = Field(
-        default=0.02,
+        default=None,
         description=(
             "Target KL divergence for adaptive KL control. If set, beta is adjusted "
             "each step to achieve this target. Typical values: 0.01-0.1. "
