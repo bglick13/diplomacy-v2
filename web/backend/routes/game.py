@@ -6,23 +6,45 @@ from fastapi import APIRouter, HTTPException
 
 from src.utils.parsing import extract_orders
 from web.backend.models.schemas import AdapterInfo, NewGameRequest, SubmitOrdersRequest
-from web.backend.services.game_session import POWERS, GameSession
+from web.backend.services.game_session import (
+    POWERS,
+    GameSession,
+    get_baseline_bot,
+    is_baseline_bot,
+)
 from web.backend.services.inference_service import get_inference_service
 from web.backend.services.persistence import get_persistence
 
 router = APIRouter()
 
-# In-memory session store (for MVP)
-# In production, this would be backed by the persistence layer
+# In-memory session store with persistence backup
+# Sessions are cached in memory but can be restored from SQLite
 _sessions: dict[str, GameSession] = {}
 
 
 def _get_session(game_id: str) -> GameSession:
-    """Get a game session or raise 404."""
+    """Get a game session, restoring from persistence if needed."""
+    # Check in-memory cache first
     session = _sessions.get(game_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Game not found")
-    return session
+    if session:
+        return session
+
+    # Try to restore from persistence
+    persistence = get_persistence()
+    saved_data = persistence.load_game(game_id)
+    if saved_data and "game_state" in saved_data:
+        try:
+            session = GameSession.from_dict(saved_data)
+            _sessions[game_id] = session  # Cache for future requests
+            return session
+        except Exception as e:
+            print(f"Failed to restore session {game_id}: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to restore game session: {e}",
+            ) from e
+
+    raise HTTPException(status_code=404, detail="Game not found")
 
 
 @router.post("/new")
@@ -49,13 +71,11 @@ async def create_game(req: NewGameRequest) -> dict[str, Any]:
     )
     _sessions[session.id] = session
 
-    # Persist initial state
+    # Persist full session state (for restoration after server restart)
     persistence = get_persistence()
-    state = session.get_state()
-    state["adapter_name"] = session.adapter_name
-    persistence.save_game(session.id, state)
+    persistence.save_game(session.id, session.to_dict())
 
-    return state
+    return session.get_state()
 
 
 @router.get("/{game_id}")
@@ -78,9 +98,9 @@ async def submit_orders(game_id: str, req: SubmitOrdersRequest) -> dict[str, Any
 
     This endpoint:
     1. Validates human orders
-    2. Gets AI moves from the inference service
+    2. Gets AI moves from the inference service (LLM) or baseline bots (rule-based)
     3. Executes all orders
-    4. Collects training data
+    4. Collects training data (LLM moves only)
     5. Returns the new game state
 
     Args:
@@ -98,49 +118,59 @@ async def submit_orders(game_id: str, req: SubmitOrdersRequest) -> dict[str, Any
     # Get current phase for logging
     phase = session.game.get_current_phase()
 
-    # Get inference service
-    inference = get_inference_service()
-
     # Get inputs for all powers
     inputs = session.game.get_all_inputs(agent=session.agent)
 
-    # Separate human and AI powers
-    ai_indices = []
-    ai_prompts = []
-    ai_valid_moves = []
+    # Separate AI powers into LLM-based vs baseline bots
+    llm_indices = []
+    llm_prompts = []
+    llm_valid_moves = []
+    bot_powers: list[tuple[str, str, int]] = []  # (power, adapter, orig_idx)
 
     for idx, power in enumerate(inputs["power_names"]):
-        if power != session.human_power:
-            ai_indices.append(idx)
-            ai_prompts.append(inputs["prompts"][idx])
-            ai_valid_moves.append(inputs["valid_moves"][idx])
+        if power == session.human_power:
+            continue
 
-    # Get AI responses (if there are AI powers with valid moves)
-    ai_responses = []
-    if ai_prompts:
-        ai_responses = await inference.generate(
-            prompts=ai_prompts,
-            valid_moves=ai_valid_moves,
-            lora_name=session.adapter_name,
-        )
+        adapter = session.get_adapter_for_power(power)
+        if is_baseline_bot(adapter):
+            bot_powers.append((power, adapter, idx))  # type: ignore[arg-type]
+        else:
+            llm_indices.append(idx)
+            llm_prompts.append(inputs["prompts"][idx])
+            llm_valid_moves.append(inputs["valid_moves"][idx])
 
     # Collect all orders: human orders first
     all_orders = list(req.orders)
 
-    # Process AI responses
-    for resp_idx, orig_idx in enumerate(ai_indices):
-        power = inputs["power_names"][orig_idx]
-        response_data = ai_responses[resp_idx]
-        orders = extract_orders(response_data["text"])
+    # Get baseline bot orders directly (no inference needed)
+    for power, adapter, _idx in bot_powers:
+        bot = get_baseline_bot(adapter)
+        orders = bot.get_orders(session.game, power)
         all_orders.extend(orders)
 
-        # Collect training data for AI moves
-        session.collect_trajectory(
-            power=power,
-            prompt=inputs["prompts"][orig_idx],
-            completion=response_data["text"],
-            response_data=response_data,
+    # Get LLM responses (if there are LLM-based AI powers)
+    if llm_prompts:
+        inference = get_inference_service()
+        llm_responses = await inference.generate(
+            prompts=llm_prompts,
+            valid_moves=llm_valid_moves,
+            lora_name=session.adapter_name,
         )
+
+        # Process LLM responses
+        for resp_idx, orig_idx in enumerate(llm_indices):
+            power = inputs["power_names"][orig_idx]
+            response_data = llm_responses[resp_idx]
+            orders = extract_orders(response_data["text"])
+            all_orders.extend(orders)
+
+            # Collect training data for LLM moves only
+            session.collect_trajectory(
+                power=power,
+                prompt=inputs["prompts"][orig_idx],
+                completion=response_data["text"],
+                response_data=response_data,
+            )
 
     # Record turn history
     session.record_turn(
@@ -152,11 +182,9 @@ async def submit_orders(game_id: str, req: SubmitOrdersRequest) -> dict[str, Any
     # Execute turn
     session.game.step(all_orders)
 
-    # Persist state
+    # Persist full session state (for restoration after server restart)
     persistence = get_persistence()
-    state = session.get_state()
-    state["adapter_name"] = session.adapter_name
-    persistence.save_game(session.id, state)
+    persistence.save_game(session.id, session.to_dict())
 
     # If game is done, finalize and save trajectories
     result = session.get_state()
@@ -201,19 +229,46 @@ async def get_powers() -> list[str]:
 async def get_available_adapters() -> list[AdapterInfo]:
     """List available bot difficulty levels / adapters."""
     return [
+        # LLM-based opponents (require inference)
         AdapterInfo(
             id=None,
             name="Base Model",
-            description="Untrained Qwen2.5-7B - easiest difficulty",
+            description="Untrained Qwen2.5-7B - easiest LLM difficulty",
         ),
         AdapterInfo(
-            id="adapter_v18",
-            name="Intermediate",
-            description="Step 18 checkpoint - medium difficulty",
+            id="grpo-20251222-191408/adapter_v150",
+            name="Best (v150)",
+            description="Peak Elo checkpoint - 1068 Elo",
         ),
         AdapterInfo(
-            id="adapter_v100",
-            name="Advanced",
-            description="Step 100 checkpoint - hardest difficulty",
+            id="grpo-20251222-191408/adapter_v240",
+            name="Final",
+            description="Final training checkpoint",
+        ),
+        # Rule-based baseline bots (no inference needed, instant response)
+        AdapterInfo(
+            id="bot:random",
+            name="Random Bot",
+            description="Picks random valid moves - very easy",
+        ),
+        AdapterInfo(
+            id="bot:chaos",
+            name="Chaos Bot",
+            description="Aggressive - prioritizes movement over holds",
+        ),
+        AdapterInfo(
+            id="bot:defensive",
+            name="Defensive Bot",
+            description="Cautious - prioritizes holds and supports",
+        ),
+        AdapterInfo(
+            id="bot:territorial",
+            name="Territorial Bot",
+            description="Greedy - targets neutral supply centers",
+        ),
+        AdapterInfo(
+            id="bot:coordinated",
+            name="Coordinated Bot",
+            description="Team play - coordinates supports between units",
         ),
     ]

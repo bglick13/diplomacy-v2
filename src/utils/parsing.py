@@ -10,8 +10,33 @@ RE_PRESS = re.compile(r"<communication>(.*?)</communication>", re.DOTALL | re.IG
 RE_TRUTH = re.compile(r"<truth_status>(.*?)</truth_status>", re.DOTALL | re.IGNORECASE)
 
 # Pattern to detect if text looks like Diplomacy orders (starts with unit type)
-# A = Army, F = Fleet, B = Build, D = Disband
-RE_ORDER_LINE = re.compile(r"^[AFBD]\s+[A-Z]{3}", re.MULTILINE)
+# A = Army, F = Fleet
+# Requires proper order format with action verb to avoid false positives like "AUM: Correct..."
+# Uses lookahead patterns to properly detect each action type:
+#   - Movement: "- " followed by destination
+#   - Hold: "H" at end or followed by whitespace
+#   - Support/Convoy/Retreat: "S ", "C ", "R " followed by unit
+#   - Build/Disband: "B" or "D" at end or followed by whitespace
+RE_ORDER_LINE = re.compile(
+    r"^[AF]\s+[A-Z]{3}(/[A-Z]{2})?\s+"  # Unit + location (with optional coast)
+    r"(-\s|H(?:\s|$)|S\s|C\s|B(?:\s|$)|D(?:\s|$)|R\s)",  # Action indicator
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Pattern to validate a complete order line (stricter than detection)
+# Matches: A PAR - BUR, A PAR H, A PAR S A BUR, F NTH C A LON - BRE, A PAR B, A PAR D, A PAR R BUR
+RE_VALID_ORDER = re.compile(
+    r"^[AF]\s+[A-Z]{3}(/[A-Z]{2})?\s+"  # Unit type + location (with optional coast)
+    r"(-\s+[A-Z]{3}(/[A-Z]{2})?"  # Movement: - LOC
+    r"|H"  # Hold
+    r"|S\s+[AF]\s+[A-Z]{3}(/[A-Z]{2})?(\s+-\s+[A-Z]{3}(/[A-Z]{2})?)?"  # Support
+    r"|C\s+[AF]\s+[A-Z]{3}(/[A-Z]{2})?\s+-\s+[A-Z]{3}(/[A-Z]{2})?"  # Convoy
+    r"|B"  # Build
+    r"|D"  # Disband
+    r"|R\s+[A-Z]{3}(/[A-Z]{2})?"  # Retreat
+    r")(\s+VIA)?$",  # Optional VIA for convoy routes
+    re.IGNORECASE,
+)
 
 
 def extract_orders(llm_output: str) -> list[str]:
@@ -46,17 +71,17 @@ def extract_orders(llm_output: str) -> list[str]:
     # Split by newlines and clean whitespace
     orders = [line.strip() for line in raw_block.split("\n") if line.strip()]
 
-    # Filter to only valid-looking order lines
-    # A = Army, F = Fleet, B = Build (standalone), D = Disband (standalone)
-    # Also accept WAIVE for adjustment phases
+    # Filter to only valid-looking order lines using strict validation
+    # This prevents false positives like "AUM: Correct..." from being extracted
     valid_orders = []
     for o in orders:
         if not o:
             continue
-        if o.upper() == "WAIVE":
+        o_stripped = o.strip()
+        if o_stripped.upper() == "WAIVE":
             valid_orders.append("WAIVE")
-        elif o[0] in ("A", "F"):
-            valid_orders.append(o)
+        elif RE_VALID_ORDER.match(o_stripped):
+            valid_orders.append(o_stripped)
 
     return valid_orders
 

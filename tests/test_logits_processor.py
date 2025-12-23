@@ -144,6 +144,156 @@ class TestValidateParams:
 
 
 # =============================================================================
+# Self-Bounce Prevention Tests
+# =============================================================================
+
+
+class TestExtractTargetFromMove:
+    """Tests for target location extraction from movement orders."""
+
+    def test_movement_order(self):
+        """Movement order extracts target location."""
+        assert DiplomacyLogitsProcessor._extract_target_from_move("A PAR - BUR") == "BUR"
+        assert DiplomacyLogitsProcessor._extract_target_from_move("F NTH - NWY") == "NWY"
+
+    def test_movement_with_via(self):
+        """Movement with VIA convoy still extracts target."""
+        assert DiplomacyLogitsProcessor._extract_target_from_move("A PAR - BUR VIA") == "BUR"
+
+    def test_movement_with_coast(self):
+        """Movement to coastal location extracts base province."""
+        assert DiplomacyLogitsProcessor._extract_target_from_move("F NWG - STP/NC") == "STP"
+        assert DiplomacyLogitsProcessor._extract_target_from_move("F AEG - BUL/SC") == "BUL"
+
+    def test_hold_returns_none(self):
+        """Hold orders don't target any location."""
+        assert DiplomacyLogitsProcessor._extract_target_from_move("A PAR H") is None
+
+    def test_support_hold_returns_none(self):
+        """Support hold orders don't add movement target."""
+        assert DiplomacyLogitsProcessor._extract_target_from_move("A PAR S A BUR") is None
+
+    def test_support_move_returns_none(self):
+        """Support move orders - supporting unit doesn't move."""
+        assert DiplomacyLogitsProcessor._extract_target_from_move("A PAR S A BUR - MAR") is None
+        assert DiplomacyLogitsProcessor._extract_target_from_move("F ENG S F MAO - BRE") is None
+
+    def test_convoy_returns_none(self):
+        """Convoy orders - fleet doesn't move to destination."""
+        assert DiplomacyLogitsProcessor._extract_target_from_move("F NTH C A LON - BRE") is None
+
+    def test_build_returns_none(self):
+        """Build orders don't have movement."""
+        assert DiplomacyLogitsProcessor._extract_target_from_move("A PAR B") is None
+
+    def test_disband_returns_none(self):
+        """Disband orders don't have movement."""
+        assert DiplomacyLogitsProcessor._extract_target_from_move("A PAR D") is None
+
+    def test_retreat_returns_none(self):
+        """Retreat orders use R syntax, not - syntax."""
+        # Retreat format is "A PAR R BUR" not "A PAR - BUR"
+        assert DiplomacyLogitsProcessor._extract_target_from_move("A PAR R BUR") is None
+
+
+@pytest.mark.skipif(not VLLM_AVAILABLE, reason="vLLM not available")
+class TestSelfBouncePrevention:
+    """Tests for trie building with target location exclusion."""
+
+    @pytest.fixture
+    def batch_processor(self, tokenizer):
+        """Create a batch-level processor."""
+        mock_config = MockVllmConfig(model_name="gpt2")
+        return DiplomacyLogitsProcessor(
+            vllm_config=mock_config,  # type: ignore[arg-type]
+            device=torch.device("cpu"),
+            is_pin_memory=False,
+        )
+
+    def test_build_trie_excludes_targeted_locations(self, batch_processor, tokenizer):
+        """Trie excludes movements to already-targeted locations."""
+        valid_moves = {
+            "F LON": ["F LON - YOR", "F LON - NTH", "F LON H"],
+            "A LVP": ["A LVP - YOR", "A LVP - WAL", "A LVP H"],
+        }
+
+        # Build trie with YOR already targeted
+        excluded_targets = {"YOR"}
+        trie = batch_processor._build_trie(valid_moves, exclude_targets=excluded_targets)
+
+        # "F LON - YOR" should NOT be in trie
+        yor_move_ids = tokenizer.encode("F LON - YOR", add_special_tokens=False)
+        node = trie
+        can_reach_yor = True
+        for tid in yor_move_ids:
+            if tid in node.children:
+                node = node.children[tid]
+            else:
+                can_reach_yor = False
+                break
+        assert not can_reach_yor, "F LON - YOR should be excluded"
+
+        # "F LON - NTH" SHOULD be in trie
+        nth_move_ids = tokenizer.encode("F LON - NTH", add_special_tokens=False)
+        node = trie
+        can_reach_nth = True
+        for tid in nth_move_ids:
+            if tid in node.children:
+                node = node.children[tid]
+            else:
+                can_reach_nth = False
+                break
+        assert can_reach_nth, "F LON - NTH should be allowed"
+
+        # "F LON H" SHOULD be in trie (holds are not affected)
+        hold_move_ids = tokenizer.encode("F LON H", add_special_tokens=False)
+        node = trie
+        can_reach_hold = True
+        for tid in hold_move_ids:
+            if tid in node.children:
+                node = node.children[tid]
+            else:
+                can_reach_hold = False
+                break
+        assert can_reach_hold, "F LON H should be allowed"
+
+    def test_supports_still_allowed_when_target_excluded(self, batch_processor, tokenizer):
+        """Support orders to excluded locations should still be allowed."""
+        valid_moves = {
+            "A PAR": ["A PAR - BUR", "A PAR S A MAR - BUR", "A PAR H"],
+            "A MAR": ["A MAR - BUR", "A MAR H"],
+        }
+
+        # If MAR already ordered to BUR, PAR can still support that move
+        excluded_targets = {"BUR"}
+        trie = batch_processor._build_trie(valid_moves, exclude_targets=excluded_targets)
+
+        # "A PAR - BUR" should NOT be in trie (direct movement)
+        move_ids = tokenizer.encode("A PAR - BUR", add_special_tokens=False)
+        node = trie
+        can_reach = True
+        for tid in move_ids:
+            if tid in node.children:
+                node = node.children[tid]
+            else:
+                can_reach = False
+                break
+        assert not can_reach, "A PAR - BUR should be excluded"
+
+        # "A PAR S A MAR - BUR" SHOULD be in trie (support is allowed)
+        support_ids = tokenizer.encode("A PAR S A MAR - BUR", add_special_tokens=False)
+        node = trie
+        can_reach_support = True
+        for tid in support_ids:
+            if tid in node.children:
+                node = node.children[tid]
+            else:
+                can_reach_support = False
+                break
+        assert can_reach_support, "A PAR S A MAR - BUR should be allowed (support)"
+
+
+# =============================================================================
 # DiplomacyLogitsProcessor (Batch-Level) Tests
 # =============================================================================
 
@@ -434,9 +584,10 @@ class TestTagDetection:
             "First token of valid move should be allowed"
         )
 
-    def test_free_generation_after_closing_tag(self, batch_processor, tokenizer):
+    def test_eos_forced_after_closing_tag(self, batch_processor, tokenizer):
         """
-        After </orders> tag, masking should deactivate for any trailing content.
+        After </orders> tag, only EOS should be allowed to prevent trailing garbage.
+        The expected format is <analysis>...</analysis><orders>...</orders> with nothing after.
         """
         valid_moves = {"A PAR": ["A PAR - BUR"]}
         params = MockSamplingParams(extra_args={"valid_moves_dict": valid_moves})
@@ -454,8 +605,15 @@ class TestTagDetection:
         logits = torch.zeros(1, tokenizer.vocab_size)
         result = batch_processor.apply(logits)
 
-        # All tokens should be allowed again (orders block is closed)
-        assert torch.all(result == 0), "All tokens should be allowed after </orders> tag"
+        # Only EOS should be allowed after </orders> to cleanly terminate generation
+        eos_id = tokenizer.eos_token_id
+        assert result[0, eos_id] == 0, "EOS token should be allowed"
+        # All other tokens should be masked
+        non_eos_mask = torch.ones(tokenizer.vocab_size, dtype=torch.bool)
+        non_eos_mask[eos_id] = False
+        assert torch.all(result[0, non_eos_mask] == float("-inf")), (
+            "All non-EOS tokens should be masked after </orders> tag"
+        )
 
     def test_empty_output_allows_free_generation(self, batch_processor, tokenizer):
         """

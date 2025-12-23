@@ -5,11 +5,40 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.agents.base import DiplomacyAgent
+from src.agents.baselines import (
+    ChaosBot,
+    CoordinatedBot,
+    DefensiveBot,
+    RandomBot,
+    TerritorialBot,
+)
 from src.agents.llm_agent import LLMAgent, PromptConfig
 from src.engine.wrapper import DiplomacyWrapper
 from src.utils.scoring import calculate_final_scores
 
 POWERS = ["AUSTRIA", "ENGLAND", "FRANCE", "GERMANY", "ITALY", "RUSSIA", "TURKEY"]
+
+# Mapping from bot: prefixed adapter names to bot classes
+BOT_MAP: dict[str, type[DiplomacyAgent]] = {
+    "bot:random": RandomBot,
+    "bot:chaos": ChaosBot,
+    "bot:defensive": DefensiveBot,
+    "bot:territorial": TerritorialBot,
+    "bot:coordinated": CoordinatedBot,
+}
+
+
+def is_baseline_bot(adapter_name: str | None) -> bool:
+    """Check if adapter name refers to a rule-based baseline bot."""
+    return adapter_name is not None and adapter_name.startswith("bot:")
+
+
+def get_baseline_bot(adapter_name: str) -> DiplomacyAgent:
+    """Instantiate a baseline bot from its adapter name."""
+    if adapter_name not in BOT_MAP:
+        raise ValueError(f"Unknown baseline bot: {adapter_name}")
+    return BOT_MAP[adapter_name]()
 
 
 @dataclass
@@ -48,7 +77,15 @@ class GameSession:
         """
         session_id = str(uuid.uuid4())[:8]
         game = DiplomacyWrapper(game_id=session_id, horizon=horizon)
-        agent = LLMAgent(config=PromptConfig(compact_mode=True))
+        # Match training config: show_valid_moves=False to include board context
+        agent = LLMAgent(
+            config=PromptConfig(
+                compact_mode=True,
+                show_valid_moves=False,
+                show_board_context=True,
+                show_map_windows=True,
+            )
+        )
 
         # Build power_adapters map
         if power_adapters is None:
@@ -174,3 +211,36 @@ class GameSession:
             "turn_history": self.turn_history,
             # Note: trajectories are stored separately
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "GameSession":
+        """Restore a session from persisted data.
+
+        Args:
+            data: Dict from to_dict() or persistence layer
+
+        Returns:
+            Restored GameSession instance
+        """
+        # Restore the game engine from saved state
+        game = DiplomacyWrapper.from_saved_state(data["game_state"], horizon=10)
+        # Match training config: show_valid_moves=False to include board context
+        agent = LLMAgent(
+            config=PromptConfig(
+                compact_mode=True,
+                show_valid_moves=False,
+                show_board_context=True,
+                show_map_windows=True,
+            )
+        )
+
+        return cls(
+            id=data["id"],
+            game=game,
+            agent=agent,
+            human_power=data["human_power"],
+            adapter_name=data.get("adapter_name"),
+            power_adapters=data.get("power_adapters", {}),
+            created_at=data.get("created_at", time.time()),
+            turn_history=data.get("turn_history", []),
+        )

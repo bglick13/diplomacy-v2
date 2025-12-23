@@ -1242,7 +1242,9 @@ async def run_rollout(
             compact_mode=cfg.compact_prompts,
             prefix_cache_optimized=cfg.prefix_cache_optimized,
             show_valid_moves=cfg.show_valid_moves,
+            show_board_context=cfg.show_board_context,
             show_map_windows=cfg.show_map_windows,
+            show_action_counts=cfg.show_action_counts,
         )
         agent = LLMAgent(config=prompt_config)
 

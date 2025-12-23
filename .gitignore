@@ -11,3 +11,5 @@ wheels/
 adapter_v*
 blog**
 .env
+**/*.db
+web/data/diplomacy.db

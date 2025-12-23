@@ -8,7 +8,7 @@ Human vs AI Diplomacy gameplay with training data collection.
 
 ```bash
 # Backend (from repo root)
-pip install fastapi uvicorn[standard] python-multipart
+uv sync
 
 # Frontend
 cd web/frontend
@@ -19,8 +19,8 @@ npm install
 
 **Terminal 1 - Backend:**
 ```bash
-# From repo root
-INFERENCE_MODE=mock PYTHONPATH=. uvicorn web.backend.server:app --reload --port 8000
+# From repo root - mock mode for UI development
+INFERENCE_MODE=mock uv run uvicorn web.backend.server:app --reload --port 8000
 ```
 
 **Terminal 2 - Frontend:**
@@ -36,21 +36,46 @@ Then open http://localhost:3000
 Set `INFERENCE_MODE` environment variable:
 
 - `mock` (default): Random valid moves, no GPU needed. Great for UI development.
-- `modal`: Use Modal's deployed InferenceEngine. Requires Modal CLI and deployed app.
+- `modal`: Use Modal's WebInferenceEngine (optimized for fast cold starts). Requires Modal CLI and deployed app.
 - `local`: Use local vLLM. Requires CUDA GPU.
 
-### Using Modal Inference
+### Using Modal Inference (Recommended for playing against trained models)
 
 ```bash
-INFERENCE_MODE=modal PYTHONPATH=. uvicorn web.backend.server:app --reload --port 8000
+# First, ensure the app is deployed to Modal
+uv run modal deploy -m src.apps.deploy
+
+# Then run the backend with modal inference
+INFERENCE_MODE=modal uv run uvicorn web.backend.server:app --reload --port 8000
 ```
+
+This uses `WebInferenceEngine` which is optimized for web traffic:
+- `enforce_eager=True` to skip CUDA graph compilation (~10-15s faster startup)
+- Lower concurrency settings for single-user traffic
+- 5-min scaledown for cost optimization
 
 ### Using Local vLLM
 
 ```bash
 # Requires CUDA GPU
-INFERENCE_MODE=local MODEL_ID=Qwen/Qwen2.5-7B-Instruct PYTHONPATH=. uvicorn web.backend.server:app --port 8000
+INFERENCE_MODE=local MODEL_ID=Qwen/Qwen2.5-7B-Instruct uv run uvicorn web.backend.server:app --port 8000
 ```
+
+## Available Opponents
+
+### LLM-based (require inference)
+- **Base Model**: Untrained Qwen2.5-7B - easiest LLM difficulty
+- **Best (v150)**: Peak Elo checkpoint - 1068 Elo
+- **Final**: Final training checkpoint
+
+### Rule-based Baseline Bots (instant response, no inference needed)
+- **Random Bot**: Picks random valid moves - very easy
+- **Chaos Bot**: Aggressive - prioritizes movement over holds
+- **Defensive Bot**: Cautious - prioritizes holds and supports
+- **Territorial Bot**: Greedy - targets neutral supply centers
+- **Coordinated Bot**: Team play - coordinates supports between units
+
+Baseline bots work in any inference mode (including `mock`) since they don't require GPU inference.
 
 ## Project Structure
 

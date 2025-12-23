@@ -146,14 +146,16 @@ class LLMAgent:
         phase = game.get_current_phase()
         phase_type = game.get_phase_type()
 
-        # Get board context for strategic awareness (used in minimal prompt mode)
+        # Get board context for strategic awareness
+        # Always include board context when show_board_context=True (default)
+        # This gives the model crucial info: opponent positions, power rankings, threats
         board_context = (
             game.get_board_context(
                 power_name,
                 include_windows=self.config.show_map_windows,
                 include_action_counts=self.config.show_action_counts,
             )
-            if not self.config.show_valid_moves
+            if self.config.show_board_context
             else None
         )
 

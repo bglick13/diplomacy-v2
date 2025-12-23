@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING, Any
 
 import diplomacy
-from diplomacy.utils.export import to_saved_game_format
+from diplomacy.utils.export import from_saved_game_format, to_saved_game_format
 
 if TYPE_CHECKING:
     from src.agents.llm_agent import LLMAgent
@@ -18,6 +18,34 @@ class DiplomacyWrapper:
         self.max_years = horizon
         self.start_year = self.get_year()
         self._orders_cache: tuple[str, dict] | None = None
+
+    @classmethod
+    def from_saved_state(cls, saved_state: dict, horizon: int = 10) -> "DiplomacyWrapper":
+        """Restore a DiplomacyWrapper from saved game state.
+
+        Args:
+            saved_state: Dict from to_saved_game_format()
+            horizon: Maximum years to play (restored games use provided value)
+
+        Returns:
+            Restored DiplomacyWrapper instance
+        """
+        instance = cls.__new__(cls)
+        instance.game = from_saved_game_format(saved_state)
+        instance.max_years = horizon
+        # Restore start_year from the earliest phase in history, or current year
+        if saved_state.get("phases"):
+            first_phase = saved_state["phases"][0].get("name", "")
+            for part in first_phase.split():
+                if part.isdigit():
+                    instance.start_year = int(part)
+                    break
+            else:
+                instance.start_year = instance.get_year()
+        else:
+            instance.start_year = instance.get_year()
+        instance._orders_cache = None
+        return instance
 
     def is_done(self) -> bool:
         if self.game.is_game_done:
@@ -75,7 +103,11 @@ class DiplomacyWrapper:
             return self._get_movement_moves(power_name, possible_orders)
 
     def _get_movement_moves(self, power_name: str, possible_orders: dict) -> dict[str, list[str]]:
-        """Get valid moves for movement/retreat phases."""
+        """Get valid moves for movement/retreat phases.
+
+        During retreat phases, only dislodged units have orders. Non-dislodged
+        units are skipped (they don't need orders during retreats).
+        """
         current_units = self.game.powers[power_name].units
         normalized_moves = {}
 
@@ -88,7 +120,10 @@ class DiplomacyWrapper:
             if loc_key in possible_orders:
                 orders = possible_orders[loc_key]
                 clean_orders = [str(order) for order in orders]
-                normalized_moves[unit_str] = clean_orders
+                # Only include units that have actual orderable moves
+                # (During retreats, non-dislodged units have no orders)
+                if clean_orders:
+                    normalized_moves[unit_str] = clean_orders
 
         return normalized_moves
 
@@ -100,6 +135,8 @@ class DiplomacyWrapper:
         - Builds: orderable_locations are empty home centers
         - Disbands: orderable_locations are all unit locations
         - Orders format: "A LOC B", "F LOC B", "WAIVE", "A LOC D", "F LOC D"
+
+        Powers with no adjustment needed (units == centers) have no orderable locations.
         """
         orderable_locs = self.game.get_orderable_locations(power_name)
         normalized_moves = {}
@@ -108,8 +145,10 @@ class DiplomacyWrapper:
             if loc in possible_orders:
                 orders = possible_orders[loc]
                 clean_orders = [str(order) for order in orders]
-                # Use location as key (not unit string) for adjustments
-                normalized_moves[loc] = clean_orders
+                # Only include locations with actual orderable moves
+                if clean_orders:
+                    # Use location as key (not unit string) for adjustments
+                    normalized_moves[loc] = clean_orders
 
         return normalized_moves
 

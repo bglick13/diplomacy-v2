@@ -85,10 +85,11 @@ class RequestState:
         # end-tag forcing
         "force_end_ids",
         "force_end_pos",
-        # track used units
+        # track used units and targeted locations
         "valid_moves_dict",
         "current_line_text",
         "used_units",
+        "targeted_locations",
     )
 
     def __init__(
@@ -121,10 +122,11 @@ class RequestState:
         self.force_end_ids: list[int] | None = None
         self.force_end_pos: int = 0
 
-        # Track which units have been used
+        # Track which units have been used and which locations are targeted
         self.valid_moves_dict = valid_moves_dict
         self.current_line_text = ""
         self.used_units: set[str] = set()
+        self.targeted_locations: set[str] = set()
 
 
 # -------------------------
@@ -169,6 +171,57 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
         if unit_type not in ("A", "F"):
             return None  # Not a valid unit order (e.g., WAIVE)
         return f"{parts[0]} {parts[1]}"
+
+    @staticmethod
+    def _extract_target_from_move(move: str) -> str | None:
+        """
+        Extract the TARGET location from a MOVEMENT order only.
+
+        Only movement orders (containing " - ") add a target location.
+        Support/hold/convoy orders do NOT target a location for self-bounce purposes
+        because the acting unit stays in place.
+
+        Examples:
+        - "A PAR - BUR" -> "BUR" (Army Paris moves to Burgundy)
+        - "F NTH - NWY" -> "NWY" (Fleet North Sea moves to Norway)
+        - "A PAR - BUR VIA" -> "BUR" (via convoy, still targets BUR)
+        - "A PAR H" -> None (hold, no movement target)
+        - "A PAR S A BUR" -> None (support hold, no movement target)
+        - "A PAR S A BUR - MAR" -> None (support move, PAR doesn't move to MAR)
+        - "F NTH C A LON - BRE" -> None (convoy, fleet doesn't move)
+        - "A PAR B" -> None (build, no movement)
+        - "A PAR D" -> None (disband, no movement)
+
+        Returns:
+            Target location string (e.g., "BUR", "NWY") or None if not a movement.
+        """
+        move = move.strip()
+
+        # Only movement orders have " - " where the unit is the one moving
+        # Support orders also have " - " but the acting unit (first unit) doesn't move
+        # Check if this is a direct movement (not support/convoy)
+        if " S " in move.upper() or " C " in move.upper():
+            # Support or convoy order - acting unit stays in place
+            return None
+
+        if " - " not in move:
+            # Hold, build, disband, retreat without " - " syntax
+            return None
+
+        # Extract target from movement: "A PAR - BUR" or "A PAR - BUR VIA"
+        parts = move.split(" - ")
+        if len(parts) < 2:
+            return None
+
+        # Target is first word after the dash (handle "BUR VIA" edge case)
+        target_part = parts[-1].strip().split()[0] if parts[-1].strip() else None
+        if not target_part:
+            return None
+
+        # Handle coast notation: "STP/NC" -> "STP" for self-bounce purposes
+        # (Units can't bounce themselves into different coasts of same province)
+        base_target = target_part.split("/")[0]
+        return base_target.upper()
 
     @classmethod
     def validate_params(cls, sampling_params: SamplingParams) -> None:
@@ -224,7 +277,10 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
         return False
 
     def _build_trie(
-        self, valid_moves_dict: dict[str, list[str]], exclude_units: set[str] | None = None
+        self,
+        valid_moves_dict: dict[str, list[str]],
+        exclude_units: set[str] | None = None,
+        exclude_targets: set[str] | None = None,
     ) -> TokenTrieNode:
         """
         Build a trie over token ids for valid moves.
@@ -234,15 +290,24 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
         Args:
             valid_moves_dict: Dictionary mapping unit identifiers to their valid moves
             exclude_units: Set of unit identifiers to exclude from the trie
+            exclude_targets: Set of target locations to exclude (prevents self-bounces)
         """
         root = TokenTrieNode()
         exclude = exclude_units or set()
+        excluded_targets = exclude_targets or set()
 
         for unit, moves in valid_moves_dict.items():
             if unit in exclude:
                 continue
 
             for move in moves:
+                # Check if this movement order targets an already-used location
+                if excluded_targets:
+                    target = self._extract_target_from_move(move)
+                    if target and target in excluded_targets:
+                        # Skip this move - would cause self-bounce
+                        continue
+
                 # Base move
                 ids = self.tokenizer.encode(move, add_special_tokens=False)
                 if ids:
@@ -447,7 +512,7 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
                 pass
 
             # If the token's decoded text contains a newline and we are at a move end,
-            # extract the unit and rebuild the trie excluding it.
+            # extract the unit and target, then rebuild the trie excluding them.
             if "\n" in piece and state.current_node.is_end_of_move:
                 state.emitted_orders += 1
 
@@ -455,8 +520,16 @@ class DiplomacyLogitsProcessor(LogitsProcessor):  # type: ignore[misc]
                 unit = self._extract_unit_from_move(state.current_line_text)
                 if unit and unit in state.valid_moves_dict:
                     state.used_units.add(unit)
-                    # Rebuild trie excluding used units
-                    state.root = self._build_trie(state.valid_moves_dict, state.used_units)
+
+                # Extract target location from movement orders to prevent self-bounces
+                target = self._extract_target_from_move(state.current_line_text)
+                if target:
+                    state.targeted_locations.add(target)
+
+                # Rebuild trie excluding used units AND targeted locations
+                state.root = self._build_trie(
+                    state.valid_moves_dict, state.used_units, state.targeted_locations
+                )
 
                 # Reset for next line
                 state.current_node = state.root

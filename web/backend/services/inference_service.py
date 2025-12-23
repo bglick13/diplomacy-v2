@@ -75,18 +75,25 @@ class MockInferenceService(InferenceService):
 
 
 class ModalInferenceService(InferenceService):
-    """Modal-based inference for production."""
+    """Modal-based inference for production.
+
+    Uses WebInferenceEngine which is optimized for web traffic with:
+    - GPU memory snapshotting for fast cold starts (~3-5s vs ~30-60s)
+    - enforce_eager=True to skip CUDA graph compilation
+    - Lower concurrency settings for single-user traffic
+    """
 
     def __init__(self, model_id: str = "Qwen/Qwen2.5-7B-Instruct"):
         self.model_id = model_id
         self._engine_cls = None
 
     def _get_engine_cls(self):
-        """Lazy load Modal engine class."""
+        """Lazy load Modal engine class (WebInferenceEngine for fast cold starts)."""
         if self._engine_cls is None:
             import modal
 
-            self._engine_cls = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
+            # Use WebInferenceEngine optimized for web traffic
+            self._engine_cls = modal.Cls.from_name("diplomacy-grpo", "WebInferenceEngine")
         return self._engine_cls
 
     async def generate(

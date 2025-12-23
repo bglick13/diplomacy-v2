@@ -906,3 +906,204 @@ class InferenceEngine:
         print(f"📊 Scored {len(prompts)} sequences in {duration_ms}ms (base model)")
 
         return results
+
+
+# ============================================================================
+# WEB INFERENCE ENGINE (Optimized for low-traffic web app with fast cold starts)
+# ============================================================================
+
+
+@app.cls(
+    image=gpu_image,
+    gpu="L4",
+    volumes={
+        str(VOLUME_PATH): volume,
+        str(HF_CACHE_PATH): hf_cache_volume,
+    },
+    secrets=[modal.Secret.from_name("axiom-secrets")],
+    scaledown_window=60 * 5,  # 5 min scaledown for cost optimization
+    buffer_containers=0,  # No buffer for low-traffic web
+)
+@modal.concurrent(max_inputs=8, target_inputs=4)  # Lower concurrency for web
+class WebInferenceEngine:
+    """
+    Inference engine optimized for web app traffic with faster cold starts.
+
+    Key optimizations:
+    - enforce_eager=True: Skips CUDA graph compilation (~10-15s faster startup)
+    - Lower concurrency: Optimized for single-user web traffic
+    - Faster scaledown: 5 min idle (vs 10 min for training engine)
+
+    Note: GPU memory snapshotting (enable_memory_snapshot) is not compatible
+    with vLLM's model inspection process, so we rely on enforce_eager instead.
+    """
+
+    model_id: str = modal.parameter(default="Qwen/Qwen2.5-7B-Instruct")
+
+    @modal.enter()
+    def setup(self):
+        """Initialize vLLM engine with fast-boot configuration."""
+        print("🌐 Initializing WebInferenceEngine (fast-boot mode)...")
+
+        # Setup HuggingFace cache
+        os.environ["HF_HOME"] = str(HF_CACHE_PATH)
+        os.environ["TRANSFORMERS_CACHE"] = str(HF_CACHE_PATH / "transformers")
+        os.environ["HF_HUB_CACHE"] = str(HF_CACHE_PATH / "hub")
+
+        for cache_dir in [
+            HF_CACHE_PATH / "transformers",
+            HF_CACHE_PATH / "hub",
+        ]:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_id,
+            cache_dir=str(HF_CACHE_PATH / "transformers"),
+        )
+
+        # Initialize adapter manager
+        self.adapter_mgr = AdapterManager()
+
+        # Create engine with fast-boot settings
+        # enforce_eager=True skips CUDA graph compilation for faster cold starts
+        engine_args = AsyncEngineArgs(
+            model=self.model_id,  # pyright: ignore[reportCallIssue]
+            enable_lora=True,  # pyright: ignore[reportCallIssue]
+            max_loras=4,  # Fewer adapters for web (vs 8 for training)  # pyright: ignore[reportCallIssue]
+            max_lora_rank=16,  # pyright: ignore[reportCallIssue]
+            gpu_memory_utilization=0.85,  # More conservative for stability  # pyright: ignore[reportCallIssue]
+            max_num_seqs=32,  # Lower for single-user traffic  # pyright: ignore[reportCallIssue]
+            max_num_batched_tokens=4096,  # pyright: ignore[reportCallIssue]
+            dtype="half",  # pyright: ignore[reportCallIssue]
+            enable_prefix_caching=True,  # pyright: ignore[reportCallIssue]
+            disable_log_stats=True,  # Reduce logging overhead  # pyright: ignore[reportCallIssue]
+            enforce_eager=True,  # Skip CUDA graph compilation for fast startup  # pyright: ignore[reportCallIssue]
+            logits_processors=[DiplomacyLogitsProcessor],  # pyright: ignore[reportCallIssue]
+            download_dir=str(HF_CACHE_PATH / "hub"),  # pyright: ignore[reportCallIssue]
+            load_format="auto",  # pyright: ignore[reportCallIssue]
+        )
+
+        print("⚙️  WebInferenceEngine Config: enforce_eager=True, max_loras=4, max_num_seqs=32")
+        self.engine = AsyncLLM.from_engine_args(engine_args)
+
+        print("✅ WebInferenceEngine Ready (snapshot will be created)")
+
+    @modal.method()
+    async def generate(
+        self,
+        prompts: list[str],
+        valid_moves: list[dict],
+        lora_name: str | None = None,
+        temperature: float = 0.8,
+        max_new_tokens: int = 256,
+    ) -> list[GenerateBatchResponseItem]:
+        """
+        Generate responses for the given prompts.
+
+        Simplified interface for web app (single adapter at a time).
+        """
+        batch_size = len(prompts)
+        request_start = time.time()
+
+        try:
+            # Load adapter if specified
+            lora_req = None
+            if lora_name:
+                lora_req = await self.adapter_mgr.load_adapter(lora_name)
+
+            # Generate responses
+            responses = await self._generate_batch(
+                prompts, valid_moves, lora_req, temperature, max_new_tokens
+            )
+
+            duration_ms = int((time.time() - request_start) * 1000)
+            total_tokens = sum(resp["token_count"] for resp in responses)
+            print(
+                f"🌐 WebInference: {batch_size} prompts, {total_tokens} tokens in {duration_ms}ms"
+            )
+
+            return [
+                {
+                    "text": resp["text"],
+                    "token_ids": resp["token_ids"],
+                    "prompt_token_ids": resp["prompt_token_ids"],
+                    "completion_logprobs": resp["completion_logprobs"],
+                }
+                for resp in responses
+            ]
+
+        except Exception as e:
+            error_msg = f"WebInference Failed: {type(e).__name__}: {str(e)}"
+            print(error_msg)
+            handle_fatal_error(e)
+            raise RuntimeError(error_msg) from None
+
+    async def _generate_batch(
+        self,
+        prompts: list[str],
+        valid_moves: list[dict],
+        lora_req: LoRARequest | None,
+        temperature: float,
+        max_new_tokens: int,
+    ) -> list[GenerationResponse]:
+        """Generate responses for a batch of prompts."""
+
+        async def _generate_single(prompt: str, moves: dict) -> GenerationResponse:
+            request_id = str(uuid.uuid4())
+            sampling_params = SamplingParams(  # type: ignore[call-arg, misc]
+                temperature=temperature,  # type: ignore[arg-type]
+                max_tokens=max_new_tokens,  # type: ignore[arg-type]
+                extra_args={"valid_moves_dict": moves, "start_active": True},
+                stop=["</orders>", "</Orders>"],  # type: ignore[arg-type]
+                logprobs=1,  # type: ignore[arg-type]
+            )
+
+            try:
+                generator = self.engine.generate(
+                    prompt=prompt,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                    lora_request=lora_req,
+                )
+
+                final_output = None
+                async for output in generator:
+                    final_output = output
+
+                text = ""
+                token_ids: list[int] = []
+                prompt_token_ids: list[int] = []
+                completion_logprobs: list[float] = []
+
+                if final_output:
+                    prompt_token_ids = final_output.prompt_token_ids or []
+                    if final_output.outputs:
+                        output = final_output.outputs[0]
+                        text = output.text
+                        token_ids = list(output.token_ids)
+                        if output.logprobs:
+                            completion_logprobs = parse_completion_logprobs(
+                                output.logprobs, token_ids
+                            )
+
+                return {
+                    "text": text,
+                    "token_count": len(token_ids),
+                    "token_ids": token_ids,
+                    "prompt_token_ids": prompt_token_ids,
+                    "completion_logprobs": completion_logprobs,
+                }
+
+            except Exception as e:
+                print(f"❌ WebInference Generation Error: {e}")
+                raise e
+
+        results = await asyncio.gather(
+            *[
+                _generate_single(prompt, moves)
+                for prompt, moves in zip(prompts, valid_moves, strict=True)
+            ]
+        )
+
+        return list(results)
