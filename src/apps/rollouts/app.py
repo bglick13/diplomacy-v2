@@ -24,7 +24,12 @@ from src.utils.observability import (
     stopwatch,
 )
 from src.utils.parsing import extract_orders
-from src.utils.scoring import calculate_final_scores, calculate_step_score
+from src.utils.scoring import (
+    calculate_balance_of_power_score,
+    calculate_final_scores,
+    calculate_leader_gap_penalty,
+    calculate_step_score,
+)
 from src.utils.vis import GameVisualizer
 from src.utils.weave_traces import (
     TrajectoryTrace,
@@ -1011,7 +1016,18 @@ def build_trajectories(
             # Blend step reward with final game outcome
             step_component = step_delta * cfg.step_reward_weight
             final_component = final_scores[power] * cfg.final_reward_weight
-            blended_reward = step_component + final_component
+
+            # Strategic awareness components
+            leader_gap = calculate_leader_gap_penalty(
+                game, power, threshold=cfg.leader_gap_threshold
+            )
+            balance_bonus = calculate_balance_of_power_score(game, power)
+            strategic_component = (
+                leader_gap * cfg.leader_gap_penalty_weight
+                + balance_bonus * cfg.balance_bonus_weight
+            )
+
+            blended_reward = step_component + final_component + strategic_component
 
             # Use step_count in group_id for proper credit assignment
             # This ensures trajectories from the same step across forks are grouped together

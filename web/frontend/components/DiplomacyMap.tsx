@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { Card, CardContent } from "@/components/ui/card";
 import {
   PROVINCE_COORDINATES,
   MAP_VIEWBOX,
@@ -9,7 +9,11 @@ import {
   parseUnitLocation,
   isFleet,
   getUnitCoordinates,
+  svgPointFromEvent,
+  findNearestProvinceFromAll,
 } from "@/lib/map-data";
+import { DragOrderLayer } from "./DragOrderLayer";
+import type { DragState, Point } from "@/hooks/useDragOrderState";
 
 interface DiplomacyMapProps {
   units: Record<string, string[]>;
@@ -19,6 +23,12 @@ interface DiplomacyMapProps {
   selectedOrders?: Record<string, string>;
   selectedUnit?: string | null;
   onUnitClick?: (unit: string) => void;
+  // Drag-and-drop props
+  dragState?: DragState;
+  onDragStart?: (unit: string, pos: Point) => void;
+  onDragMove?: (pos: Point) => void;
+  onDragEnd?: (province: string | null) => void;
+  onDragCancel?: () => void;
 }
 
 // Order types for visualization
@@ -136,9 +146,18 @@ export function DiplomacyMap({
   selectedOrders = {},
   selectedUnit,
   onUnitClick,
+  dragState,
+  onDragStart,
+  onDragMove,
+  onDragEnd,
+  onDragCancel,
 }: DiplomacyMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
   const [svgContent, setSvgContent] = useState<string>("");
+  const [isDragging, setIsDragging] = useState(false);
+  const dragStartPos = useRef<{ x: number; y: number } | null>(null);
+  const hasDraggedRef = useRef(false); // Track if user actually dragged (moved significantly)
 
   // Load the base SVG map
   useEffect(() => {
@@ -192,6 +211,96 @@ export function DiplomacyMap({
   // Get human power color for order visualization
   const humanColor = UNIT_COLORS[humanPower] || "#00bfff";
 
+  // Minimum drag distance to consider it a drag vs a click (in SVG units)
+  const MIN_DRAG_DISTANCE = 15;
+
+  // Drag handlers
+  const handlePointerDown = useCallback(
+    (unit: string, e: React.PointerEvent) => {
+      if (!onDragStart || !svgRef.current) return;
+      if (!isClickable(unit)) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+
+      const pos = svgPointFromEvent(e.nativeEvent, svgRef.current);
+      dragStartPos.current = pos;
+      hasDraggedRef.current = false;
+      setIsDragging(true);
+      onDragStart(unit, pos);
+
+      // Capture pointer for reliable drag tracking
+      (e.target as Element).setPointerCapture(e.pointerId);
+    },
+    [onDragStart, isClickable]
+  );
+
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent) => {
+      if (!isDragging || !onDragMove || !svgRef.current) return;
+
+      const pos = svgPointFromEvent(e.nativeEvent, svgRef.current);
+
+      // Check if we've moved enough to consider it a drag
+      if (dragStartPos.current && !hasDraggedRef.current) {
+        const dist = Math.hypot(
+          pos.x - dragStartPos.current.x,
+          pos.y - dragStartPos.current.y
+        );
+        if (dist > MIN_DRAG_DISTANCE) {
+          hasDraggedRef.current = true;
+        }
+      }
+
+      onDragMove(pos);
+    },
+    [isDragging, onDragMove]
+  );
+
+  const handlePointerUp = useCallback(
+    (e: React.PointerEvent) => {
+      if (!isDragging || !onDragEnd || !svgRef.current) return;
+
+      const pos = svgPointFromEvent(e.nativeEvent, svgRef.current);
+
+      // If we didn't drag significantly, treat as a click (potential hold)
+      if (!hasDraggedRef.current) {
+        // Find the unit at the click position to issue hold
+        setIsDragging(false);
+        dragStartPos.current = null;
+        onDragEnd(null); // null signals "dropped on self" which triggers hold
+        (e.target as Element).releasePointerCapture?.(e.pointerId);
+        return;
+      }
+
+      const province = findNearestProvinceFromAll(pos, 60);
+
+      setIsDragging(false);
+      dragStartPos.current = null;
+      onDragEnd(province);
+
+      // Release pointer capture
+      (e.target as Element).releasePointerCapture?.(e.pointerId);
+    },
+    [isDragging, onDragEnd]
+  );
+
+  const handleMapClick = useCallback(
+    (e: React.MouseEvent) => {
+      // Handle clicks for multi-step operations
+      if (!dragState || dragState.phase === "idle" || dragState.phase === "dragging") return;
+      if (!svgRef.current || !onDragEnd) return;
+
+      const pos = svgPointFromEvent(e.nativeEvent, svgRef.current);
+      const province = findNearestProvinceFromAll(pos, 60);
+      onDragEnd(province);
+    },
+    [dragState, onDragEnd]
+  );
+
+  // Check if we're in an active drag state (for showing drag UI)
+  const isActiveDrag = dragState && dragState.phase !== "idle";
+
   return (
     <Card className="h-full overflow-hidden p-0">
       <CardContent className="p-0 h-full">
@@ -201,9 +310,17 @@ export function DiplomacyMap({
           style={{ maxHeight: "calc(100vh - 100px)" }}
         >
           <svg
+            ref={svgRef}
             viewBox={`0 0 ${MAP_VIEWBOX.width} ${MAP_VIEWBOX.height}`}
             className="w-full h-auto min-w-[600px]"
-            style={{ background: "#c5dfea" }}
+            style={{ background: "#c5dfea", touchAction: isDragging ? "none" : "auto" }}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
+            onPointerCancel={() => {
+              setIsDragging(false);
+              onDragCancel?.();
+            }}
+            onClick={handleMapClick}
           >
             {/* Arrow marker definitions */}
             <defs>
@@ -473,6 +590,15 @@ export function DiplomacyMap({
               })}
             </g>
 
+            {/* Drag order layer - between orders and units */}
+            {dragState && (
+              <DragOrderLayer
+                dragState={dragState}
+                humanPower={humanPower}
+                allUnits={allUnits}
+              />
+            )}
+
             {/* Unit overlays */}
             <g id="units">
               {allUnits.map(({ unit, power }) => {
@@ -483,15 +609,16 @@ export function DiplomacyMap({
                 const color = UNIT_COLORS[power] || "#888";
                 const isHuman = power === humanPower;
                 const clickable = isClickable(unit);
-                const isSelected = selectedUnit === unit;
+                const isSelected = selectedUnit === unit || (dragState?.phase !== "idle" && dragState?.unit === unit);
                 const hasOrder = unit in selectedOrders;
 
                 return (
                   <g
                     key={unit}
                     transform={`translate(${coords.x - 20}, ${coords.y - 10})`}
-                    onClick={() => clickable && onUnitClick?.(unit)}
-                    style={{ cursor: clickable ? "pointer" : "default" }}
+                    onClick={() => !isDragging && clickable && onUnitClick?.(unit)}
+                    onPointerDown={(e) => handlePointerDown(unit, e)}
+                    style={{ cursor: clickable ? "grab" : "default" }}
                   >
                     {/* Selection highlight */}
                     {isSelected && (

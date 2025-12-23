@@ -134,6 +134,31 @@ class ExperimentConfig(BaseModel):
         description="Weight for forward unit positioning in step scoring (+ per unit outside home)",
     )
 
+    # Strategic awareness reward shaping
+    leader_gap_penalty_weight: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Weight for penalizing large gaps to the leader. "
+            "Encourages stopping runaway leaders instead of fighting weak neighbors."
+        ),
+    )
+    balance_bonus_weight: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Weight for balance-of-power bonus. "
+            "Non-leaders get rewarded when game is balanced (encourages coalition behavior)."
+        ),
+    )
+    leader_gap_threshold: int = Field(
+        default=3,
+        ge=1,
+        description="SC gap above which leader_gap_penalty starts applying.",
+    )
+
     # =========================================================================
     # League Training Settings
     # =========================================================================

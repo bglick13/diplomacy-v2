@@ -1,4 +1,92 @@
+import numpy as np
+
 from src.engine.wrapper import DiplomacyWrapper
+
+
+def calculate_leader_gap_penalty(
+    game: DiplomacyWrapper,
+    power_name: str,
+    threshold: int = 3,
+) -> float:
+    """
+    Penalty based on how far behind the leader this power is.
+
+    This encourages powers to stop runaway leaders rather than fighting
+    weak neighbors. The penalty only applies when the gap exceeds the threshold.
+
+    Args:
+        game: The Diplomacy game wrapper
+        power_name: Name of the power to calculate penalty for
+        threshold: SC gap above which penalty starts (default 3)
+
+    Returns:
+        0 if power is the leader or within threshold.
+        Negative value proportional to gap beyond threshold (normalized by 18).
+    """
+    sc_counts = {pn: len(p.centers) for pn, p in game.game.powers.items()}
+    my_scs = sc_counts.get(power_name, 0)
+    leader_scs = max(sc_counts.values()) if sc_counts else 0
+
+    gap = leader_scs - my_scs
+    if gap <= threshold:
+        return 0.0
+
+    # Penalty grows with gap beyond threshold
+    # Normalized by 18 (max SCs) so penalty is in [0, 1] range
+    excess_gap = gap - threshold
+    return -excess_gap / 18.0
+
+
+def calculate_balance_of_power_score(
+    game: DiplomacyWrapper,
+    power_name: str,
+) -> float:
+    """
+    Score based on game balance. Higher = more balanced = good for non-leaders.
+
+    Uses inverse coefficient of variation (lower spread = higher score).
+    Only positive for non-leaders (leaders should want to break balance, not preserve it).
+
+    This encourages coalition behavior - non-leaders benefit when the game is tight,
+    which means they're incentivized to stop anyone from running away.
+
+    Args:
+        game: The Diplomacy game wrapper
+        power_name: Name of the power to calculate score for
+
+    Returns:
+        0 for leaders (they want to break balance).
+        0-1 for non-leaders based on game balance (1 = perfectly equal).
+    """
+    sc_counts = {pn: len(p.centers) for pn, p in game.game.powers.items()}
+    my_scs = sc_counts.get(power_name, 0)
+
+    # Filter to surviving powers only
+    active_counts = [c for c in sc_counts.values() if c > 0]
+    if len(active_counts) < 2:
+        return 0.0
+
+    leader_scs = max(active_counts)
+
+    # Leaders don't get balance bonus (they want to break balance)
+    if my_scs == leader_scs:
+        return 0.0
+
+    # Calculate coefficient of variation (std/mean)
+    mean_sc = float(np.mean(active_counts))
+    std_sc = float(np.std(active_counts))
+
+    if mean_sc < 0.1:  # Avoid division by zero
+        return 0.0
+
+    cv = std_sc / mean_sc  # Higher = more unequal
+
+    # Invert: balance_score = 1 - cv (capped at 0)
+    # When game is perfectly equal, cv=0, score=1
+    # When one power dominates, cv is high, score approaches 0
+    balance_score = max(0.0, 1.0 - cv)
+
+    return balance_score
 
 
 def calculate_step_score(

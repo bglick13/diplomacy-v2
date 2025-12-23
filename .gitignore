@@ -13,3 +13,5 @@ blog**
 .env
 **/*.db
 web/data/diplomacy.db
+**/.DS_Store
+web/.DS_Store

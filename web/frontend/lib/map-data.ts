@@ -155,3 +155,77 @@ export function getUnitCoordinates(
 
   return null;
 }
+
+/**
+ * Convert a pointer event to SVG coordinates.
+ */
+export function svgPointFromEvent(
+  event: PointerEvent | MouseEvent,
+  svgElement: SVGSVGElement
+): { x: number; y: number } {
+  const pt = svgElement.createSVGPoint();
+  pt.x = event.clientX;
+  pt.y = event.clientY;
+  const ctm = svgElement.getScreenCTM();
+  if (!ctm) return { x: 0, y: 0 };
+  const svgP = pt.matrixTransform(ctm.inverse());
+  return { x: svgP.x, y: svgP.y };
+}
+
+/**
+ * Find the nearest province to a point within a hit radius.
+ * Returns null if no province is within the radius.
+ */
+export function findNearestProvince(
+  point: { x: number; y: number },
+  candidates: string[],
+  hitRadius: number = 50
+): string | null {
+  let nearest: string | null = null;
+  let minDist = Infinity;
+
+  for (const province of candidates) {
+    const coords = PROVINCE_COORDINATES[province];
+    if (!coords) {
+      // Try base province without coast
+      const base = province.split("/")[0];
+      const baseCoords = PROVINCE_COORDINATES[base];
+      if (!baseCoords) continue;
+
+      const dist = Math.hypot(baseCoords.x - point.x, baseCoords.y - point.y);
+      if (dist < minDist && dist < hitRadius) {
+        minDist = dist;
+        nearest = province;
+      }
+    } else {
+      const dist = Math.hypot(coords.x - point.x, coords.y - point.y);
+      if (dist < minDist && dist < hitRadius) {
+        minDist = dist;
+        nearest = province;
+      }
+    }
+  }
+
+  return nearest;
+}
+
+/**
+ * Find the nearest province from all provinces.
+ */
+export function findNearestProvinceFromAll(
+  point: { x: number; y: number },
+  hitRadius: number = 50
+): string | null {
+  return findNearestProvince(
+    point,
+    Object.keys(PROVINCE_COORDINATES).filter((p) => !p.includes("/")),
+    hitRadius
+  );
+}
+
+/**
+ * Get all base provinces (without coastal variants).
+ */
+export function getAllBaseProvinces(): string[] {
+  return Object.keys(PROVINCE_COORDINATES).filter((p) => !p.includes("/"));
+}
