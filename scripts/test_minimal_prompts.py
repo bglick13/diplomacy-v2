@@ -9,7 +9,7 @@ from src.engine.wrapper import DiplomacyWrapper
 
 # Try to import tiktoken for accurate token counts, fall back to estimate
 try:
-    import tiktoken
+    import tiktoken  # type: ignore[import-not-found]
 
     _encoding = tiktoken.encoding_for_model("gpt-4o")
 

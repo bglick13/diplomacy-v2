@@ -120,7 +120,7 @@ def generate_with_vllm(
     sampling_params = SamplingParams(  # type: ignore[call-arg, misc]
         temperature=temperature,  # type: ignore[arg-type]
         max_tokens=max_tokens,  # type: ignore[arg-type]
-        extra_args={"valid_moves_dict": valid_moves, "start_active": False},
+        extra_args={"valid_moves_dict": valid_moves, "start_active": False},  # type: ignore[arg-type]
         stop=["</orders>", "</Orders>"],  # type: ignore[arg-type]
         logprobs=1,  # type: ignore[arg-type]
     )
