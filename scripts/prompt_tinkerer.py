@@ -117,12 +117,12 @@ def generate_with_vllm(
 
     # Pass valid_moves via extra_args - this is how DiplomacyLogitsProcessor receives them
     # start_active=True because prompt ends with <orders>, so we start constraining immediately
-    sampling_params = SamplingParams(
-        temperature=temperature,
-        max_tokens=max_tokens,
+    sampling_params = SamplingParams(  # type: ignore[call-arg, misc]
+        temperature=temperature,  # type: ignore[arg-type]
+        max_tokens=max_tokens,  # type: ignore[arg-type]
         extra_args={"valid_moves_dict": valid_moves, "start_active": False},
-        logprobs=1,
-        stop=["</orders>", "</Orders>"],
+        stop=["</orders>", "</Orders>"],  # type: ignore[arg-type]
+        logprobs=1,  # type: ignore[arg-type]
     )
 
     print(colorize(f"Valid moves passed to logits processor: {len(valid_moves)} units", "cyan"))

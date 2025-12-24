@@ -1032,17 +1032,17 @@ def aggregate_rewards_by_opponent_type(
         category_games[dominant_cat] += 1
 
     # Compute means
-    result: dict[str, dict[str, float]] = {}
+    aggregated: dict[str, dict[str, float]] = {}
     for cat in ["self", "peer", "exploitable", "baseline"]:
         rewards = category_rewards.get(cat, [])
         if rewards:
-            result[cat] = {
+            aggregated[cat] = {
                 "reward_mean": float(np.mean(rewards)),
                 "reward_count": len(rewards),
                 "game_count": category_games.get(cat, 0),
             }
 
-    return result
+    return aggregated
 
 
 def _add_league_metrics(

@@ -119,6 +119,7 @@ def test_adjustment_phase_builds():
     wrapper.game = game
     wrapper.max_years = 2
     wrapper.start_year = 1901
+    wrapper._orders_cache = None
 
     # Continue processing until we hit an adjustments phase or wrap around to Spring 1902
     max_iterations = 10

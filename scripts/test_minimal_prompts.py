@@ -3,16 +3,25 @@
 
 from collections import defaultdict
 
-import tiktoken
-
 from src.agents.baselines import ChaosBot
 from src.agents.llm_agent import LLMAgent, PromptConfig
 from src.engine.wrapper import DiplomacyWrapper
 
+# Try to import tiktoken for accurate token counts, fall back to estimate
+try:
+    import tiktoken
 
-def estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~1 token per 4 characters."""
-    return len(tiktoken.encoding_for_model("gpt-4o").encode(text))
+    _encoding = tiktoken.encoding_for_model("gpt-4o")
+
+    def estimate_tokens(text: str) -> int:
+        """Token count using tiktoken."""
+        return len(_encoding.encode(text))
+
+except ImportError:
+
+    def estimate_tokens(text: str) -> int:
+        """Rough token estimate: ~1 token per 4 characters."""
+        return len(text) // 4
 
 
 def test_prompt_modes():

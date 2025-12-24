@@ -212,7 +212,7 @@ def estimate_win_probability(
     c = math.sqrt(2 * BETA**2 + sigma_a**2 + sigma_b**2)
 
     # Probability A > B
-    return env.cdf((mu_a - mu_b) / c)
+    return float(env.cdf((mu_a - mu_b) / c))
 
 
 def elo_to_trueskill(elo: float) -> tuple[float, float]:

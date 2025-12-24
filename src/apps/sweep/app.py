@@ -68,12 +68,12 @@ def orchestrate_sweep(
 
     logger.info(f"Starting sweep orchestration: {sweep_name}")
     axiom.log(
-        "sweep_started",
         {
+            "event": "sweep_started",
             "sweep_name": sweep_name,
             "hypothesis": sweep_config.metadata.hypothesis,
             "run_ids": run_ids or list(sweep_config.runs.keys()),
-        },
+        }
     )
 
     # Load or create state
@@ -122,12 +122,12 @@ def orchestrate_sweep(
             orchestrate_sweep.spawn(sweep_config_dict, remaining)
 
             axiom.log(
-                "sweep_respawned",
                 {
+                    "event": "sweep_respawned",
                     "sweep_name": sweep_name,
                     "completed_runs": state.completed_runs,
                     "remaining_runs": remaining,
-                },
+                }
             )
 
             return {
@@ -151,13 +151,13 @@ def orchestrate_sweep(
         state.save()
 
         axiom.log(
-            "sweep_run_started",
             {
+                "event": "sweep_run_started",
                 "sweep_name": sweep_name,
                 "run_id": run_id,
                 "run_name": cfg.run_name,
                 "config": cfg.model_dump(),
-            },
+            }
         )
 
         # Execute training run (blocking)
@@ -181,26 +181,26 @@ def orchestrate_sweep(
             state.save()
 
             axiom.log(
-                "sweep_run_completed",
                 {
+                    "event": "sweep_run_completed",
                     "sweep_name": sweep_name,
                     "run_id": run_id,
                     "run_name": cfg.run_name,
                     "duration_hours": run_duration / 3600,
                     "final_reward": result.get("final_reward_mean"),
-                },
+                }
             )
 
         except Exception as e:
             logger.error(f"Run {run_id} failed: {e}")
             axiom.log(
-                "sweep_run_failed",
                 {
+                    "event": "sweep_run_failed",
                     "sweep_name": sweep_name,
                     "run_id": run_id,
                     "run_name": cfg.run_name,
                     "error": str(e),
-                },
+                }
             )
             # Don't mark as completed - can retry on next invocation
             state.current_run = None
@@ -216,12 +216,12 @@ def orchestrate_sweep(
     logger.info("=" * 60)
 
     axiom.log(
-        "sweep_completed",
         {
+            "event": "sweep_completed",
             "sweep_name": sweep_name,
             "completed_runs": state.completed_runs,
             "total_duration_hours": total_duration / 3600,
-        },
+        }
     )
 
     return {
