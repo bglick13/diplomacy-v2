@@ -20,6 +20,8 @@ from typing import Any
 
 from src.league.types import (
     DEFAULT_BASELINES,
+    MU_INIT,
+    SIGMA_INIT,
     AgentInfo,
     AgentType,
     LeagueMetadata,
@@ -182,6 +184,8 @@ class LeagueRegistry:
         step: int,
         parent: str | None = None,
         initial_elo: float | None = None,
+        initial_mu: float | None = None,
+        initial_sigma: float | None = None,
     ) -> AgentInfo:
         """
         Add a new checkpoint to the league.
@@ -191,7 +195,9 @@ class LeagueRegistry:
             path: Path to the LoRA adapter on the Volume
             step: Training step when checkpoint was created
             parent: Name of the parent checkpoint (for lineage)
-            initial_elo: Starting Elo (defaults to parent's Elo or 1000)
+            initial_elo: Starting Elo (defaults to parent's Elo or 1000) - DEPRECATED
+            initial_mu: Starting TrueSkill mu (defaults to parent's mu)
+            initial_sigma: Starting TrueSkill sigma (defaults to SIGMA_INIT for new checkpoints)
 
         Returns:
             The created AgentInfo
@@ -205,21 +211,37 @@ class LeagueRegistry:
                 logger.warning(f"Checkpoint {name} already exists, skipping")
                 return self._agents[name]
 
-            # Inherit Elo from parent if not specified
-            if initial_elo is None:
-                if parent and parent in self._agents:
-                    initial_elo = self._agents[parent].elo
-                elif parent:
-                    # Parent specified but not found - warn about broken lineage
-                    logger.warning(
-                        f"Parent '{parent}' not found in registry for checkpoint '{name}'. "
-                        f"Using default Elo 1000.0 instead of inheriting. "
-                        "This may indicate a broken checkpoint lineage."
-                    )
+            # Inherit ratings from parent if not specified
+            if parent and parent in self._agents:
+                parent_agent = self._agents[parent]
+                if initial_elo is None:
+                    initial_elo = parent_agent.elo
+                if initial_mu is None:
+                    initial_mu = parent_agent.mu
+                # New checkpoints get full uncertainty (they haven't proven themselves yet)
+                if initial_sigma is None:
+                    initial_sigma = SIGMA_INIT
+            elif parent:
+                # Parent specified but not found - warn about broken lineage
+                logger.warning(
+                    f"Parent '{parent}' not found in registry for checkpoint '{name}'. "
+                    f"Using defaults instead of inheriting. "
+                    "This may indicate a broken checkpoint lineage."
+                )
+                if initial_elo is None:
                     initial_elo = 1000.0
-                else:
-                    # No parent specified - normal case for first checkpoint
+                if initial_mu is None:
+                    initial_mu = MU_INIT
+                if initial_sigma is None:
+                    initial_sigma = SIGMA_INIT
+            else:
+                # No parent specified - normal case for first checkpoint
+                if initial_elo is None:
                     initial_elo = 1000.0
+                if initial_mu is None:
+                    initial_mu = MU_INIT
+                if initial_sigma is None:
+                    initial_sigma = SIGMA_INIT
 
             agent = AgentInfo.create_checkpoint(
                 name=name,
@@ -227,18 +249,26 @@ class LeagueRegistry:
                 step=step,
                 parent=parent,
                 elo=initial_elo,
+                mu=initial_mu,
+                sigma=initial_sigma,
             )
             self._agents[name] = agent
 
             # Update metadata
             if self._metadata:
                 self._metadata.latest_step = max(self._metadata.latest_step, step)
-                if agent.elo > self._metadata.best_elo:
+                # Update best tracking using display_rating
+                if agent.display_rating > self._metadata.best_display_rating:
                     self._metadata.best_elo = agent.elo
+                    self._metadata.best_mu = agent.mu
+                    self._metadata.best_display_rating = agent.display_rating
                     self._metadata.best_agent = name
 
             self._save_unlocked()
-            logger.info(f"Added checkpoint {name} at step {step} with Elo {initial_elo:.0f}")
+            logger.info(
+                f"Added checkpoint {name} at step {step} "
+                f"with rating {agent.display_rating:.1f} (mu={agent.mu:.2f}, sigma={agent.sigma:.2f})"
+            )
 
             return agent
 
@@ -290,12 +320,92 @@ class LeagueRegistry:
                     self._agents[name].elo = new_elo
                     self._agents[name].matches += matches_delta
 
-            # Update best agent tracking
+            # Update best agent tracking (deprecated - use bulk_update_trueskill)
             if self._metadata:
                 for name, new_elo in elo_updates.items():
                     if new_elo > self._metadata.best_elo:
                         self._metadata.best_elo = new_elo
                         self._metadata.best_agent = name
+
+            self._save_unlocked()
+
+    def update_trueskill(
+        self,
+        name: str,
+        new_mu: float,
+        new_sigma: float,
+        matches_delta: int = 1,
+    ) -> None:
+        """
+        Update an agent's TrueSkill rating.
+
+        Args:
+            name: Agent name
+            new_mu: New TrueSkill mean
+            new_sigma: New TrueSkill uncertainty
+            matches_delta: Number of matches to add to count
+        """
+        with file_lock(self._lock_path):
+            # Reload to get latest state before modifying
+            if self.path.exists() and self.path.stat().st_size > 0:
+                self._load_unlocked()
+
+            if name not in self._agents:
+                logger.warning(f"Agent {name} not found, cannot update TrueSkill")
+                return
+
+            agent = self._agents[name]
+            agent.mu = new_mu
+            agent.sigma = new_sigma
+            agent.matches += matches_delta
+            # Keep elo in sync (approximate conversion)
+            agent.elo = (agent.display_rating - MU_INIT) * 40 + 1000
+
+            # Update best agent tracking using display_rating
+            if self._metadata and agent.display_rating > self._metadata.best_display_rating:
+                self._metadata.best_mu = new_mu
+                self._metadata.best_display_rating = agent.display_rating
+                self._metadata.best_elo = agent.elo
+                self._metadata.best_agent = name
+
+            self._save_unlocked()
+
+    def bulk_update_trueskill(
+        self,
+        updates: dict[str, tuple[float, float]],
+        matches_delta: int = 1,
+    ) -> None:
+        """
+        Update multiple agent TrueSkill ratings at once.
+
+        Args:
+            updates: Mapping of agent name to (new_mu, new_sigma) tuple
+            matches_delta: Number of matches to add to each agent's count
+        """
+        with file_lock(self._lock_path):
+            # Reload to get latest state before modifying
+            if self.path.exists() and self.path.stat().st_size > 0:
+                self._load_unlocked()
+
+            for name, (new_mu, new_sigma) in updates.items():
+                if name in self._agents:
+                    agent = self._agents[name]
+                    agent.mu = new_mu
+                    agent.sigma = new_sigma
+                    agent.matches += matches_delta
+                    # Keep elo in sync (approximate conversion)
+                    agent.elo = (agent.display_rating - MU_INIT) * 40 + 1000
+
+            # Update best agent tracking using display_rating
+            if self._metadata:
+                for name, (new_mu, _new_sigma) in updates.items():
+                    if name in self._agents:
+                        agent = self._agents[name]
+                        if agent.display_rating > self._metadata.best_display_rating:
+                            self._metadata.best_mu = new_mu
+                            self._metadata.best_display_rating = agent.display_rating
+                            self._metadata.best_elo = agent.elo
+                            self._metadata.best_agent = name
 
             self._save_unlocked()
 
@@ -338,12 +448,22 @@ class LeagueRegistry:
 
     @property
     def best_elo(self) -> float:
-        """Get the highest Elo in the league."""
+        """Get the highest Elo in the league (DEPRECATED - use best_display_rating)."""
         return self._metadata.best_elo if self._metadata else 1000.0
 
     @property
+    def best_mu(self) -> float:
+        """Get the highest TrueSkill mu in the league."""
+        return self._metadata.best_mu if self._metadata else MU_INIT
+
+    @property
+    def best_display_rating(self) -> float:
+        """Get the highest display rating (mu - 3*sigma) in the league."""
+        return self._metadata.best_display_rating if self._metadata else MU_INIT - 3 * SIGMA_INIT
+
+    @property
     def best_agent(self) -> str:
-        """Get the name of the agent with highest Elo."""
+        """Get the name of the agent with highest rating."""
         return self._metadata.best_agent if self._metadata else "base_model"
 
     @property
@@ -369,6 +489,7 @@ def should_add_to_league(
     step: int,
     registry: LeagueRegistry,
     current_elo: float | None = None,
+    current_display_rating: float | None = None,
 ) -> bool:
     """
     Determine if a checkpoint should be added to the league.
@@ -379,12 +500,13 @@ def should_add_to_league(
     1. Early training (step < 50): every 5 steps
     2. Mid training (step < 200): every 10 steps
     3. Late training: every 20 steps for recent (last 100), every 100 for historical
-    4. Elite: new high score in Elo (always)
+    4. Elite: new high score in display_rating (always)
 
     Args:
         step: Current training step
         registry: The league registry
-        current_elo: Current estimated Elo (optional, for elite check)
+        current_elo: Current estimated Elo (DEPRECATED - use current_display_rating)
+        current_display_rating: Current display rating (mu - 3*sigma) for elite check
 
     Returns:
         True if checkpoint should be added
@@ -409,7 +531,9 @@ def should_add_to_league(
     if step % 100 == 0:
         return True
 
-    # Elite: new high score
+    # Elite: new high score (prefer display_rating, fall back to elo for backwards compat)
+    if current_display_rating is not None and current_display_rating > registry.best_display_rating:
+        return True
     if current_elo is not None and current_elo > registry.best_elo:
         return True
 

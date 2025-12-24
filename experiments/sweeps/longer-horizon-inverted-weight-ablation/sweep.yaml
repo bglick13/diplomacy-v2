@@ -1,0 +1,91 @@
+# Ablation Study: Strategic Learning vs Greedy SC Capture
+#
+# From experiment `grpo-20251222-191408` (Zero KL):
+# - +69 Elo improvement shows learning occurred
+# - BUT reward trajectory stayed FLAT at 3.46 (not climbing)
+# - Baselines heavily exploited (defensive_bot -243 Elo, coordinated_bot -195)
+# - Suggests model learned to exploit weak play, not strategic play
+#
+# Hypothesis: Over-rewarding greedy SC capture, under-rewarding strategic play
+# that leads to wins. This 2x2 ablation tests horizon length and scoring philosophy.
+
+metadata:
+  name: "longer-horizon-inverted-weight-ablation"
+  description: "2x2 ablation: Horizon (Short/Long) x Scoring (SC-Based/Strategic)"
+  hypothesis: |
+    Training with longer horizons and strategic scoring will produce
+    agents that learn to WIN rather than greedily capture SCs.
+
+    Expected outcomes:
+    - D > C > B > A for TrueSkill
+    - C, D should have higher win_bonus_rate than A, B
+    - B, D should have more decisive outcomes than A, C
+  experiment_tag_prefix: "ablation-scoring"
+  created: "2024-12-23"
+  author: "bglick13"
+
+# Default config values shared across all runs
+# For clean comparison, all runs disable separate reward shaping
+defaults:
+  total_steps: 100
+  leader_gap_penalty_weight: 0.0
+  balance_bonus_weight: 0.0
+
+# Analysis configuration
+analysis:
+  primary_metric: "trueskill/display_rating"
+  secondary_metrics:
+    - "game/win_bonus_rate"
+    - "benchmark/reward_mean"
+    - "game/avg_sc_count"
+  expected_ranking: ["D", "C", "B", "A"]
+  success_criteria:
+    - "D achieves higher TrueSkill than A"
+    - "win_bonus_rate increases from A to D"
+    - "No training instability (loss spikes, gradient explosions)"
+
+# Run definitions
+runs:
+  A:
+    name: "baseline"
+    description: "Short Horizon + SC-Based Scoring (control)"
+    config:
+      # Uses default horizon (4yr 80% / 6yr 20%)
+      # Uses default SC-based scoring (step_weight=0.8, final_weight=0.2)
+      experiment_tag: "${metadata.experiment_tag_prefix}-A-baseline"
+
+  B:
+    name: "long-horizon"
+    description: "Long Horizon + SC-Based Scoring"
+    config:
+      rollout_horizon_years: 8
+      rollout_long_horizon_years: 12
+      rollout_long_horizon_chance: 0.5
+      experiment_tag: "${metadata.experiment_tag_prefix}-B-horizon"
+
+  C:
+    name: "strategic-scoring"
+    description: "Short Horizon + Strategic Step Scoring"
+    config:
+      use_strategic_step_scoring: true
+      step_reward_weight: 0.2
+      final_reward_weight: 0.8
+      win_bonus: 200.0
+      winner_threshold_sc: 10
+      experiment_tag: "${metadata.experiment_tag_prefix}-C-strategic"
+
+  D:
+    name: "combined"
+    description: "Long Horizon + Strategic Step Scoring (recommended)"
+    config:
+      # Long horizon
+      rollout_horizon_years: 8
+      rollout_long_horizon_years: 12
+      rollout_long_horizon_chance: 0.5
+      # Strategic scoring
+      use_strategic_step_scoring: true
+      step_reward_weight: 0.2
+      final_reward_weight: 0.8
+      win_bonus: 200.0
+      winner_threshold_sc: 10
+      experiment_tag: "${metadata.experiment_tag_prefix}-D-combined"

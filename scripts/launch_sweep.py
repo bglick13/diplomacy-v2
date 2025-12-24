@@ -1,333 +1,284 @@
 #!/usr/bin/env python3
 """
-Power Laws Experiment: Compute vs. Insight
+Launch a sweep experiment on Modal.
 
-This script runs the "Mini Power Laws" experiment to test whether
-scaling (compute) or engineering (reward shaping) solves the problem
-of models learning suicidal rushing behavior in Diplomacy.
-
-The Hypothesis:
-- Engineering approach: Add penalties for leaving home centers empty
-- Scaling approach: Look further into the future (longer horizons)
-
-Experiment Configurations:
-- Run A (Baseline): horizon=2, samples=8  → 1x compute
-- Run B (Deep Search): horizon=4, samples=8  → 2x compute
-- Run C (Broad Search): horizon=2, samples=16 → 2x compute
-
-After 100 steps, we compare reward slopes to determine:
-1. If Run B wins → Longer horizons work, simple rewards are sufficient
-2. If Run C wins → More samples work, noise filtering is the bottleneck
-3. If neither wins → Reward engineering is necessary
+This script loads a sweep configuration from YAML, validates it, and spawns
+the Modal orchestrator which runs training jobs sequentially in the cloud.
 
 Usage:
-    # Launch sweep on Modal (can close laptop after)
-    python scripts/launch_sweep.py
+    # Launch all runs in a sweep (fire-and-forget)
+    python scripts/launch_sweep.py experiments/sweeps/my-ablation/
 
-    # Run specific configuration
-    python scripts/launch_sweep.py --run A
-    python scripts/launch_sweep.py --run B
-    python scripts/launch_sweep.py --run C
+    # Launch specific runs only
+    python scripts/launch_sweep.py experiments/sweeps/my-ablation/ --run A B
 
-    # Run with fewer steps for testing
-    python scripts/launch_sweep.py --total-steps 10 --run A
+    # Dry run (validate config, show what would run)
+    python scripts/launch_sweep.py experiments/sweeps/my-ablation/ --dry-run
 
-    # Dry run (show config without launching)
-    python scripts/launch_sweep.py --dry-run
+    # Check status of a running sweep
+    python scripts/launch_sweep.py experiments/sweeps/my-ablation/ --status
 
-    # Run in parallel mode (3x GPUs, 3x cost, 3x faster)
-    python scripts/launch_sweep.py --parallel
+    # Show sweep info without launching
+    python scripts/launch_sweep.py experiments/sweeps/my-ablation/ --info
 
-    # Fire and forget (don't wait for results)
-    python scripts/launch_sweep.py --detach
-
-    # Use smaller model for faster iteration
-    python scripts/launch_sweep.py --fast
+    # List all sweeps
+    python scripts/launch_sweep.py --list
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-from dataclasses import dataclass
-from datetime import datetime
+import sys
+from pathlib import Path
 
 import modal
 
-
-@dataclass
-class SweepConfig:
-    """Configuration for a single sweep run."""
-
-    name: str
-    tag: str  # WandB tag for grouping
-    rollout_horizon_years: int
-    samples_per_group: int
-    compute_multiplier: float
-    description: str
-
-    def simulated_years_per_step(self, num_groups: int) -> int:
-        """Calculate simulated years per training step."""
-        return num_groups * self.samples_per_group * self.rollout_horizon_years
-
-    def total_simulated_years(self, num_groups: int, total_steps: int) -> int:
-        """Calculate total simulated years for the full run."""
-        return self.simulated_years_per_step(num_groups) * total_steps
+from src.utils.sweep_config import SweepConfig
 
 
-# Define the three experimental configurations
-SWEEP_CONFIGS = {
-    "A": SweepConfig(
-        name="baseline",
-        tag="power-laws-baseline",
-        rollout_horizon_years=2,
-        samples_per_group=8,
-        compute_multiplier=1.0,
-        description="Baseline: Fast & Loose (horizon=2, samples=8)",
-    ),
-    "B": SweepConfig(
-        name="deep-search",
-        tag="power-laws-deep",
-        rollout_horizon_years=4,
-        samples_per_group=8,
-        compute_multiplier=2.0,
-        description="Deep Search: Time Scaling (horizon=4, samples=8)",
-    ),
-    "C": SweepConfig(
-        name="broad-search",
-        tag="power-laws-broad",
-        rollout_horizon_years=2,
-        samples_per_group=16,
-        compute_multiplier=2.0,
-        description="Broad Search: Variance Scaling (horizon=2, samples=16)",
-    ),
-}
+def print_sweep_info(sweep_config: SweepConfig, run_ids: list[str] | None = None) -> None:
+    """Print detailed information about a sweep."""
+    meta = sweep_config.metadata
+    runs_to_show = run_ids or sweep_config.get_run_ids()
+
+    print("\n" + "=" * 70)
+    print(f"SWEEP: {meta.name}")
+    print("=" * 70)
+    print(f"\nDescription: {meta.description}")
+    if meta.hypothesis:
+        print(f"\nHypothesis:\n  {meta.hypothesis}")
+    print(f"\nExperiment tag prefix: {meta.experiment_tag_prefix}")
+    print(f"Author: {meta.author or 'N/A'}")
+    print(f"Created: {meta.created}")
+
+    print("\n" + "-" * 70)
+    print("DEFAULTS")
+    print("-" * 70)
+    if sweep_config.defaults:
+        for key, value in sweep_config.defaults.items():
+            print(f"  {key}: {value}")
+    else:
+        print("  (none)")
+
+    print("\n" + "-" * 70)
+    print("RUNS")
+    print("-" * 70)
+    for run_id in runs_to_show:
+        run = sweep_config.runs[run_id]
+        print(f"\n  [{run_id}] {run.name}")
+        print(f"      {run.description}")
+        if run.config:
+            print("      Config overrides:")
+            for key, value in run.config.items():
+                print(f"        {key}: {value}")
+
+    print("\n" + "-" * 70)
+    print("ANALYSIS")
+    print("-" * 70)
+    analysis = sweep_config.analysis
+    print(f"  Primary metric: {analysis.primary_metric}")
+    print(f"  Secondary metrics: {', '.join(analysis.secondary_metrics)}")
+    if analysis.expected_ranking:
+        print(f"  Expected ranking: {' > '.join(analysis.expected_ranking)}")
+    if analysis.success_criteria:
+        print("  Success criteria:")
+        for criterion in analysis.success_criteria:
+            print(f"    - {criterion}")
+
+    print("\n" + "=" * 70 + "\n")
 
 
-def print_comparison_table(comparison: list[dict], analysis: dict):
-    """Print a comparison table of all sweep results."""
-    print("\n")
-    print("=" * 80)
-    print("📊 POWER LAWS EXPERIMENT COMPARISON")
-    print("=" * 80)
-    print()
+def get_sweep_status(sweep_name: str) -> None:
+    """Get and print the status of a sweep."""
+    get_status = modal.Function.from_name("diplomacy-grpo", "get_sweep_status")
 
-    # Header
-    print(f"{'Config':<12} {'Compute':<8} {'Sim Years':<12} {'Reward Mean':<12} {'Time (s)':<10}")
-    print("-" * 60)
+    print(f"\nChecking status of sweep: {sweep_name}")
+    try:
+        status = get_status.remote(sweep_name)
 
-    for r in comparison:
-        reward_str = f"{r['final_reward_mean']:.2f}" if r.get("final_reward_mean") else "N/A"
-        print(
-            f"{r['name']:<12} "
-            f"{r['compute_multiplier']:<8.1f}x "
-            f"{r['simulated_years']:<12} "
-            f"{reward_str:<12} "
-            f"{r['duration_s']:<10.1f}"
+        if status["status"] == "not_found":
+            print(f"  Sweep not found: {sweep_name}")
+            print("  (Either it hasn't been launched or the name is incorrect)")
+            return
+
+        print(f"\n  Status: {status['status']}")
+        print(f"  Started: {status['started_at']}")
+        print(f"  Progress: {status['progress']}")
+        print(f"  Current run: {status['current_run'] or '(none)'}")
+        print(f"  Completed: {', '.join(status['completed_runs']) or '(none)'}")
+        print(f"  Pending: {', '.join(status['pending_runs']) or '(none)'}")
+
+        if status["run_names"]:
+            print("\n  WandB run names:")
+            for run_id, run_name in status["run_names"].items():
+                print(f"    [{run_id}] {run_name}")
+
+    except Exception as e:
+        print(f"  Error checking status: {e}")
+        print("  (Is the sweep app deployed? Run: uv run modal deploy -m src.apps.deploy)")
+
+
+def list_sweeps() -> None:
+    """List all sweeps on the volume."""
+    list_fn = modal.Function.from_name("diplomacy-grpo", "list_sweeps")
+
+    print("\nListing all sweeps...")
+    try:
+        sweeps = list_fn.remote()
+
+        if not sweeps:
+            print("  No sweeps found.")
+            return
+
+        print(f"\n  Found {len(sweeps)} sweep(s):\n")
+        for sweep in sweeps:
+            status_emoji = "" if sweep["status"] == "in_progress" else ""
+            print(f"  {status_emoji} {sweep['name']}")
+            print(f"       Progress: {sweep['progress']}")
+            print(f"       Started: {sweep['started_at']}")
+            if sweep["current_run"]:
+                print(f"       Current: {sweep['current_run']}")
+            print()
+
+    except Exception as e:
+        print(f"  Error listing sweeps: {e}")
+        print("  (Is the sweep app deployed? Run: uv run modal deploy -m src.apps.deploy)")
+
+
+def launch_sweep(
+    sweep_config: SweepConfig,
+    run_ids: list[str] | None = None,
+    dry_run: bool = False,
+) -> None:
+    """Launch a sweep on Modal."""
+    meta = sweep_config.metadata
+    requested_runs = run_ids or sweep_config.get_run_ids()
+
+    print("\n" + "=" * 70)
+    print(f"LAUNCHING SWEEP: {meta.name}")
+    print("=" * 70)
+    print(f"\nRuns to execute: {', '.join(requested_runs)}")
+    print(f"Dry run: {dry_run}")
+
+    # Get reference to orchestrator
+    orchestrate_sweep = modal.Function.from_name("diplomacy-grpo", "orchestrate_sweep")
+
+    if dry_run:
+        print("\n[DRY RUN] Validating configuration...")
+        # Run dry_run remotely to validate
+        result = orchestrate_sweep.remote(
+            sweep_config_dict=sweep_config.model_dump(),
+            run_ids=requested_runs,
+            dry_run=True,
         )
+        print("\n[DRY RUN] Configuration valid!")
+        print(f"  Would execute runs: {result.get('pending_runs', [])}")
+        print(f"  Already completed: {result.get('completed_runs', [])}")
+        return
 
-    print()
-    print("=" * 80)
-    print("📈 ANALYSIS")
-    print("=" * 80)
+    # Fire and forget - spawn and exit
+    print("\nSpawning sweep orchestrator on Modal...")
+    handle = orchestrate_sweep.spawn(
+        sweep_config_dict=sweep_config.model_dump(),
+        run_ids=requested_runs,
+        dry_run=False,
+    )
 
-    if analysis.get("winner"):
-        print(f"\n🏆 Winner: {analysis['winner']}")
-        print(f"   Best Reward: {analysis.get('best_reward', 'N/A')}")
-        print(f"\n📝 {analysis['interpretation']}")
-
-        # Decision guidance
-        print("\n📋 Recommendations:")
-        if analysis["winner"] == "deep-search":
-            print("   → Increase rollout_horizon_years in production config")
-            print("   → The model benefits from seeing longer-term consequences")
-        elif analysis["winner"] == "broad-search":
-            print("   → Increase samples_per_group in production config")
-            print("   → More samples help filter noise and stabilize gradients")
-        else:
-            print("   → Consider reward engineering approaches:")
-            print("     - Add defensive bonuses for holding home centers")
-            print("     - Add penalties for overextension")
-            print("     - Consider curriculum learning")
-
-    print()
-    print("=" * 80)
-    print("📊 WandB Visualization")
-    print("=" * 80)
-    print("\nTo create the Power Law plot in WandB:")
-    print("1. Go to your WandB project: diplomacy-grpo")
-    print("2. Filter runs by names starting with 'power-laws-'")
-    print("3. Create a custom chart with:")
-    print("   - X-Axis: 'power_law/cumulative_simulated_years'")
-    print("   - Y-Axis: 'power_law/reward_at_compute'")
-    print("4. Group by experiment tag to compare configurations")
+    print(f"\n Sweep launched! Function ID: {handle.object_id}")
+    print("\nThe sweep is now running in the cloud. You can close your laptop.")
+    print("\nTo check status:")
+    print(f"  python scripts/launch_sweep.py experiments/sweeps/{meta.name}/ --status")
+    print("\nTo monitor in Modal dashboard:")
+    print("  https://modal.com/apps")
+    print("\nResults will be logged to WandB with tag prefix:")
+    print(f"  {meta.experiment_tag_prefix}")
     print()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run the Power Laws scaling experiment on Modal",
+        description="Launch a sweep experiment on Modal",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
 
-    # Core experiment settings (subset of ExperimentConfig)
+    parser.add_argument(
+        "path",
+        type=str,
+        nargs="?",
+        help="Path to sweep directory or sweep.yaml file",
+    )
     parser.add_argument(
         "--run",
         type=str,
-        choices=["A", "B", "C", "all"],
-        default="all",
-        help="Which configuration to run (A=baseline, B=deep, C=broad, all=sequential)",
+        nargs="+",
+        help="Specific run IDs to execute (e.g., --run A B)",
     )
-    parser.add_argument(
-        "--total-steps",
-        type=int,
-        default=100,
-        dest="total_steps",
-        help="Number of training steps per run (default: 100)",
-    )
-    parser.add_argument(
-        "--num-groups-per-step",
-        type=int,
-        default=8,
-        dest="num_groups_per_step",
-        help="Number of rollout groups per step (default: 8)",
-    )
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=1e-5,
-        dest="learning_rate",
-        help="Learning rate (default: 1e-5)",
-    )
-    parser.add_argument(
-        "--base-model-id",
-        type=str,
-        default="Qwen/Qwen2.5-7B-Instruct",
-        dest="base_model_id",
-        help="Model ID for inference (default: Qwen/Qwen2.5-7B-Instruct)",
-    )
-
-    # Sweep-specific options
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print configurations without launching jobs",
+        help="Validate config and show what would run without launching",
     )
     parser.add_argument(
-        "--parallel",
+        "--info",
         action="store_true",
-        help="Run all configurations in parallel (3x cost, 3x faster)",
+        help="Show sweep info without launching",
     )
     parser.add_argument(
-        "--fast",
+        "--status",
         action="store_true",
-        help="Use smaller 3B model for faster iteration (good for testing hypotheses)",
+        help="Check status of a running sweep",
     )
     parser.add_argument(
-        "--detach",
+        "--list",
         action="store_true",
-        help="Fire and forget - launch sweep and exit without waiting for results",
+        help="List all sweeps on the volume",
     )
 
     args = parser.parse_args()
 
-    # Apply --fast flag to use smaller model
-    if args.fast:
-        args.base_model_id = "Qwen/Qwen2.5-3B-Instruct"
-        print("⚡ FAST MODE: Using Qwen2.5-3B-Instruct for faster iteration")
-
-    # Determine which configs to run
-    if args.run == "all":
-        run_configs = ["A", "B", "C"]
-        configs_to_show = list(SWEEP_CONFIGS.values())
-    else:
-        run_configs = [args.run]
-        configs_to_show = [SWEEP_CONFIGS[args.run]]
-
-    print("\n" + "=" * 80)
-    print("🔬 POWER LAWS EXPERIMENT: Compute vs. Insight")
-    print("=" * 80)
-    print(f"\nTotal Steps: {args.total_steps}")
-    print(f"Groups/Step: {args.num_groups_per_step}")
-    print(f"Learning Rate: {args.learning_rate}")
-    print(f"Model: {args.base_model_id}")
-    print(f"Parallel: {args.parallel}")
-    print(f"Detach: {args.detach}")
-    print("\nConfigurations to run:")
-
-    for config in configs_to_show:
-        sim_years = config.total_simulated_years(args.num_groups_per_step, args.total_steps)
-        print(f"  [{config.name}] {config.description}")
-        print(
-            f"       Horizon: {config.rollout_horizon_years} | Samples: {config.samples_per_group}"
-        )
-        print(f"       Total Simulated Years: {sim_years}")
-        print()
-
-    if args.dry_run:
-        print("🔍 DRY RUN - No jobs launched")
+    # Handle --list (doesn't need path)
+    if args.list:
+        list_sweeps()
         return
 
-    # Launch the sweep on Modal
-    print("\n🚀 Launching Power Laws sweep on Modal...")
-    print("   (You can close your laptop - the sweep runs in the cloud)")
-    print()
-
-    sweep_fn = modal.Function.from_name("diplomacy-grpo", "run_power_laws_sweep")
-
-    if args.detach:
-        # Fire and forget
-        handle = sweep_fn.spawn(
-            total_steps=args.total_steps,
-            num_groups_per_step=args.num_groups_per_step,
-            learning_rate=args.learning_rate,
-            model_id=args.base_model_id,
-            run_configs=run_configs,
-            parallel=args.parallel,
-        )
-        print(f"✅ Sweep launched! Function ID: {handle.object_id}")
-        print("\nTo check status later:")
-        print(f"   modal function get {handle.object_id}")
-        print("\nOr monitor in Modal dashboard:")
-        print("   https://modal.com/apps")
+    # All other commands need a path
+    if not args.path:
+        parser.error("path is required (unless using --list)")
         return
 
-    # Wait for results
-    print("⏳ Waiting for sweep to complete...")
-    print("   (Press Ctrl+C to detach - sweep will continue in cloud)")
-    print()
-
+    # Load sweep config
+    path = Path(args.path)
     try:
-        result = sweep_fn.remote(
-            total_steps=args.total_steps,
-            num_groups_per_step=args.num_groups_per_step,
-            learning_rate=args.learning_rate,
-            model_id=args.base_model_id,
-            run_configs=run_configs,
-            parallel=args.parallel,
-        )
+        sweep_config = SweepConfig.from_yaml(path)
+    except FileNotFoundError:
+        print(f"Error: Sweep config not found at {path}")
+        print("Expected sweep.yaml in the specified directory.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error loading sweep config: {e}")
+        sys.exit(1)
 
-        # Print results
-        print("\n" + "=" * 80)
-        print("🏁 SWEEP COMPLETE")
-        print("=" * 80)
-        print(f"\nTotal Duration: {result['total_duration_hours']:.2f} hours")
+    # Validate run IDs if specified
+    if args.run:
+        valid_runs = sweep_config.get_run_ids()
+        invalid = [r for r in args.run if r not in valid_runs]
+        if invalid:
+            print(f"Error: Invalid run IDs: {invalid}")
+            print(f"Valid run IDs: {valid_runs}")
+            sys.exit(1)
 
-        if result.get("comparison"):
-            print_comparison_table(result["comparison"], result.get("analysis", {}))
+    # Handle commands
+    if args.info:
+        print_sweep_info(sweep_config, args.run)
+        return
 
-        # Save results to file
-        timestamp = result.get("timestamp", datetime.now().strftime("%Y%m%d-%H%M%S"))
-        output_file = f"power_laws_results_{timestamp}.json"
-        with open(output_file, "w") as f:
-            json.dump(result, f, indent=2, default=str)
-        print(f"\n📁 Full results saved to: {output_file}")
+    if args.status:
+        get_sweep_status(sweep_config.metadata.name)
+        return
 
-    except KeyboardInterrupt:
-        print("\n\n⚠️ Detached from sweep (Ctrl+C)")
-        print("   The sweep continues running on Modal.")
-        print("   Check the Modal dashboard for progress.")
+    # Default: launch the sweep
+    launch_sweep(sweep_config, args.run, args.dry_run)
 
 
 if __name__ == "__main__":

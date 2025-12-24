@@ -95,6 +95,50 @@ class ExperimentConfig(BaseModel):
         default=5,
         description="Minimum supply centers required to be eligible for win bonus",
     )
+    solo_victory_sc: int = Field(
+        default=18,
+        description="Supply centers required for solo victory (full win bonus)",
+    )
+    use_position_based_scoring: bool = Field(
+        default=True,
+        description=(
+            "Use position-based final scoring with bonuses for each rank (1st-7th). "
+            "When enabled, all finishing positions receive appropriate bonuses/penalties, "
+            "not just the winner. Inspired by webDiplomacy scoring systems."
+        ),
+    )
+    position_bonus_1st: float = Field(
+        default=50.0,
+        description="Bonus for 1st place (leader or tied for lead)",
+    )
+    position_bonus_2nd: float = Field(
+        default=25.0,
+        description="Bonus for 2nd place",
+    )
+    position_bonus_3rd: float = Field(
+        default=15.0,
+        description="Bonus for 3rd place",
+    )
+    position_bonus_4th: float = Field(
+        default=10.0,
+        description="Bonus for 4th place",
+    )
+    position_bonus_5th: float = Field(
+        default=5.0,
+        description="Bonus for 5th place",
+    )
+    position_bonus_6th: float = Field(
+        default=2.0,
+        description="Bonus for 6th place",
+    )
+    position_bonus_7th: float = Field(
+        default=0.0,
+        description="Bonus for 7th place (surviving but last)",
+    )
+    elimination_penalty: float = Field(
+        default=-30.0,
+        description="Penalty for being eliminated (0 SCs, 0 units)",
+    )
     step_reward_weight: float = Field(
         default=0.8,
         ge=0.0,
@@ -158,6 +202,15 @@ class ExperimentConfig(BaseModel):
         ge=1,
         description="SC gap above which leader_gap_penalty starts applying.",
     )
+    use_strategic_step_scoring: bool = Field(
+        default=False,
+        description=(
+            "Use strategic step scoring (position-based) instead of SC-based. "
+            "Rewards relative position and balance, not absolute SC accumulation. "
+            "When enabled, leader_gap_penalty and balance_bonus are integrated into "
+            "step scoring rather than applied as separate shaping."
+        ),
+    )
 
     # =========================================================================
     # League Training Settings
@@ -186,19 +239,53 @@ class ExperimentConfig(BaseModel):
         default=10,
         description="Save checkpoint to league every N steps (for recent curriculum)",
     )
-    elo_eval_every_n_steps: int = Field(
-        default=50,
-        description="Run async Elo evaluation every N steps for monitoring (0 to disable). "
-        "Note: Primary Elo updates now come from rollouts, not evaluation.",
+    # =========================================================================
+    # TrueSkill Rating Settings
+    # =========================================================================
+    trueskill_mu_init: float = Field(
+        default=25.0,
+        description="Initial TrueSkill mu (skill mean). Standard default is 25.",
     )
-    elo_eval_games_per_opponent: int = Field(
+    trueskill_sigma_init: float = Field(
+        default=8.333,
+        description="Initial TrueSkill sigma (uncertainty). Standard default is 25/3 ≈ 8.333.",
+    )
+    trueskill_beta: float = Field(
+        default=4.166,
+        description="TrueSkill beta (performance variance). Standard is sigma/2 ≈ 4.166.",
+    )
+    trueskill_tau: float = Field(
+        default=0.0833,
+        description="TrueSkill tau (skill drift per game). Standard is sigma/100 ≈ 0.0833.",
+    )
+
+    # =========================================================================
+    # League Evaluation Settings (updates TrueSkill ratings)
+    # =========================================================================
+    league_eval_every_n_steps: int = Field(
+        default=0,
+        description="Run async league evaluation every N steps for rating updates (0 to disable). "
+        "Primary TrueSkill updates come from rollouts; this is for additional validation.",
+    )
+    league_eval_games_per_opponent: int = Field(
         default=2,
-        description="Games per gatekeeper during Elo evaluation",
+        description="Games per league opponent during evaluation",
     )
-    rollout_elo_k_factor: float = Field(
-        default=16.0,
-        description="K-factor for Elo updates from rollouts. Lower = more stable ratings. "
-        "Default 16 (half of standard 32) since updates happen every step.",
+
+    # =========================================================================
+    # Benchmark Evaluation Settings (frozen checkpoints, absolute skill)
+    # =========================================================================
+    benchmark_eval_every_n_steps: int = Field(
+        default=50,
+        description="Run benchmark evaluation against frozen checkpoints every N steps (0 to disable).",
+    )
+    benchmark_games_per_opponent: int = Field(
+        default=3,
+        description="Number of games to play against each frozen benchmark checkpoint.",
+    )
+    benchmark_max_years: int = Field(
+        default=5,
+        description="Maximum game length in years for benchmark evaluation games.",
     )
     pfsp_self_play_weight: float = Field(
         default=0.30,

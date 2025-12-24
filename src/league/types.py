@@ -38,6 +38,11 @@ class AgentType(str, Enum):
     CHECKPOINT = "checkpoint"  # Trained LoRA adapter
 
 
+# TrueSkill default parameters (imported here for backward compat conversion)
+MU_INIT = 25.0
+SIGMA_INIT = 25.0 / 3  # ~8.333
+
+
 @dataclass
 class AgentInfo:
     """
@@ -46,8 +51,10 @@ class AgentInfo:
     Attributes:
         name: Unique identifier (e.g., "random_bot", "adapter_v50")
         agent_type: Whether this is a baseline or checkpoint
-        elo: Current Elo rating
-        matches: Number of matches played for Elo calculation
+        elo: Current Elo rating (DEPRECATED - kept for backward compat)
+        mu: TrueSkill skill mean (higher = better)
+        sigma: TrueSkill skill uncertainty (lower = more confident)
+        matches: Number of matches played for rating calculation
         path: Path to LoRA adapter (None for baselines)
         step: Training step when checkpoint was created (None for baselines)
         created_at: ISO timestamp of creation
@@ -56,18 +63,27 @@ class AgentInfo:
 
     name: str
     agent_type: AgentType
-    elo: float = 1000.0
+    elo: float = 1000.0  # DEPRECATED - kept for backward compatibility
+    mu: float = MU_INIT  # TrueSkill mean
+    sigma: float = SIGMA_INIT  # TrueSkill uncertainty
     matches: int = 0
     path: str | None = None
     step: int | None = None
     created_at: str | None = None
     parent: str | None = None
 
+    @property
+    def display_rating(self) -> float:
+        """Conservative rating estimate (mu - 3*sigma, 99.7% confidence lower bound)."""
+        return self.mu - 3 * self.sigma
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dictionary for JSON storage."""
         return {
             "type": self.agent_type.value,
             "elo": self.elo,
+            "mu": self.mu,
+            "sigma": self.sigma,
             "matches": self.matches,
             "path": self.path,
             "step": self.step,
@@ -77,11 +93,26 @@ class AgentInfo:
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> "AgentInfo":
-        """Deserialize from dictionary."""
+        """Deserialize from dictionary.
+
+        Handles backward compatibility: if mu/sigma are missing, converts from Elo.
+        """
+        # Check if this is an old registry without TrueSkill fields
+        if "mu" not in data:
+            # Convert Elo to approximate TrueSkill
+            elo = data.get("elo", 1000.0)
+            mu = (elo - 1000) / 40 + MU_INIT
+            sigma = SIGMA_INIT  # Full uncertainty for converted ratings
+        else:
+            mu = data["mu"]
+            sigma = data["sigma"]
+
         return cls(
             name=name,
             agent_type=AgentType(data["type"]),
             elo=data.get("elo", 1000.0),
+            mu=mu,
+            sigma=sigma,
             matches=data.get("matches", 0),
             path=data.get("path"),
             step=data.get("step"),
@@ -90,12 +121,23 @@ class AgentInfo:
         )
 
     @classmethod
-    def create_baseline(cls, name: str, elo: float = 1000.0) -> "AgentInfo":
+    def create_baseline(
+        cls,
+        name: str,
+        elo: float = 1000.0,
+        mu: float | None = None,
+        sigma: float = SIGMA_INIT,
+    ) -> "AgentInfo":
         """Create a baseline agent (no LoRA)."""
+        # Convert elo to mu if mu not specified
+        if mu is None:
+            mu = (elo - 1000) / 40 + MU_INIT
         return cls(
             name=name,
             agent_type=AgentType.BASELINE,
             elo=elo,
+            mu=mu,
+            sigma=sigma,
             path=None,
         )
 
@@ -107,12 +149,22 @@ class AgentInfo:
         step: int,
         parent: str | None = None,
         elo: float = 1000.0,
+        mu: float | None = None,
+        sigma: float | None = None,
     ) -> "AgentInfo":
         """Create a checkpoint agent (LoRA adapter)."""
+        # Default mu from elo conversion
+        if mu is None:
+            mu = (elo - 1000) / 40 + MU_INIT
+        # Default sigma - high for new checkpoints (uncertain)
+        if sigma is None:
+            sigma = SIGMA_INIT
         return cls(
             name=name,
             agent_type=AgentType.CHECKPOINT,
             elo=elo,
+            mu=mu,
+            sigma=sigma,
             path=path,
             step=step,
             created_at=datetime.now(UTC).isoformat(),
@@ -176,14 +228,18 @@ class LeagueMetadata:
 
     Attributes:
         run_name: Name of the training run
-        best_elo: Highest Elo achieved by any checkpoint
-        best_agent: Name of the agent with highest Elo
+        best_elo: Highest Elo achieved by any checkpoint (DEPRECATED)
+        best_mu: Highest TrueSkill mu achieved by any checkpoint
+        best_display_rating: Highest display rating (mu - 3*sigma)
+        best_agent: Name of the agent with highest rating
         latest_step: Most recent training step with a checkpoint
         total_matches: Total number of matches recorded
     """
 
     run_name: str
-    best_elo: float = 1000.0
+    best_elo: float = 1000.0  # DEPRECATED
+    best_mu: float = MU_INIT
+    best_display_rating: float = MU_INIT - 3 * SIGMA_INIT
     best_agent: str = "base_model"
     latest_step: int = 0
     total_matches: int = 0
@@ -193,6 +249,8 @@ class LeagueMetadata:
         return {
             "run_name": self.run_name,
             "best_elo": self.best_elo,
+            "best_mu": self.best_mu,
+            "best_display_rating": self.best_display_rating,
             "best_agent": self.best_agent,
             "latest_step": self.latest_step,
             "total_matches": self.total_matches,
@@ -204,6 +262,8 @@ class LeagueMetadata:
         return cls(
             run_name=data["run_name"],
             best_elo=data.get("best_elo", 1000.0),
+            best_mu=data.get("best_mu", MU_INIT),
+            best_display_rating=data.get("best_display_rating", MU_INIT - 3 * SIGMA_INIT),
             best_agent=data.get("best_agent", "base_model"),
             latest_step=data.get("latest_step", 0),
             total_matches=data.get("total_matches", 0),

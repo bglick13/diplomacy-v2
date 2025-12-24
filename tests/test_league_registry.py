@@ -250,19 +250,33 @@ class TestShouldAddToLeague:
         """First checkpoint should always be added."""
         assert should_add_to_league(step=1, registry=registry)
 
-    def test_every_10_steps_recent(self, registry):
-        """Every 10 steps should be added for recent curriculum."""
+    def test_early_training_every_5_steps(self, registry):
+        """Early training (step < 50) should add every 5 steps."""
         # Add a checkpoint first
         registry.add_checkpoint("adapter_v0", "run/v0", step=0)
 
-        # Step 10 should be added
-        assert should_add_to_league(step=10, registry=registry)
+        # Step 5 should be added (early training: every 5 steps)
+        assert should_add_to_league(step=5, registry=registry)
 
-        # Step 15 should not
-        assert not should_add_to_league(step=15, registry=registry)
+        # Step 7 should not (not divisible by 5)
+        assert not should_add_to_league(step=7, registry=registry)
 
-        # Step 20 should be added
-        assert should_add_to_league(step=20, registry=registry)
+        # Step 15 should be added (15 % 5 == 0)
+        assert should_add_to_league(step=15, registry=registry)
+
+    def test_mid_training_every_10_steps(self, registry):
+        """Mid training (50 <= step < 200) should add every 10 steps."""
+        # Add a checkpoint first
+        registry.add_checkpoint("adapter_v0", "run/v0", step=0)
+
+        # Step 50 should be added (50 % 10 == 0)
+        assert should_add_to_league(step=50, registry=registry)
+
+        # Step 55 should not (55 % 10 != 0)
+        assert not should_add_to_league(step=55, registry=registry)
+
+        # Step 60 should be added
+        assert should_add_to_league(step=60, registry=registry)
 
     def test_every_100_steps_anchor(self, registry):
         """Every 100 steps should always be added."""
@@ -271,15 +285,16 @@ class TestShouldAddToLeague:
         assert should_add_to_league(step=100, registry=registry)
         assert should_add_to_league(step=200, registry=registry)
 
-    def test_new_best_elo(self, registry):
-        """New best Elo should trigger checkpoint."""
-        registry.add_checkpoint("adapter_v0", "run/v0", step=0, initial_elo=1000.0)
+    def test_new_best_display_rating(self, registry):
+        """New best display_rating should trigger checkpoint."""
+        registry.add_checkpoint("adapter_v0", "run/v0", step=0)
 
+        # Step 53 doesn't match any interval rule (not 5, 10, 20, or 100 divisor)
         # Not a new best
-        assert not should_add_to_league(step=5, registry=registry, current_elo=990.0)
+        assert not should_add_to_league(step=53, registry=registry, current_display_rating=-5.0)
 
         # New best!
-        assert should_add_to_league(step=5, registry=registry, current_elo=1050.0)
+        assert should_add_to_league(step=53, registry=registry, current_display_rating=10.0)
 
 
 class TestEloCalculation:

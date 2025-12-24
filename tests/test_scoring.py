@@ -89,15 +89,19 @@ class TestWinBonus:
         assert abs(scores_no_bonus["FRANCE"] - scores_with_bonus["FRANCE"]) < 0.01
 
     def test_eliminated_power_negative_score(self, game):
-        """Eliminated powers should have negative score."""
+        """Eliminated powers should have negative score (elimination penalty)."""
         # Eliminate a power by removing all units and centers
         russia = game.game.powers["RUSSIA"]
         russia.centers = set()
         russia.units = []
 
+        # With position-based scoring (default), eliminated powers get -30.0
         scores = calculate_final_scores(game)
+        assert scores["RUSSIA"] == -30.0
 
-        assert scores["RUSSIA"] == -1.0
+        # With legacy scoring, eliminated powers get -1.0
+        scores_legacy = calculate_final_scores(game, use_position_scoring=False)
+        assert scores_legacy["RUSSIA"] == -1.0
 
 
 class TestRandomBot:

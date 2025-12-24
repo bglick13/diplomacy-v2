@@ -29,6 +29,7 @@ from src.utils.scoring import (
     calculate_final_scores,
     calculate_leader_gap_penalty,
     calculate_step_score,
+    calculate_strategic_step_score,
 )
 from src.utils.vis import GameVisualizer
 from src.utils.weave_traces import (
@@ -837,7 +838,13 @@ async def run_synchronized_forks(
                 pn: set(p.influence) if hasattr(p, "influence") else set()
                 for pn, p in game.game.powers.items()
             }
-            score_before = calculate_step_score(
+            # Use strategic or standard step scoring based on config
+            score_fn = (
+                calculate_strategic_step_score
+                if cfg.use_strategic_step_scoring
+                else calculate_step_score
+            )
+            score_before = score_fn(
                 game,
                 prev_influence=None,  # No delta for "before" score
                 dislodgment_weight=cfg.step_dislodgment_weight,
@@ -849,7 +856,7 @@ async def run_synchronized_forks(
             game.step(orders)
 
             # Capture board score AFTER applying orders (with territory delta)
-            score_after = calculate_step_score(
+            score_after = score_fn(
                 game,
                 prev_influence=prev_influence,  # Pass for territory expansion signal
                 dislodgment_weight=cfg.step_dislodgment_weight,
@@ -960,12 +967,26 @@ def build_trajectories(
     win_bonus_awarded = 0
 
     # Pre-compute final scores for all games (only need to do this once per game)
+    # Build position bonuses tuple from config
+    position_bonuses = (
+        cfg.position_bonus_1st,
+        cfg.position_bonus_2nd,
+        cfg.position_bonus_3rd,
+        cfg.position_bonus_4th,
+        cfg.position_bonus_5th,
+        cfg.position_bonus_6th,
+        cfg.position_bonus_7th,
+    )
     final_scores_by_game: dict[int, dict[str, float]] = {}
     for g_idx, game in enumerate(games):
         final_scores_by_game[g_idx] = calculate_final_scores(
             game,
             win_bonus=cfg.win_bonus,
             winner_threshold_sc=cfg.winner_threshold_sc,
+            use_position_scoring=cfg.use_position_based_scoring,
+            solo_victory_sc=cfg.solo_victory_sc,
+            position_bonuses=position_bonuses,
+            elimination_penalty=cfg.elimination_penalty,
         )
 
     # Track SC counts for hero powers (one entry per game, not per step)
@@ -1399,6 +1420,17 @@ async def run_rollout(
         )
         metrics.log_summary()
 
+        # Build position bonuses tuple for match results scoring
+        position_bonuses = (
+            cfg.position_bonus_1st,
+            cfg.position_bonus_2nd,
+            cfg.position_bonus_3rd,
+            cfg.position_bonus_4th,
+            cfg.position_bonus_5th,
+            cfg.position_bonus_6th,
+            cfg.position_bonus_7th,
+        )
+
         return {
             "trajectories": trajectories,
             "extraction_stats": {
@@ -1415,13 +1447,20 @@ async def run_rollout(
                 # Detailed timing breakdown for waterfall charts
                 **metrics.timing.to_dict(),
             },
-            # Match results for Elo updates (one per game fork)
+            # Match results for TrueSkill/Elo updates (one per game fork)
             # Uses power_agent_names (e.g., "adapter_v50") not paths for registry lookups
+            # Note: Uses same position-based scoring as training rewards for consistency
             "match_results": [
                 {
                     "power_agents": dict(adapter_config.power_agent_names),
                     "power_scores": calculate_final_scores(
-                        game, cfg.win_bonus, cfg.winner_threshold_sc
+                        game,
+                        win_bonus=cfg.win_bonus,
+                        winner_threshold_sc=cfg.winner_threshold_sc,
+                        use_position_scoring=cfg.use_position_based_scoring,
+                        solo_victory_sc=cfg.solo_victory_sc,
+                        position_bonuses=position_bonuses,
+                        elimination_penalty=cfg.elimination_penalty,
                     ),
                     "game_id": game.game.game_id,
                 }

@@ -16,9 +16,9 @@ from src.league.registry import LeagueRegistry
 from src.league.types import AgentInfo, AgentType
 
 
-def _elo_bucket(hero_elo: float, opponent_elo: float) -> str:
-    """Categorize opponent by Elo distance for logging."""
-    diff = opponent_elo - hero_elo
+def _rating_bucket(hero_rating: float, opponent_rating: float) -> str:
+    """Categorize opponent by rating distance for logging."""
+    diff = opponent_rating - hero_rating
     if diff > 100:
         return "stronger"
     elif diff > -100:
@@ -39,9 +39,9 @@ class PFSPConfig:
     exploitable_weight: float = 0.35  # Weaker agents we should beat (positive EV)
     baseline_weight: float = 0.05  # Baseline bots (regression testing)
 
-    # Elo thresholds for peer matching (legacy, used when elo_based_sampling=False)
-    peer_elo_range: int = 100  # +/- from hero Elo
-    near_peer_elo_range: int = 300  # Extended range for near-peers
+    # Rating thresholds for peer matching (legacy, used when rating_based_sampling=False)
+    peer_rating_range: int = 100  # +/- from hero display_rating
+    near_peer_rating_range: int = 300  # Extended range for near-peers
 
     # Baseline sampling (stronger baselines for better signal)
     baseline_agents: list[str] = field(
@@ -53,14 +53,14 @@ class PFSPConfig:
         ]
     )
 
-    # New Elo-based sampling params (replaces category-based when enabled)
-    elo_based_sampling: bool = True  # Enable pure Elo-based Gaussian sampling
-    elo_sampling_sigma: float = 150.0  # Std dev of Gaussian (in Elo points)
+    # Rating-based sampling params (replaces category-based when enabled)
+    rating_based_sampling: bool = True  # Enable pure rating-based Gaussian sampling
+    rating_sampling_sigma: float = 150.0  # Std dev of Gaussian (in rating points)
     min_self_play_prob: float = 0.15  # Minimum probability of self-play
 
     def validate(self) -> None:
         """Ensure weights sum to 1.0 (only matters for legacy mode)."""
-        if not self.elo_based_sampling:
+        if not self.rating_based_sampling:
             total = (
                 self.self_play_weight
                 + self.peer_weight
@@ -77,9 +77,9 @@ class MatchmakingResult:
 
     hero_power: str
     hero_agent: str
-    hero_elo: float  # Hero's Elo used for matchmaking
+    hero_rating: float  # Hero's display_rating used for matchmaking
     power_adapters: dict[str, str | None]  # Power -> adapter path or bot name
-    power_agent_names: dict[str, str]  # Power -> agent name (for Elo updates)
+    power_agent_names: dict[str, str]  # Power -> agent name (for rating updates)
     opponent_categories: dict[str, str]  # Power -> category (self, peer, baseline, etc.)
 
     def to_wandb_dict(self) -> dict[str, Any]:
@@ -91,7 +91,7 @@ class MatchmakingResult:
         return {
             "hero_power": self.hero_power,
             "hero_agent": self.hero_agent,
-            "hero_elo": self.hero_elo,
+            "hero_rating": self.hero_rating,
             "opponent_categories": category_counts,
             "num_unique_adapters": len(set(self.power_adapters.values())),
         }
@@ -127,7 +127,7 @@ class PFSPMatchmaker:
         hero_agent: str,
         hero_power: str | None = None,
         num_opponents: int = 6,
-        hero_elo_override: float | None = None,
+        hero_rating_override: float | None = None,
         hero_adapter_path: str | None = None,
     ) -> MatchmakingResult:
         """
@@ -137,8 +137,8 @@ class PFSPMatchmaker:
             hero_agent: Agent name for the hero (e.g., "adapter_v50")
             hero_power: Which power the hero plays (random if None)
             num_opponents: Number of opponent slots (usually 6)
-            hero_elo_override: Explicit Elo for the hero (used when hero isn't
-                               registered yet, e.g., during active training)
+            hero_rating_override: Explicit display_rating for the hero (used when hero
+                                  isn't registered yet, e.g., during active training)
             hero_adapter_path: Explicit adapter path for the hero (used for self-play
                                when hero isn't in registry yet)
 
@@ -154,12 +154,12 @@ class PFSPMatchmaker:
         self._current_hero_agent = hero_agent
         self._current_hero_adapter_path = hero_adapter_path
 
-        # Determine hero Elo: explicit override > registry lookup > default
-        if hero_elo_override is not None:
-            hero_elo = hero_elo_override
+        # Determine hero rating: explicit override > registry lookup > default
+        if hero_rating_override is not None:
+            hero_rating = hero_rating_override
         else:
             hero_info = self.registry.get_agent(hero_agent)
-            hero_elo = hero_info.elo if hero_info else 1000.0
+            hero_rating = hero_info.display_rating if hero_info else 0.0
 
         # Get available agents for opponent sampling
         all_agents = self.registry.get_all_agents()
@@ -169,12 +169,12 @@ class PFSPMatchmaker:
         # Categorize opponents
         opponents: list[tuple[str, str]] = []  # (agent_name, category)
 
-        if self.config.elo_based_sampling:
-            # New: Pure Elo-based Gaussian sampling
+        if self.config.rating_based_sampling:
+            # Pure rating-based Gaussian sampling
             # All agents (checkpoints + baselines) are in the same pool
             for _ in range(num_opponents):
-                agent_name, _, bucket = self._sample_agent_by_elo(
-                    hero_elo=hero_elo,
+                agent_name, _, bucket = self._sample_agent_by_rating(
+                    hero_rating=hero_rating,
                     hero_agent=hero_agent,
                     all_agents=all_agents,
                 )
@@ -184,7 +184,7 @@ class PFSPMatchmaker:
             for _ in range(num_opponents):
                 category = self._sample_category()
                 agent = self._sample_agent_for_category(
-                    category, hero_agent, hero_elo, checkpoints, baselines
+                    category, hero_agent, hero_rating, checkpoints, baselines
                 )
                 opponents.append((agent, category))
 
@@ -217,7 +217,7 @@ class PFSPMatchmaker:
         return MatchmakingResult(
             hero_power=hero_power,
             hero_agent=hero_agent,
-            hero_elo=hero_elo,
+            hero_rating=hero_rating,
             power_adapters=power_adapters,
             power_agent_names=power_agent_names,
             opponent_categories=opponent_categories,
@@ -246,7 +246,7 @@ class PFSPMatchmaker:
         self,
         category: str,
         hero_agent: str,
-        hero_elo: float,
+        hero_rating: float,
         checkpoints: list[AgentInfo],
         baselines: list[AgentInfo],
     ) -> str:
@@ -264,11 +264,12 @@ class PFSPMatchmaker:
             return "random_bot"  # Fallback
 
         if category == "peer":
-            # Find agents within peer_elo_range
+            # Find agents within peer_rating_range
             peers = [
                 a
                 for a in checkpoints
-                if abs(a.elo - hero_elo) <= self.config.peer_elo_range and a.name != hero_agent
+                if abs(a.display_rating - hero_rating) <= self.config.peer_rating_range
+                and a.name != hero_agent
             ]
             if peers:
                 return random.choice(peers).name
@@ -277,7 +278,8 @@ class PFSPMatchmaker:
             near_peers = [
                 a
                 for a in checkpoints
-                if abs(a.elo - hero_elo) <= self.config.near_peer_elo_range and a.name != hero_agent
+                if abs(a.display_rating - hero_rating) <= self.config.near_peer_rating_range
+                and a.name != hero_agent
             ]
             if near_peers:
                 return random.choice(near_peers).name
@@ -285,11 +287,11 @@ class PFSPMatchmaker:
             # Fall back to self-play if no peers - warn as this may be unintentional
             # This typically happens at training start when few checkpoints exist
             if checkpoints:
-                # Other checkpoints exist but none are close enough in Elo
+                # Other checkpoints exist but none are close enough in rating
                 print(
-                    f"⚠️ Peer sampling: No agents within Elo range for {hero_agent} "
-                    f"(Elo {hero_elo:.0f}). Falling back to self-play. "
-                    f"Consider widening peer_elo_range or near_peer_elo_range."
+                    f"⚠️ Peer sampling: No agents within rating range for {hero_agent} "
+                    f"(rating {hero_rating:.1f}). Falling back to self-play. "
+                    f"Consider widening peer_rating_range or near_peer_rating_range."
                 )
             else:
                 # No other checkpoints at all - expected at training start
@@ -300,16 +302,16 @@ class PFSPMatchmaker:
             return hero_agent
 
         if category == "exploitable":
-            # Find agents with lower Elo that we should beat
+            # Find agents with lower rating that we should beat
             weaker = [
                 a
                 for a in checkpoints
-                if a.elo < hero_elo - 50  # At least 50 Elo weaker
+                if a.display_rating < hero_rating - 50  # At least 50 rating points weaker
                 and a.name != hero_agent
             ]
             if weaker:
                 # Weight by how exploitable they should be
-                weights = [max(1, hero_elo - a.elo) for a in weaker]
+                weights = [max(1, hero_rating - a.display_rating) for a in weaker]
                 return random.choices(weaker, weights=weights, k=1)[0].name
 
             # Fall back to baselines if no weaker checkpoints
@@ -320,48 +322,48 @@ class PFSPMatchmaker:
         # Unknown category - default to self-play
         return hero_agent
 
-    def _sample_agent_by_elo(
+    def _sample_agent_by_rating(
         self,
-        hero_elo: float,
+        hero_rating: float,
         hero_agent: str,
         all_agents: list[AgentInfo],
     ) -> tuple[str, float, str]:
         """
-        Sample opponent using Gaussian probability centered on hero Elo.
+        Sample opponent using Gaussian probability centered on hero rating.
 
         Args:
-            hero_elo: The hero's current Elo rating
+            hero_rating: The hero's current display_rating (mu - 3*sigma)
             hero_agent: Name of the hero agent (for self-play handling)
             all_agents: List of all available agents (checkpoints + baselines)
 
         Returns:
-            Tuple of (agent_name, agent_elo, elo_bucket)
+            Tuple of (agent_name, agent_rating, rating_bucket)
         """
-        sigma = self.config.elo_sampling_sigma
+        sigma = self.config.rating_sampling_sigma
         min_self_play_prob = self.config.min_self_play_prob
 
         # Always include self-play with minimum probability
         if random.random() < min_self_play_prob:
-            return hero_agent, hero_elo, "self"
+            return hero_agent, hero_rating, "self"
 
         # Filter out hero from candidates
         candidates = [a for a in all_agents if a.name != hero_agent]
 
         if not candidates:
             # Fallback to self-play if no other agents
-            return hero_agent, hero_elo, "self"
+            return hero_agent, hero_rating, "self"
 
-        # Compute Gaussian weights based on Elo distance
+        # Compute Gaussian weights based on rating distance
         weights = []
         for agent in candidates:
-            elo_diff = hero_elo - agent.elo
-            weight = math.exp(-(elo_diff**2) / (2 * sigma**2))
+            rating_diff = hero_rating - agent.display_rating
+            weight = math.exp(-(rating_diff**2) / (2 * sigma**2))
             weights.append(weight)
 
         # Sample weighted by Gaussian
         chosen = random.choices(candidates, weights=weights, k=1)[0]
-        bucket = _elo_bucket(hero_elo, chosen.elo)
-        return chosen.name, chosen.elo, bucket
+        bucket = _rating_bucket(hero_rating, chosen.display_rating)
+        return chosen.name, chosen.display_rating, bucket
 
     def _agent_to_adapter(self, agent_name: str) -> str | None:
         """Convert agent name to adapter path or bot identifier."""
@@ -434,7 +436,7 @@ class PFSPMatchmaker:
         return MatchmakingResult(
             hero_power=hero_power,
             hero_agent="base_model",
-            hero_elo=1000.0,  # Base model defaults to 1000 Elo
+            hero_rating=0.0,  # Base model default display_rating (25 - 3*8.333 ≈ 0)
             power_adapters=power_adapters,
             power_agent_names=power_agent_names,
             opponent_categories=opponent_categories,

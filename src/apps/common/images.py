@@ -4,11 +4,13 @@ start_cmd = "pip install --upgrade pip"
 requirements = [
     "diplomacy",
     "pydantic",
+    "pyyaml",  # For sweep config YAML parsing
     "numpy",
     "tqdm",
     "cloudpickle",
     "wandb",
     "weave",  # For trajectory tracing in rollouts
+    "trueskill",
 ]
 
 cpu_image = (

@@ -392,6 +392,84 @@ def update_elo_from_rollouts(
     return final_updates
 
 
+def update_trueskill_from_rollouts(
+    collected_results: list[RolloutResult],
+    league_ctx: LeagueContext,
+) -> dict[str, tuple[float, float]]:
+    """
+    Update TrueSkill ratings from rollout game outcomes.
+
+    Args:
+        collected_results: List of RolloutResult from current step
+        league_ctx: League context with registry
+
+    Returns:
+        Dict of agent_name -> (new_mu, new_sigma) for agents that were updated
+    """
+    from collections import defaultdict
+
+    from src.league.trueskill_rating import update_trueskill_from_match
+
+    # Track all rating updates per agent
+    all_mu_deltas: dict[str, list[float]] = defaultdict(list)
+    all_new_sigmas: dict[str, list[float]] = defaultdict(list)
+
+    for result in collected_results:
+        # Get game outcomes from rollout data
+        match_results_data = result.data.get("match_results", [])
+
+        for match in match_results_data:
+            power_agents = match.get("power_agents", {})
+            power_scores = match.get("power_scores", {})
+
+            if not power_agents or not power_scores:
+                continue
+
+            # Get current TrueSkill ratings for all agents in this match
+            unique_agents = {a for a in power_agents.values() if a}
+            agent_ratings: dict[str, tuple[float, float]] = {}
+            for agent in unique_agents:
+                info = league_ctx.registry.get_agent(agent)
+                if info:
+                    agent_ratings[agent] = (info.mu, info.sigma)
+                else:
+                    # Default for unknown agents
+                    from src.league.trueskill_rating import MU_INIT, SIGMA_INIT
+
+                    agent_ratings[agent] = (MU_INIT, SIGMA_INIT)
+
+            # Compute new ratings using TrueSkill
+            new_ratings = update_trueskill_from_match(power_agents, power_scores, agent_ratings)
+
+            # Accumulate updates for averaging
+            for agent, (new_mu, new_sigma) in new_ratings.items():
+                old_mu, _old_sigma = agent_ratings[agent]
+                all_mu_deltas[agent].append(new_mu - old_mu)
+                all_new_sigmas[agent].append(new_sigma)
+
+    # Apply average delta for mu, minimum for sigma (most confident after seeing more games)
+    final_updates: dict[str, tuple[float, float]] = {}
+    for agent, mu_deltas in all_mu_deltas.items():
+        current = league_ctx.registry.get_agent(agent)
+        if current:
+            avg_mu_delta = sum(mu_deltas) / len(mu_deltas)
+            min_sigma = min(all_new_sigmas[agent])
+            final_updates[agent] = (current.mu + avg_mu_delta, min_sigma)
+
+    if final_updates:
+        league_ctx.registry.bulk_update_trueskill(final_updates)
+        # Log a sample of the updates
+        sample_agent = next(iter(final_updates))
+        sample_info = league_ctx.registry.get_agent(sample_agent)
+        if sample_info:
+            logger.info(
+                f"📊 TrueSkill updated for {len(final_updates)} agents "
+                f"(e.g., {sample_agent}: rating={sample_info.display_rating:.1f})"
+            )
+
+    return final_updates
+
+
 def add_checkpoint_to_league(
     step: int,
     adapter_rel_path: str,
@@ -432,9 +510,9 @@ def add_checkpoint_to_league(
     volume.commit()
     logger.info(f"🏆 Added checkpoint {checkpoint_key} to league")
 
-    # Spawn Elo evaluation if enabled
-    if cfg.elo_eval_every_n_steps > 0 and step % cfg.elo_eval_every_n_steps == 0 and step > 1:
-        logger.info(f"🎯 Spawning Elo evaluation for {checkpoint_key}")
+    # Spawn league evaluation if enabled (for additional rating validation)
+    if cfg.league_eval_every_n_steps > 0 and step % cfg.league_eval_every_n_steps == 0 and step > 1:
+        logger.info(f"🎯 Spawning league evaluation for {checkpoint_key}")
         registry_path_str = str(
             f"/data/league_{cfg.run_name}.json"
             if not cfg.league_registry_path
@@ -444,7 +522,7 @@ def add_checkpoint_to_league(
         evaluate_league_fn.spawn(
             challenger_path=adapter_rel_path,
             league_registry_path=registry_path_str,
-            games_per_opponent=cfg.elo_eval_games_per_opponent,
+            games_per_opponent=cfg.league_eval_games_per_opponent,
             max_years=cfg.rollout_horizon_years,
             model_id=cfg.base_model_id,
             wandb_run_id=wandb.run.id if wandb.run else None,
@@ -538,13 +616,17 @@ class RolloutManager:
         # Sample opponents
         if self.league_ctx.registry.num_checkpoints > 0:
             hero_info = self.league_ctx.registry.get_agent(hero_agent_name)
-            estimated_hero_elo = hero_info.elo if hero_info else self.league_ctx.registry.best_elo
+            estimated_hero_rating = (
+                hero_info.display_rating
+                if hero_info
+                else self.league_ctx.registry.best_display_rating
+            )
 
             match_result = self.league_ctx.matchmaker.sample_opponents(
                 hero_agent=hero_agent_name,
                 hero_power=hero_power,
                 num_opponents=6,
-                hero_elo_override=estimated_hero_elo,
+                hero_rating_override=estimated_hero_rating,
                 hero_adapter_path=hero_adapter_path,
             )
         else:
@@ -1218,6 +1300,9 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
         run_rollout_fn = modal.Function.from_name("diplomacy-grpo", "run_rollout")
         InferenceEngineCls = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
         evaluate_league_fn = modal.Function.from_name("diplomacy-grpo", "evaluate_league")
+        evaluate_benchmarks_fn = modal.Function.from_name(
+            "diplomacy-grpo", "evaluate_against_benchmarks"
+        )
 
         # Initialize rollout manager
         rollout_mgr = RolloutManager(cfg, run_rollout_fn, league_ctx)
@@ -1413,20 +1498,46 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 sim_years_per_step,
                 collected_results=collected,  # For per-opponent-type metrics
             )
-            # Update Elo from rollout game outcomes (if league training enabled)
-            # Note: We add Elo metrics to wandb_metrics BEFORE logging to avoid
+            # Update TrueSkill ratings from rollout game outcomes (if league training enabled)
+            # Note: We add rating metrics to wandb_metrics BEFORE logging to avoid
             # double-incrementing WandB's step counter (each wandb.log() call = 1 step)
             if league_ctx is not None:
-                elo_updates = update_elo_from_rollouts(
-                    collected, league_ctx, k_factor=cfg.rollout_elo_k_factor
-                )
-                if elo_updates:
-                    # Add count and individual agent Elos to wandb_metrics
-                    wandb_metrics["elo/rollout_updates_count"] = len(elo_updates)
-                    for agent_name, new_elo in elo_updates.items():
+                trueskill_updates = update_trueskill_from_rollouts(collected, league_ctx)
+                if trueskill_updates:
+                    # Add count and individual agent ratings to wandb_metrics
+                    wandb_metrics["trueskill/rollout_updates_count"] = len(trueskill_updates)
+                    for agent_name, (new_mu, new_sigma) in trueskill_updates.items():
                         # Sanitize agent name for WandB (replace / with _)
                         safe_name = agent_name.replace("/", "_")
-                        wandb_metrics[f"elo/{safe_name}"] = new_elo
+                        display_rating = new_mu - 3 * new_sigma
+                        wandb_metrics[f"trueskill/{safe_name}_mu"] = new_mu
+                        wandb_metrics[f"trueskill/{safe_name}_sigma"] = new_sigma
+                        wandb_metrics[f"trueskill/{safe_name}_rating"] = display_rating
+                        # Also log under elo/ for backwards compatibility
+                        wandb_metrics[f"elo/{safe_name}"] = (new_mu - 25.0) * 40 + 1000
+
+            # Spawn benchmark evaluation if enabled and due
+            if (
+                cfg.benchmark_eval_every_n_steps > 0
+                and step > 0
+                and step % cfg.benchmark_eval_every_n_steps == 0
+            ):
+                adapter_rel_path = f"{cfg.run_name}/adapter_v{step}"
+                logger.info(f"📊 Spawning benchmark evaluation for step {step}")
+                evaluate_benchmarks_fn.spawn(
+                    challenger_path=adapter_rel_path,
+                    games_per_benchmark=cfg.benchmark_games_per_opponent,
+                    max_years=cfg.benchmark_max_years,
+                    model_id=cfg.base_model_id,
+                    wandb_run_id=wandb.run.id if wandb.run else None,
+                    training_step=step,
+                    use_quick_suite=True,  # Use quick suite for frequent eval during training
+                    show_valid_moves=cfg.show_valid_moves,
+                    compact_prompts=cfg.compact_prompts,
+                    prefix_cache_optimized=cfg.prefix_cache_optimized,
+                    temperature=cfg.temperature,
+                    max_new_tokens=cfg.max_new_tokens,
+                )
 
             wandb.log(wandb_metrics)
 
