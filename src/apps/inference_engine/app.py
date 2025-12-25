@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -33,12 +34,56 @@ app = modal.App("diplomacy-grpo-inference-engine")
 # ============================================================================
 
 
+# Must match max_lora_rank in engine configuration (lines 490, 986)
+# This is also validated in src/utils/preflight.py
+INFERENCE_ENGINE_MAX_LORA_RANK = 32
+
+
 @dataclass
 class AdapterManager:
     """Manages LoRA adapter loading and caching."""
 
     loaded_adapters: set[str] = field(default_factory=set)
     adapter_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def _validate_adapter_config(self, full_path: str, lora_name: str) -> None:
+        """
+        Validate adapter configuration at runtime.
+
+        Raises ValueError with actionable fix if lora_rank exceeds max_lora_rank.
+        This catches misconfigurations that would cause silent hangs.
+        """
+        config_path = os.path.join(full_path, "adapter_config.json")
+        if not os.path.exists(config_path):
+            # Let vLLM handle missing config files
+            return
+
+        try:
+            with open(config_path) as f:
+                adapter_config = json.load(f)
+
+            adapter_rank = adapter_config.get("r", 0)
+            if adapter_rank > INFERENCE_ENGINE_MAX_LORA_RANK:
+                raise ValueError(
+                    f"LoRA adapter '{lora_name}' has rank {adapter_rank} which exceeds "
+                    f"InferenceEngine max_lora_rank={INFERENCE_ENGINE_MAX_LORA_RANK}.\n"
+                    f"Fix: Either:\n"
+                    f"  1. Retrain with lora_rank <= {INFERENCE_ENGINE_MAX_LORA_RANK}, OR\n"
+                    f"  2. Update max_lora_rank in src/apps/inference_engine/app.py "
+                    f"(lines 490, 986) and redeploy"
+                )
+
+            print(
+                f"✅ Adapter '{lora_name}' rank={adapter_rank} validated (max={INFERENCE_ENGINE_MAX_LORA_RANK})"
+            )
+
+        except json.JSONDecodeError as e:
+            print(f"⚠️ Could not parse adapter_config.json for {lora_name}: {e}")
+        except ValueError:
+            # Re-raise rank mismatch errors
+            raise
+        except Exception as e:
+            print(f"⚠️ Could not validate adapter config for {lora_name}: {e}")
 
     async def load_adapter(self, lora_name: str) -> LoRARequest:
         """
@@ -103,6 +148,8 @@ class AdapterManager:
             if os.path.exists(full_path):
                 adapter_files = os.listdir(full_path)
                 print(f"✅ LoRA adapter found. Files: {adapter_files}")
+                # Validate adapter config before returning
+                self._validate_adapter_config(full_path, lora_name)
                 return
 
             if attempt < max_retries - 1:

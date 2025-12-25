@@ -419,7 +419,12 @@ class ExperimentConfig(BaseModel):
         ),
     )
     chunk_size: int = Field(
-        default=8, ge=1, description="Mini-batch size for gradient accumulation (must be >= 1)"
+        default=4,
+        ge=1,
+        description=(
+            "Mini-batch size for gradient accumulation (must be >= 1). "
+            "Reduced from 8 to 4 for Qwen2.5-7B's large vocab (~150k) to avoid OOM."
+        ),
     )
 
     # =========================================================================
@@ -627,6 +632,26 @@ class ExperimentConfig(BaseModel):
                 f"PFSP weights must sum to 1.0, got {total:.4f}. "
                 f"(self_play={self.pfsp_self_play_weight}, peer={self.pfsp_peer_weight}, "
                 f"exploitable={self.pfsp_exploitable_weight}, baseline={self.pfsp_baseline_weight})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_lora_rank(self) -> ExperimentConfig:
+        """Validate lora_rank doesn't exceed inference engine max.
+
+        This catches the bug where lora_rank in config exceeds the max_lora_rank
+        configured in InferenceEngine, which causes silent inference timeouts.
+        """
+        # Must match src/apps/inference_engine/app.py line 490
+        MAX_LORA_RANK = 32
+
+        if self.lora_rank > MAX_LORA_RANK:
+            raise ValueError(
+                f"lora_rank={self.lora_rank} exceeds InferenceEngine max_lora_rank={MAX_LORA_RANK}. "
+                f"Either:\n"
+                f"  1. Set lora_rank <= {MAX_LORA_RANK} in your config, OR\n"
+                f"  2. Update max_lora_rank in src/apps/inference_engine/app.py:490 "
+                f"and src/utils/preflight.py, then redeploy"
             )
         return self
 

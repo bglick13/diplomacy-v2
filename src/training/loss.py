@@ -228,12 +228,18 @@ class GRPOLoss:
         logits = outputs.logits[:, :-1, :]  # Shift left for next-token prediction
         shifted_labels = labels[:, 1:]  # Shift right to align with predictions
 
-        # 3. Compute Token LogProbs (negative cross-entropy)
-        per_token_loss = F.cross_entropy(logits.transpose(1, 2), shifted_labels, reduction="none")
+        # 3. Compute Token LogProbs (memory-efficient: log_softmax + gather)
+        # Using log_softmax + gather is more memory-efficient than F.cross_entropy with reduction="none"
+        # because we avoid materializing gradients for the full (batch, seq, vocab) tensor.
+        # We only need gradients for the actual target tokens.
+        log_probs = F.log_softmax(logits, dim=-1)
+        # Handle -100 labels by temporarily replacing with 0 for gather, then masking
+        gather_labels = shifted_labels.clamp(min=0)
+        token_log_probs_raw = log_probs.gather(-1, gather_labels.unsqueeze(-1)).squeeze(-1)
 
         # 4. Mask out prompt tokens (where labels == -100)
         token_mask = (shifted_labels != -100).float()
-        token_log_probs = -per_token_loss * token_mask
+        token_log_probs = token_log_probs_raw * token_mask
         num_completion_tokens = token_mask.sum().int().item()
 
         # 4a. Entropy monitoring disabled - computing full softmax over 150k vocab is too expensive
@@ -279,11 +285,12 @@ class GRPOLoss:
                     ref_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
                 ref_logits = ref_outputs.logits[:, :-1, :]
 
-                # Compute Reference LogProbs
-                ref_per_token_loss = F.cross_entropy(
-                    ref_logits.transpose(1, 2), shifted_labels, reduction="none"
-                )
-                ref_token_log_probs = -ref_per_token_loss * token_mask
+                # Compute Reference LogProbs (memory-efficient: log_softmax + gather)
+                ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+                ref_token_log_probs_raw = ref_log_probs.gather(
+                    -1, gather_labels.unsqueeze(-1)
+                ).squeeze(-1)
+                ref_token_log_probs = ref_token_log_probs_raw * token_mask
                 ref_completion_log_probs = ref_token_log_probs.sum(dim=1)
 
         # 6. KL Divergence Approximation (Schulman's estimator)
@@ -312,6 +319,19 @@ class GRPOLoss:
         # Determine if we can use PPO clipping
         has_rollout_logprobs = all("rollout_logprobs" in b for b in batch)
         use_clipping = self.use_ppo_clipping and has_rollout_logprobs
+
+        # Debug: Log if PPO clipping is unexpectedly disabled
+        if self.use_ppo_clipping and not has_rollout_logprobs:
+            missing_count = sum(1 for b in batch if "rollout_logprobs" not in b)
+            # Only log occasionally to avoid spam
+            if len(batch) > 0 and missing_count > 0:
+                import random
+
+                if random.random() < 0.01:  # 1% sample rate
+                    print(
+                        f"⚠️ PPO clipping disabled: {missing_count}/{len(batch)} items "
+                        "missing rollout_logprobs"
+                    )
 
         if use_clipping:
             # Extract rollout logprobs (from generation time)

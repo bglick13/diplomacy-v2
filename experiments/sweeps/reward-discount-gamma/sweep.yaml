@@ -32,6 +32,9 @@ defaults:
   # Keep other reward settings at defaults to isolate gamma effect
   step_reward_weight: 0.8
   final_reward_weight: 0.2
+  # Add KL regularization for stability (prevents mode collapse with gamma=0.0)
+  kl_beta: 0.04
+  kl_beta_warmup_steps: 10
 
 # Analysis configuration
 analysis:

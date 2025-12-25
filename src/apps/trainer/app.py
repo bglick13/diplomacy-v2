@@ -732,6 +732,20 @@ class RolloutManager:
                 result = handle.get(timeout=timeout)
                 polls_without_progress = 0
 
+                # Check if rollout returned a failure result
+                from src.utils.results import is_rollout_failure, parse_rollout_result
+
+                if is_rollout_failure(result):
+                    failure = parse_rollout_result(result)
+                    failed_count += 1
+                    logger.error(
+                        f"❌ Rollout returned failure: {failure}\n"
+                        f"  This is NOT a transient error - fix the root cause."
+                    )
+                    # Don't retry failures - they indicate config/setup issues
+                    self._retry_counts.pop(id(handle), None)
+                    continue
+
                 # Track timing
                 timing = result.get("timing", {})
                 max_volume_reload_s = max(max_volume_reload_s, timing.get("volume_reload_s", 0.0))
@@ -1331,6 +1345,18 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
 
     cfg = ExperimentConfig(**config_values)
     sim_years_per_step = cfg.simulated_years_per_step
+
+    # =========================================================================
+    # PREFLIGHT VALIDATION - Run before any GPU work
+    # =========================================================================
+    # This catches config mismatches (like lora_rank > max_lora_rank) that would
+    # otherwise cause silent timeouts and waste GPU hours.
+    from src.utils.preflight import run_full_preflight
+
+    preflight = run_full_preflight(cfg)
+    preflight.log_warnings(logger)
+    preflight.raise_if_failed()  # Hard error if validation fails
+    logger.info("✅ Preflight validation passed")
 
     # Setup profiling
     profiler, trace_subdir = setup_profiler(cfg)

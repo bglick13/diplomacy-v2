@@ -24,6 +24,7 @@ from src.utils.observability import (
     stopwatch,
 )
 from src.utils.parsing import extract_orders
+from src.utils.results import ErrorCode, RolloutFailure, RolloutSuccess
 from src.utils.scoring import (
     calculate_balance_of_power_score,
     calculate_final_scores,
@@ -1394,7 +1395,17 @@ async def run_rollout(
         )
 
         if not warmup_success:
-            return []
+            # Warmup failed - could be game ended early (normal) or timeout (error)
+            # Return failure to trigger retry with different starting state
+            return RolloutFailure(
+                error_code=ErrorCode.ROLLOUT_WARMUP_FAILED,
+                message="Warmup phase failed (game ended early or inference timeout)",
+                fix_instruction=(
+                    "If timeout, check InferenceEngine health. "
+                    "If game ended early, this is normal - will retry with new game."
+                ),
+                partial_data={"rollout_id": rollout_id, "warmup_phases": warmup_phases},
+            ).to_dict()
 
         # Fork the game state
         fork_start = time.time()
@@ -1493,17 +1504,17 @@ async def run_rollout(
             cfg.position_bonus_7th,
         )
 
-        return {
-            "trajectories": trajectories,
-            "extraction_stats": {
+        return RolloutSuccess(
+            trajectories=trajectories,
+            extraction_stats={
                 "orders_expected": metrics.total_orders_expected,
                 "orders_extracted": metrics.total_orders_extracted,
                 "empty_responses": metrics.empty_responses,
                 "partial_responses": metrics.partial_responses,
                 "extraction_rate": metrics.get_extraction_rate(),
             },
-            "game_stats": game_stats,
-            "timing": {
+            game_stats=game_stats,
+            timing={
                 "volume_reload_s": volume_reload_time,
                 "total_s": total_s,
                 # Detailed timing breakdown for waterfall charts
@@ -1512,7 +1523,7 @@ async def run_rollout(
             # Match results for TrueSkill/Elo updates (one per game fork)
             # Uses power_agent_names (e.g., "adapter_v50") not paths for registry lookups
             # Note: Uses same position-based scoring as training rewards for consistency
-            "match_results": [
+            match_results=[
                 {
                     "power_agents": dict(adapter_config.power_agent_names),
                     "power_scores": calculate_final_scores(
@@ -1528,13 +1539,19 @@ async def run_rollout(
                 }
                 for game in games
             ],
-        }
+        ).to_dict()
 
     except Exception as e:
         logger.error(f"❌ Error running rollout: {e}")
         if rollout_id:
             log_rollout_error(rollout_id=rollout_id, error=str(e))
-        raise e
+        # Return failure as value instead of raising - enables aggregated error handling
+        return RolloutFailure(
+            error_code=ErrorCode.UNKNOWN,
+            message=f"Rollout failed with exception: {e}",
+            fix_instruction="Check the full error traceback in Axiom logs.",
+            partial_data={"rollout_id": rollout_id} if rollout_id else {},
+        ).to_dict()
 
     finally:
         await axiom.flush()
