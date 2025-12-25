@@ -9,6 +9,7 @@ Key features:
 - Fire-and-forget: Local script spawns and exits immediately
 - Auto-resume: Saves progress after each run; respawns self if timeout nears
 - Progress tracking: sweep_state.json on volume tracks completed runs
+- Inference warmup: Warms up inference engine before first run
 """
 
 from __future__ import annotations
@@ -24,6 +25,9 @@ from src.apps.common.volumes import VOLUME_PATH, volume
 from src.utils.observability import axiom, logger
 from src.utils.sweep_config import SweepConfig, SweepState
 
+# Default model ID for inference warmup
+DEFAULT_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+
 app = modal.App("diplomacy-grpo-sweep")
 
 # Leave 1 hour buffer before Modal's 24hr timeout for safe self-respawn
@@ -32,6 +36,33 @@ SWEEP_TIMEOUT_SECONDS = SWEEP_TIMEOUT_HOURS * 60 * 60
 
 # Path for sweep state files
 SWEEPS_PATH = VOLUME_PATH / "sweeps"
+
+
+def warmup_inference_engine(model_id: str = DEFAULT_MODEL_ID) -> float:
+    """
+    Warm up the InferenceEngine before training runs.
+
+    Args:
+        model_id: HuggingFace model ID to warm up
+
+    Returns:
+        Warmup duration in seconds
+    """
+    logger.info(f"Warming up InferenceEngine with model: {model_id}")
+    start = time.time()
+
+    InferenceEngine = modal.Cls.from_name("diplomacy-grpo", "InferenceEngine")
+    engine = InferenceEngine(model_id=model_id)
+
+    # Make a minimal call to trigger container startup
+    _ = engine.generate.remote(
+        prompts=["<orders>"],
+        valid_moves=[{"A PAR": ["A PAR - BUR"]}],
+    )
+
+    duration = time.time() - start
+    logger.info(f"InferenceEngine ready! ({duration:.2f}s)")
+    return duration
 
 
 @app.function(
@@ -104,6 +135,20 @@ def orchestrate_sweep(
             "pending_runs": pending_runs,
             "completed_runs": state.completed_runs,
         }
+
+    # Warm up inference engine before training runs
+    # Get model_id from the first pending run's config
+    first_run_cfg = sweep_config.build_experiment_config(pending_runs[0], state.timestamp)
+    model_id = first_run_cfg.base_model_id
+    warmup_duration = warmup_inference_engine(model_id)
+    axiom.log(
+        {
+            "event": "sweep_warmup_completed",
+            "sweep_name": sweep_name,
+            "model_id": model_id,
+            "warmup_duration_s": warmup_duration,
+        }
+    )
 
     # Get reference to training function
     train_grpo = modal.Function.from_name("diplomacy-grpo", "train_grpo")

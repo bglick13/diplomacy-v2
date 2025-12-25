@@ -868,22 +868,32 @@ class GameStats(TypedDict):
     total_games: int
     avg_sc_count: float
     win_bonus_rate: float
+    hero_placements: list[int]
+    placement_counts: dict[int, int]  # rank -> count
 
 
 def aggregate_game_stats(results: list[RolloutResult]) -> GameStats:
     """Aggregate game statistics from multiple rollout results."""
     all_sc_counts: list[int] = []
+    all_hero_placements: list[int] = []
     total_win_bonus = 0
     total_games = 0
 
     for result in results:
         game_stats = result.data.get("game_stats", {})
         all_sc_counts.extend(game_stats.get("sc_counts", []))
+        all_hero_placements.extend(game_stats.get("hero_placements", []))
         total_win_bonus += game_stats.get("win_bonus_awarded", 0)
         total_games += game_stats.get("total_games", 0)
 
     avg_sc = sum(all_sc_counts) / len(all_sc_counts) if all_sc_counts else 0.0
     win_rate = total_win_bonus / total_games if total_games > 0 else 0.0
+
+    # Count placements by rank (1-7)
+    placement_counts: dict[int, int] = dict.fromkeys(range(1, 8), 0)
+    for rank in all_hero_placements:
+        if 1 <= rank <= 7:
+            placement_counts[rank] += 1
 
     return GameStats(
         sc_counts=all_sc_counts,
@@ -891,7 +901,46 @@ def aggregate_game_stats(results: list[RolloutResult]) -> GameStats:
         total_games=total_games,
         avg_sc_count=avg_sc,
         win_bonus_rate=win_rate,
+        hero_placements=all_hero_placements,
+        placement_counts=placement_counts,
     )
+
+
+def _build_placement_metrics(game_stats: GameStats) -> dict[str, float]:
+    """Build placement rate metrics for WandB logging.
+
+    Returns dict with keys like:
+    - placement/1st_rate: fraction finishing 1st
+    - placement/2nd_rate: fraction finishing 2nd
+    - ...
+    - placement/top3_rate: fraction finishing 1st, 2nd, or 3rd
+    """
+    placement_counts = game_stats.get("placement_counts", {})
+    hero_placements = game_stats.get("hero_placements", [])
+    total = len(hero_placements) if hero_placements else 0
+
+    if total == 0:
+        return {}
+
+    ordinal_names = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 5: "5th", 6: "6th", 7: "7th"}
+
+    metrics: dict[str, float] = {}
+    for rank in range(1, 8):
+        count = placement_counts.get(rank, 0)
+        rate = count / total
+        metrics[f"placement/{ordinal_names[rank]}_rate"] = rate
+
+    # Add aggregate metrics
+    top3_count = sum(placement_counts.get(r, 0) for r in [1, 2, 3])
+    bottom3_count = sum(placement_counts.get(r, 0) for r in [5, 6, 7])
+    metrics["placement/top3_rate"] = top3_count / total
+    metrics["placement/bottom3_rate"] = bottom3_count / total
+
+    # Mean placement (lower is better)
+    if hero_placements:
+        metrics["placement/mean_rank"] = sum(hero_placements) / len(hero_placements)
+
+    return metrics
 
 
 def build_wandb_metrics(
@@ -949,6 +998,8 @@ def build_wandb_metrics(
         "game/avg_sc_count": game_stats["avg_sc_count"],
         "game/win_bonus_rate": game_stats["win_bonus_rate"],
         "game/total_games": game_stats["total_games"],
+        # Placement rates (position-based scoring)
+        **_build_placement_metrics(game_stats),
         # Power law
         "power_law/cumulative_simulated_years": cumulative_sim_years,
         "power_law/simulated_years_per_step": sim_years_per_step,
@@ -974,6 +1025,13 @@ def build_wandb_metrics(
         "processing/skipped_zero_variance": traj_stats.skipped_zero_variance_groups,
         "processing/effective_batch_size": traj_stats.effective_batch_size,
         "processing/total_samples_skipped": traj_stats.total_samples_skipped,
+        # PPO clipping diagnostics (DAPO-style)
+        "ppo/ratio_mean": step_metrics.get("ratio_mean", 1.0),
+        "ppo/ratio_std": step_metrics.get("ratio_std", 0.0),
+        "ppo/clip_fraction": step_metrics.get("ratio_clipped_fraction", 0.0),
+        # Policy entropy diagnostics (GTPO-style collapse detection)
+        "policy/entropy_mean": step_metrics.get("entropy_mean", 0.0),
+        "policy/entropy_std": step_metrics.get("entropy_std", 0.0),
     }
 
     # NOTE: Cache metrics (cache/hit_rate, etc.) were removed because they never
@@ -1101,13 +1159,20 @@ def initialize_model_and_optimizer(
         attn_implementation="sdpa",
     )
 
+    # Use configured alpha or default to 2x rank
+    lora_alpha = cfg.lora_alpha if cfg.lora_alpha is not None else cfg.lora_rank * 2
+
     peft_config = LoraConfig(
         r=cfg.lora_rank,
-        lora_alpha=cfg.lora_rank * 2,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        lora_dropout=0.05,
+        lora_alpha=lora_alpha,
+        target_modules=cfg.lora_target_modules,
+        lora_dropout=cfg.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
+    )
+    logger.info(
+        f"🔧 LoRA config: rank={cfg.lora_rank}, alpha={lora_alpha}, "
+        f"modules={cfg.lora_target_modules}, dropout={cfg.lora_dropout}"
     )
     policy_model = get_peft_model(base_model, peft_config)
     policy_model.gradient_checkpointing_enable()  # pyright: ignore[reportCallIssue]
@@ -1136,7 +1201,17 @@ def initialize_model_and_optimizer(
         policy_model,  # pyright: ignore[reportArgumentType]
         beta=cfg.kl_beta,
         kl_controller=kl_controller,
+        use_ppo_clipping=cfg.use_ppo_clipping,
+        ppo_epsilon_low=cfg.ppo_epsilon_low,
+        ppo_epsilon_high=cfg.ppo_epsilon_high,
+        use_token_level_loss=cfg.use_token_level_loss,
     )
+    if cfg.use_ppo_clipping:
+        logger.info(
+            f"📊 PPO clipping enabled: ε_low={cfg.ppo_epsilon_low}, ε_high={cfg.ppo_epsilon_high}"
+        )
+    if cfg.use_token_level_loss:
+        logger.info("📊 Token-level loss weighting enabled")
 
     return policy_model, optimizer, tokenizer, loss_fn, kl_controller
 
@@ -1733,6 +1808,13 @@ def _run_training_step(
     last_effective_beta = 0.0
     num_chunks = 0
     used_cached_ref = False  # Track if ref logprobs came from rollouts vs computed here
+    # PPO clipping metrics (DAPO-style)
+    accum_ratio_mean = 0.0
+    accum_ratio_std = 0.0
+    accum_ratio_clipped = 0.0
+    # Entropy metrics (GTPO-style)
+    accum_entropy_mean = 0.0
+    accum_entropy_std = 0.0
     # Use ceiling division to correctly count partial chunks at the end
     total_chunks = (len(batch_data) + cfg.chunk_size - 1) // cfg.chunk_size
 
@@ -1759,6 +1841,13 @@ def _run_training_step(
         # Track if any chunk used cached ref logprobs (should be all or none)
         if loss_output.used_cached_ref_logprobs:
             used_cached_ref = True
+        # PPO clipping metrics
+        accum_ratio_mean += loss_output.ratio_mean
+        accum_ratio_std += loss_output.ratio_std
+        accum_ratio_clipped += loss_output.ratio_clipped_fraction
+        # Entropy metrics
+        accum_entropy_mean += loss_output.entropy_mean
+        accum_entropy_std += loss_output.entropy_std
 
     with profile_section(step_profile, "optimizer_step"):
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1779,6 +1868,13 @@ def _run_training_step(
         "effective_beta": last_effective_beta,
         "grad_norm": grad_norm,
         "used_cached_ref_logprobs": used_cached_ref,
+        # PPO clipping metrics (DAPO-style)
+        "ratio_mean": accum_ratio_mean / max(1, num_chunks),
+        "ratio_std": accum_ratio_std / max(1, num_chunks),
+        "ratio_clipped_fraction": accum_ratio_clipped / max(1, num_chunks),
+        # Entropy metrics (GTPO-style)
+        "entropy_mean": accum_entropy_mean / max(1, num_chunks),
+        "entropy_std": accum_entropy_std / max(1, num_chunks),
     }
 
 

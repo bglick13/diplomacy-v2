@@ -248,6 +248,10 @@ def process_trajectories(
             # Add reference logprobs if available (enables skipping reference forward pass)
             if ref_logprobs is not None:
                 processed_item["ref_logprobs"] = ref_logprobs
+                # Also pass as rollout_logprobs for PPO clipping (DAPO-style)
+                # Note: completion_logprobs from rollout ARE the rollout policy logprobs,
+                # which is what we need for computing π_θ_new / π_θ_old ratio
+                processed_item["rollout_logprobs"] = ref_logprobs
 
             processed_batch.append(processed_item)
 
@@ -315,9 +319,9 @@ def process_trajectories(
         has_no_ref = len(processed_batch) - has_ref
 
         if has_ref > 0 and has_no_ref > 0:
-            # Mixed batch detected - strip ref_logprobs to force consistent behavior
-            # This ensures all items use the reference forward pass instead of
-            # mixing cached and computed ref logprobs (which would bias KL estimates).
+            # Mixed batch detected - strip ref_logprobs and rollout_logprobs
+            # to force consistent behavior. This ensures all items use the
+            # reference forward pass instead of mixing cached and computed logprobs.
             if verbose:
                 print(
                     f"⚠️ Mixed ref_logprobs in batch: {has_ref} with, {has_no_ref} without. "
@@ -325,5 +329,6 @@ def process_trajectories(
                 )
             for item in processed_batch:
                 item.pop("ref_logprobs", None)
+                item.pop("rollout_logprobs", None)
 
     return processed_batch, stats

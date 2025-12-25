@@ -1,0 +1,71 @@
+# Ablation Study: Discounted Future Rewards (Temporal Credit Assignment)
+#
+# Motivation: In Diplomacy, moves often set up future captures. Spring positioning
+# enables Fall SC captures, but the positioning move gets no credit for the capture.
+#
+# This sweep tests discount factors (gamma) that propagate future rewards backwards:
+#   R_t = delta_t + gamma * R_{t+1}
+#
+# With gamma=0.95, a move that enables a capture 2 steps later receives 90% credit.
+# This addresses the temporal credit assignment problem in multi-turn games.
+
+metadata:
+  name: "reward-discount-gamma"
+  description: "Ablation: Discount factor for temporal credit assignment"
+  hypothesis: |
+    Propagating future rewards backwards (gamma > 0) will improve learning by:
+    1. Giving positioning moves credit for subsequent captures
+    2. Reducing reward variance (cumulative returns are smoother than deltas)
+    3. Creating more informative gradients for early-game decisions
+
+    Expected outcomes:
+    - gamma=0.95 should outperform baseline gamma=0.0 (immediate only, previous behavior)
+    - Lower variance in reward signals with discounting
+    - Better early-game play (Spring positioning for Fall captures)
+  experiment_tag_prefix: "ablation-gamma"
+  created: "2024-12-25"
+  author: "claude-code"
+
+# Default config values shared across all runs
+defaults:
+  total_steps: 100
+  # Keep other reward settings at defaults to isolate gamma effect
+  step_reward_weight: 0.8
+  final_reward_weight: 0.2
+
+# Analysis configuration
+analysis:
+  primary_metric: "trueskill/display_rating"
+  secondary_metrics:
+    - "benchmark/reward_mean"
+    - "benchmark/reward_std"  # Expect lower variance with discounting
+    - "game/avg_sc_count"
+    - "game/win_bonus_rate"
+  expected_ranking: ["B", "C", "A"]  # gamma=0.95 expected to win, baseline last
+  success_criteria:
+    - "At least one gamma > 0 outperforms baseline (A, gamma=0.0)"
+    - "Reward variance decreases with discounting"
+    - "No training instability"
+
+# Run definitions (3 variants: baseline + moderate discount + full future credit)
+runs:
+  A:
+    name: "baseline-immediate-only"
+    description: "gamma=0.0 - No future credit, only immediate step delta (previous behavior)"
+    config:
+      reward_discount_gamma: 0.0
+      experiment_tag: "${metadata.experiment_tag_prefix}-A-gamma000"
+
+  B:
+    name: "moderate-discount"
+    description: "gamma=0.95 - Moderate discounting, ~60% weight on step+10"
+    config:
+      reward_discount_gamma: 0.95
+      experiment_tag: "${metadata.experiment_tag_prefix}-B-gamma095"
+
+  C:
+    name: "full-future-credit"
+    description: "gamma=1.0 - Undiscounted sum of all future step rewards"
+    config:
+      reward_discount_gamma: 1.0
+      experiment_tag: "${metadata.experiment_tag_prefix}-C-gamma100"

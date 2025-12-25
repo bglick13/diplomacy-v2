@@ -425,6 +425,9 @@ class InferenceEngine:
         """Initialize vLLM engine with optimized configuration."""
         print("🥶 Initializing vLLM v1 Engine...")
 
+        # Ensure models directory exists (required by vLLM LoRA resolver plugin)
+        self._ensure_models_dir()
+
         # Setup HuggingFace cache
         self._setup_hf_cache()
 
@@ -445,6 +448,15 @@ class InferenceEngine:
         self._check_stat_logger()
 
         print("✅ Engine Ready (with dynamic LoRA support).")
+
+    def _ensure_models_dir(self) -> None:
+        """Ensure models directory exists for vLLM LoRA resolver plugin."""
+        from src.apps.common.volumes import MODELS_PATH
+
+        # vLLM's LoRA filesystem resolver plugin requires VLLM_LORA_RESOLVER_CACHE_DIR
+        # to be a valid directory. On a fresh volume, this doesn't exist yet.
+        MODELS_PATH.mkdir(parents=True, exist_ok=True)
+        print(f"📁 Ensured models directory exists: {MODELS_PATH}")
 
     def _setup_hf_cache(self) -> None:
         """Setup HuggingFace cache directories."""
@@ -475,7 +487,7 @@ class InferenceEngine:
             # LoRA configuration for league training
             enable_lora=True,  # pyright: ignore[reportCallIssue]
             max_loras=8,  # Up to 7 opponents + 1 hero  # pyright: ignore[reportCallIssue]
-            max_lora_rank=16,  # Must match training LoRA rank  # pyright: ignore[reportCallIssue]
+            max_lora_rank=32,  # Must match training LoRA rank  # pyright: ignore[reportCallIssue]
             # Performance tuning for L4
             gpu_memory_utilization=gpu_memory_util,  # pyright: ignore[reportCallIssue]
             max_num_seqs=max_num_seqs,  # pyright: ignore[reportCallIssue]
@@ -971,7 +983,7 @@ class WebInferenceEngine:
             model=self.model_id,  # pyright: ignore[reportCallIssue]
             enable_lora=True,  # pyright: ignore[reportCallIssue]
             max_loras=4,  # Fewer adapters for web (vs 8 for training)  # pyright: ignore[reportCallIssue]
-            max_lora_rank=16,  # pyright: ignore[reportCallIssue]
+            max_lora_rank=32,  # Must match training LoRA rank  # pyright: ignore[reportCallIssue]
             gpu_memory_utilization=0.85,  # More conservative for stability  # pyright: ignore[reportCallIssue]
             max_num_seqs=32,  # Lower for single-user traffic  # pyright: ignore[reportCallIssue]
             max_num_batched_tokens=4096,  # pyright: ignore[reportCallIssue]

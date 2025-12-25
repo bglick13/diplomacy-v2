@@ -131,6 +131,15 @@ class GRPOLossOutput:
     # Optimization tracking
     used_cached_ref_logprobs: bool = False
 
+    # PPO clipping statistics (DAPO-style)
+    ratio_mean: float = 1.0
+    ratio_std: float = 0.0
+    ratio_clipped_fraction: float = 0.0  # Fraction of samples that hit clip bounds
+
+    # Policy entropy (GTPO-style monitoring)
+    entropy_mean: float = 0.0
+    entropy_std: float = 0.0
+
 
 class GRPOLoss:
     """
@@ -151,6 +160,10 @@ class GRPOLoss:
         beta: float = 0.04,
         epsilon: float = 1e-4,
         kl_controller: AdaptiveKLController | None = None,
+        use_ppo_clipping: bool = True,
+        ppo_epsilon_low: float = 0.2,
+        ppo_epsilon_high: float = 0.28,
+        use_token_level_loss: bool = True,
     ):
         """
         Args:
@@ -160,11 +173,20 @@ class GRPOLoss:
             epsilon: Small constant for numerical stability.
             kl_controller: Optional adaptive KL controller. If provided, its get_beta()
                 value is used instead of the fixed beta parameter.
+            use_ppo_clipping: Enable DAPO-style asymmetric PPO clipping.
+            ppo_epsilon_low: Lower bound for ratio clipping (ratio >= 1 - epsilon_low).
+            ppo_epsilon_high: Upper bound for ratio clipping (ratio <= 1 + epsilon_high).
+                Higher than epsilon_low to encourage exploration.
+            use_token_level_loss: Weight loss by token count instead of sample count.
         """
         self.model = model
         self.beta = beta
         self.epsilon = epsilon
         self.kl_controller = kl_controller
+        self.use_ppo_clipping = use_ppo_clipping
+        self.ppo_epsilon_low = ppo_epsilon_low
+        self.ppo_epsilon_high = ppo_epsilon_high
+        self.use_token_level_loss = use_token_level_loss
 
     def compute_loss(self, batch: list[dict]) -> GRPOLossOutput:
         """
@@ -178,6 +200,8 @@ class GRPOLoss:
                 - 'advantages': Float, the normalized advantage
                 - 'ref_logprobs': Float (optional) - pre-computed reference logprobs
                     If ALL items have this key, skip reference forward pass.
+                - 'rollout_logprobs': Float (required for PPO clipping) - logprobs
+                    from the rollout policy at generation time.
 
         Returns:
             GRPOLossOutput with loss tensor and detailed metrics.
@@ -211,6 +235,11 @@ class GRPOLoss:
         token_mask = (shifted_labels != -100).float()
         token_log_probs = -per_token_loss * token_mask
         num_completion_tokens = token_mask.sum().int().item()
+
+        # 4a. Entropy monitoring disabled - computing full softmax over 150k vocab is too expensive
+        # TODO: Re-enable with memory-efficient approximation (e.g., top-k entropy or sampling)
+        entropy_mean = 0.0
+        entropy_std = 0.0
 
         # Sum log probs over the completion length per sequence
         completion_log_probs = token_log_probs.sum(dim=1)
@@ -273,12 +302,68 @@ class GRPOLoss:
         effective_beta = (
             self.kl_controller.get_beta() if self.kl_controller is not None else self.beta
         )
-        # advantages are already normalized by the trainer
-        pg_loss = -(advantages.detach() * completion_log_probs)
+
+        # 7a. PPO Clipping (DAPO-style asymmetric clipping)
+        # Uses rollout logprobs as baseline (NOT ref model), enabling clipping even with kl_beta=0
+        ratio_mean = 1.0
+        ratio_std = 0.0
+        ratio_clipped_fraction = 0.0
+
+        # Determine if we can use PPO clipping
+        has_rollout_logprobs = all("rollout_logprobs" in b for b in batch)
+        use_clipping = self.use_ppo_clipping and has_rollout_logprobs
+
+        if use_clipping:
+            # Extract rollout logprobs (from generation time)
+            rollout_log_probs = torch.tensor(
+                [b["rollout_logprobs"] for b in batch], dtype=torch.float32, device=device
+            )
+
+            # Compute ratio: π_θ(a|s) / π_old(a|s) where π_old is rollout policy
+            log_ratio_ppo = completion_log_probs - rollout_log_probs
+            ratio = torch.exp(log_ratio_ppo)
+
+            # Compute clipping stats before clamping
+            with torch.no_grad():
+                ratio_mean = ratio.mean().item()
+                ratio_std = ratio.std().item() if len(ratio) > 1 else 0.0
+                # Count samples outside clip bounds
+                clipped_low = (ratio < 1.0 - self.ppo_epsilon_low).sum().item()
+                clipped_high = (ratio > 1.0 + self.ppo_epsilon_high).sum().item()
+                ratio_clipped_fraction = (clipped_low + clipped_high) / len(ratio)
+
+            # Asymmetric clipping: lower bound tighter than upper for exploration
+            clipped_ratio = torch.clamp(
+                ratio, 1.0 - self.ppo_epsilon_low, 1.0 + self.ppo_epsilon_high
+            )
+
+            # PPO surrogate: min(ratio * A, clip(ratio) * A)
+            # For positive advantages: we want to increase probability (ratio > 1)
+            #   - Clipping limits how much we can increase
+            # For negative advantages: we want to decrease probability (ratio < 1)
+            #   - Clipping limits how much we can decrease
+            surr1 = -advantages.detach() * ratio
+            surr2 = -advantages.detach() * clipped_ratio
+            pg_loss = torch.max(surr1, surr2)  # max because we negate advantage
+        else:
+            # Vanilla REINFORCE (no clipping)
+            # Used when use_ppo_clipping=False or rollout_logprobs not available
+            pg_loss = -(advantages.detach() * completion_log_probs)
+
         total_loss = pg_loss + (effective_beta * kl)
 
+        # 7b. Token-Level Loss Weighting (DAPO-style)
+        # Weight samples by their token count so longer sequences contribute proportionally
+        if self.use_token_level_loss:
+            token_counts = token_mask.sum(dim=1)  # Tokens per sample
+            total_tokens = token_counts.sum()
+            sample_weights = token_counts / total_tokens.clamp(min=1)
+            final_loss = (total_loss * sample_weights).sum()
+        else:
+            final_loss = total_loss.mean()
+
         return GRPOLossOutput(
-            loss=total_loss.mean(),
+            loss=final_loss,
             pg_loss=pg_loss.mean().item(),
             kl=kl_mean,  # Keep for backwards compatibility
             mean_completion_logprob=completion_log_probs.mean().item(),
@@ -292,4 +377,9 @@ class GRPOLoss:
             kl_std=kl_std,
             effective_beta=effective_beta,
             used_cached_ref_logprobs=used_cached_ref,
+            ratio_mean=ratio_mean,
+            ratio_std=ratio_std,
+            ratio_clipped_fraction=ratio_clipped_fraction,
+            entropy_mean=entropy_mean,
+            entropy_std=entropy_std,
         )

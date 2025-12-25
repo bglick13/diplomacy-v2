@@ -61,6 +61,7 @@ runs:
       rollout_horizon_years: 8
       rollout_long_horizon_years: 12
       rollout_long_horizon_chance: 0.5
+      chunk_size: 4  # Reduced for longer sequences
       experiment_tag: "${metadata.experiment_tag_prefix}-B-horizon"
 
   C:
@@ -82,6 +83,7 @@ runs:
       rollout_horizon_years: 8
       rollout_long_horizon_years: 12
       rollout_long_horizon_chance: 0.5
+      chunk_size: 4  # Reduced for longer sequences
       # Strategic scoring
       use_strategic_step_scoring: true
       step_reward_weight: 0.2

@@ -680,3 +680,367 @@ class TestEdgeCases:
         assert stats.total_groups == 100
         assert stats.total_trajectories == 300
         assert len(batch) == 300
+
+
+# =============================================================================
+# Tests for DAPO/GTPO Improvements
+# =============================================================================
+
+
+class TestPPOClipping:
+    """Tests for PPO clipping (DAPO-style Clip-Higher)."""
+
+    @pytest.fixture
+    def mock_model(self):
+        """Create a mock PEFT model for testing."""
+        return MockPeftModel()
+
+    def test_ppo_clipping_with_rollout_logprobs(self, mock_model):
+        """Test that PPO clipping works when rollout_logprobs are provided."""
+        from src.training.loss import GRPOLoss
+
+        loss_fn = GRPOLoss(
+            mock_model,
+            beta=0.0,
+            use_ppo_clipping=True,
+            ppo_epsilon_low=0.2,
+            ppo_epsilon_high=0.28,
+        )
+
+        batch = [
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": 1.0,
+                "rollout_logprobs": -15.0,  # Approximate logprob for 10 tokens
+            },
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": -1.0,
+                "rollout_logprobs": -12.0,
+            },
+        ]
+
+        output = loss_fn.compute_loss(batch)
+
+        # Should have ratio metrics when clipping is active
+        assert output.ratio_mean > 0  # Ratio should be positive
+        assert output.ratio_clipped_fraction >= 0  # Can be 0 if no clipping needed
+
+    def test_ppo_clipping_fallback_without_rollout_logprobs(self, mock_model):
+        """Test that PPO clipping falls back to vanilla REINFORCE without rollout_logprobs."""
+        from src.training.loss import GRPOLoss
+
+        loss_fn = GRPOLoss(
+            mock_model,
+            beta=0.0,
+            use_ppo_clipping=True,  # Enabled but won't be used
+        )
+
+        batch = [
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": 1.0,
+                # No rollout_logprobs
+            },
+        ]
+
+        # Should not raise, should fall back to vanilla REINFORCE
+        output = loss_fn.compute_loss(batch)
+
+        # Ratio should be default (1.0) since clipping wasn't used
+        assert output.ratio_mean == 1.0
+        assert output.ratio_clipped_fraction == 0.0
+
+    def test_ppo_clipping_disabled(self, mock_model):
+        """Test vanilla REINFORCE when PPO clipping is disabled."""
+        from src.training.loss import GRPOLoss
+
+        loss_fn = GRPOLoss(
+            mock_model,
+            beta=0.0,
+            use_ppo_clipping=False,
+        )
+
+        batch = [
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": 1.0,
+                "rollout_logprobs": -15.0,  # Present but shouldn't be used
+            },
+        ]
+
+        output = loss_fn.compute_loss(batch)
+
+        # Ratio should be default since clipping is disabled
+        assert output.ratio_mean == 1.0
+
+
+class TestTokenLevelLoss:
+    """Tests for token-level loss weighting (DAPO-style)."""
+
+    @pytest.fixture
+    def mock_model(self):
+        """Create a mock PEFT model for testing."""
+        return MockPeftModel()
+
+    def test_token_level_loss_enabled(self, mock_model):
+        """Test that token-level loss weights by token count."""
+        from src.training.loss import GRPOLoss
+
+        loss_fn = GRPOLoss(
+            mock_model,
+            beta=0.0,
+            use_ppo_clipping=False,
+            use_token_level_loss=True,
+        )
+
+        # Create batch with different completion lengths
+        batch = [
+            {
+                "input_ids": torch.randint(0, 100, (15,)),  # 5 completion tokens
+                "attention_mask": torch.ones(15),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (5,))]),
+                "advantages": 1.0,
+            },
+            {
+                "input_ids": torch.randint(0, 100, (30,)),  # 20 completion tokens
+                "attention_mask": torch.ones(30),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (20,))]),
+                "advantages": 1.0,
+            },
+        ]
+
+        output = loss_fn.compute_loss(batch)
+        assert isinstance(output.loss, torch.Tensor)
+
+    def test_token_level_loss_disabled(self, mock_model):
+        """Test sample-level loss when token-level is disabled."""
+        from src.training.loss import GRPOLoss
+
+        loss_fn = GRPOLoss(
+            mock_model,
+            beta=0.0,
+            use_ppo_clipping=False,
+            use_token_level_loss=False,
+        )
+
+        batch = [
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": 1.0,
+            },
+        ]
+
+        output = loss_fn.compute_loss(batch)
+        assert isinstance(output.loss, torch.Tensor)
+
+
+class TestEntropyMonitoring:
+    """Tests for entropy monitoring (GTPO-style collapse detection).
+
+    NOTE: Entropy computation is currently disabled due to memory constraints
+    (computing full softmax over 150k vocab causes OOM). These tests verify
+    the disabled state - re-enable when memory-efficient entropy is implemented.
+    """
+
+    @pytest.fixture
+    def mock_model(self):
+        """Create a mock PEFT model for testing."""
+        return MockPeftModel()
+
+    def test_entropy_fields_exist(self, mock_model):
+        """Test that entropy fields exist in output (currently disabled, returns 0)."""
+        from src.training.loss import GRPOLoss
+
+        loss_fn = GRPOLoss(mock_model, beta=0.0)
+
+        batch = [
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": 1.0,
+            },
+        ]
+
+        output = loss_fn.compute_loss(batch)
+
+        # Entropy fields should exist (currently disabled, returns 0)
+        assert hasattr(output, "entropy_mean")
+        assert hasattr(output, "entropy_std")
+        # Currently disabled - returns 0.0
+        assert output.entropy_mean == 0.0
+        assert output.entropy_std == 0.0
+
+    def test_entropy_statistics_disabled(self, mock_model):
+        """Test that entropy statistics are 0 when disabled."""
+        from src.training.loss import GRPOLoss
+
+        loss_fn = GRPOLoss(mock_model, beta=0.0)
+
+        batch = [
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": 0.5,
+            },
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": -0.5,
+            },
+        ]
+
+        output = loss_fn.compute_loss(batch)
+
+        # Entropy is currently disabled, should be 0
+        assert output.entropy_mean == 0.0
+        assert output.entropy_std == 0.0
+
+
+# =============================================================================
+# Tests for Discounted Cumulative Returns
+# =============================================================================
+
+
+class TestDiscountedReturns:
+    """Tests for discounted cumulative returns in reward computation."""
+
+    def test_discounted_returns_basic(self):
+        """Test that discounted returns are computed correctly."""
+        # Simulate the algorithm from build_trajectories
+        gamma = 0.9
+
+        # Step deltas: [1.0, 2.0, 3.0] at steps 0, 1, 2
+        deltas = {0: 1.0, 1: 2.0, 2: 3.0}
+        sorted_steps = sorted(deltas.keys())
+
+        # Compute backwards
+        cumulative = 0.0
+        returns = {}
+        for step in reversed(sorted_steps):
+            cumulative = deltas[step] + gamma * cumulative
+            returns[step] = cumulative
+
+        # Expected:
+        # R_2 = 3.0
+        # R_1 = 2.0 + 0.9 * 3.0 = 4.7
+        # R_0 = 1.0 + 0.9 * 4.7 = 5.23
+        assert abs(returns[2] - 3.0) < 1e-6
+        assert abs(returns[1] - 4.7) < 1e-6
+        assert abs(returns[0] - 5.23) < 1e-6
+
+    def test_discounted_returns_gamma_zero(self):
+        """Test that gamma=0 gives immediate rewards only."""
+        gamma = 0.0
+
+        deltas = {0: 1.0, 1: 2.0, 2: 3.0}
+        sorted_steps = sorted(deltas.keys())
+
+        cumulative = 0.0
+        returns = {}
+        for step in reversed(sorted_steps):
+            cumulative = deltas[step] + gamma * cumulative
+            returns[step] = cumulative
+
+        # With gamma=0, each step only sees its own delta
+        assert returns[0] == 1.0
+        assert returns[1] == 2.0
+        assert returns[2] == 3.0
+
+    def test_discounted_returns_gamma_one(self):
+        """Test that gamma=1 gives undiscounted sum of future rewards."""
+        gamma = 1.0
+
+        deltas = {0: 1.0, 1: 2.0, 2: 3.0}
+        sorted_steps = sorted(deltas.keys())
+
+        cumulative = 0.0
+        returns = {}
+        for step in reversed(sorted_steps):
+            cumulative = deltas[step] + gamma * cumulative
+            returns[step] = cumulative
+
+        # With gamma=1, full sum of future rewards
+        # R_2 = 3.0
+        # R_1 = 2.0 + 3.0 = 5.0
+        # R_0 = 1.0 + 5.0 = 6.0
+        assert returns[2] == 3.0
+        assert returns[1] == 5.0
+        assert returns[0] == 6.0
+
+    def test_discounted_returns_negative_deltas(self):
+        """Test with negative step deltas (losing territory)."""
+        gamma = 0.95
+
+        # A bad start followed by recovery
+        deltas = {0: -2.0, 1: -1.0, 2: 5.0}
+        sorted_steps = sorted(deltas.keys())
+
+        cumulative = 0.0
+        returns = {}
+        for step in reversed(sorted_steps):
+            cumulative = deltas[step] + gamma * cumulative
+            returns[step] = cumulative
+
+        # R_2 = 5.0
+        # R_1 = -1.0 + 0.95 * 5.0 = 3.75
+        # R_0 = -2.0 + 0.95 * 3.75 = 1.5625
+        assert abs(returns[2] - 5.0) < 1e-6
+        assert abs(returns[1] - 3.75) < 1e-6
+        assert abs(returns[0] - 1.5625) < 1e-6
+
+        # Early steps should still get positive credit from later success
+        assert returns[0] > 0
+
+    def test_discounted_returns_single_step(self):
+        """Test with only one step."""
+        gamma = 0.9
+
+        deltas = {0: 5.0}
+        sorted_steps = sorted(deltas.keys())
+
+        cumulative = 0.0
+        returns = {}
+        for step in reversed(sorted_steps):
+            cumulative = deltas[step] + gamma * cumulative
+            returns[step] = cumulative
+
+        assert returns[0] == 5.0
+
+    def test_discount_factor_effect_on_horizon(self):
+        """Test that different gammas weight future differently."""
+        # With 10 steps all having delta=1.0
+        deltas = dict.fromkeys(range(10), 1.0)
+        sorted_steps = sorted(deltas.keys())
+
+        # Compute for different gammas
+        def compute_returns(gamma):
+            cumulative = 0.0
+            returns = {}
+            for step in reversed(sorted_steps):
+                cumulative = deltas[step] + gamma * cumulative
+                returns[step] = cumulative
+            return returns
+
+        returns_low = compute_returns(0.5)
+        returns_mid = compute_returns(0.9)
+        returns_high = compute_returns(0.99)
+
+        # First step should have more credit for future with higher gamma
+        assert returns_low[0] < returns_mid[0] < returns_high[0]
+
+        # Last step should be the same regardless of gamma
+        assert returns_low[9] == returns_mid[9] == returns_high[9] == 1.0

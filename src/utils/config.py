@@ -52,7 +52,38 @@ class ExperimentConfig(BaseModel):
         default="Qwen/Qwen2.5-7B-Instruct",
         description="HuggingFace model ID for base model",
     )
-    lora_rank: int = Field(default=16, description="LoRA adapter rank")
+    lora_rank: int = Field(
+        default=32, description="LoRA adapter rank. Higher = more capacity. 16-64 typical for RLHF."
+    )
+    lora_alpha: int | None = Field(
+        default=None,
+        description=(
+            "LoRA alpha (scaling factor). If None, defaults to 2 * lora_rank. "
+            "Higher alpha = stronger LoRA effect. Typical: 1-2x rank."
+        ),
+    )
+    lora_target_modules: list[str] = Field(
+        default_factory=lambda: [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",  # Attention
+            "gate_proj",
+            "up_proj",
+            "down_proj",  # MLP
+        ],
+        description=(
+            "Which modules to apply LoRA to. Default includes attention + MLP layers. "
+            "Attention only: ['q_proj', 'k_proj', 'v_proj', 'o_proj']. "
+            "More modules = more trainable params but better capacity."
+        ),
+    )
+    lora_dropout: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=0.5,
+        description="Dropout probability for LoRA layers. 0.0-0.1 typical.",
+    )
 
     # =========================================================================
     # Rollout/Environment Settings
@@ -176,6 +207,18 @@ class ExperimentConfig(BaseModel):
         default=0.1,
         ge=0.0,
         description="Weight for forward unit positioning in step scoring (+ per unit outside home)",
+    )
+    reward_discount_gamma: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Discount factor for future step rewards (gamma). "
+            "Each step t receives discounted sum of future deltas: Σ γ^(k-t) × delta_k. "
+            "gamma=1.0 means no discounting (all future steps weighted equally). "
+            "gamma=0.95 gives ~35% weight to rewards 10 steps ahead. "
+            "gamma=0.0 means only immediate step delta (current behavior with gamma=1.0 disabled)."
+        ),
     )
 
     # Strategic awareness reward shaping
@@ -327,7 +370,15 @@ class ExperimentConfig(BaseModel):
     # =========================================================================
     # Training Loop
     # =========================================================================
-    total_steps: int = Field(default=250, description="Total number of training steps")
+    total_steps: int = Field(
+        default=200,
+        description=(
+            "Total number of training steps. "
+            "Empirically, Elo gains plateau around step 100-150 with LR=1e-5. "
+            "Recommendations: 100 for sweeps/ablations, 200 for standard runs, "
+            "300+ for best quality (diminishing returns but more lottery tickets)."
+        ),
+    )
     num_groups_per_step: int = Field(
         default=16,
         description="Number of rollout groups per step (G in GRPO). I.e., how many different game states to start from",
@@ -352,8 +403,21 @@ class ExperimentConfig(BaseModel):
     # =========================================================================
     # Optimizer Settings
     # =========================================================================
-    learning_rate: float = Field(default=5e-6, description="Learning rate for AdamW optimizer")
-    max_grad_norm: float = Field(default=5.0, description="Maximum gradient norm for clipping")
+    learning_rate: float = Field(
+        default=1e-5,
+        description=(
+            "Learning rate for AdamW optimizer. "
+            "For GRPO with LoRA, 1e-5 to 2e-5 is typical. "
+            "Scale up ~linearly with batch size (e.g., 2x batch → 2x LR)."
+        ),
+    )
+    max_grad_norm: float = Field(
+        default=10.0,
+        description=(
+            "Maximum gradient norm for clipping. "
+            "10.0 recommended for GRPO (allows larger updates than default 5.0)."
+        ),
+    )
     chunk_size: int = Field(
         default=8, ge=1, description="Mini-batch size for gradient accumulation (must be >= 1)"
     )
@@ -395,6 +459,44 @@ class ExperimentConfig(BaseModel):
         default=0.5,
         gt=0,
         description="Maximum KL beta when using adaptive control.",
+    )
+
+    # =========================================================================
+    # PPO Clipping Settings (DAPO-style asymmetric clipping)
+    # =========================================================================
+    use_ppo_clipping: bool = Field(
+        default=True,
+        description=(
+            "Enable PPO-style ratio clipping. When False, uses vanilla REINFORCE. "
+            "Clipping prevents large policy updates that could destabilize training."
+        ),
+    )
+    ppo_epsilon_low: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Lower bound for PPO ratio clipping: ratio >= 1 - epsilon_low. "
+            "Limits how much we can decrease an action's probability."
+        ),
+    )
+    ppo_epsilon_high: float = Field(
+        default=0.28,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Upper bound for PPO ratio clipping: ratio <= 1 + epsilon_high. "
+            "DAPO recommends higher than epsilon_low (0.28 vs 0.2) to encourage "
+            "exploration for low-probability actions."
+        ),
+    )
+    use_token_level_loss: bool = Field(
+        default=True,
+        description=(
+            "Weight loss by token count instead of sample count. "
+            "Longer sequences get proportional influence on gradients. "
+            "Recommended for GRPO with variable-length completions."
+        ),
     )
 
     # =========================================================================

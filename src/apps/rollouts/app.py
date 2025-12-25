@@ -961,10 +961,12 @@ def build_trajectories(
         - sc_counts: List of SC counts for hero powers at end of games
         - win_bonus_awarded: Number of games where win bonus was achieved
         - total_games: Total number of games processed
+        - hero_placements: List of hero power placements (rank 1-7) per game
     """
     trajectories = []
     sc_counts: list[int] = []
     win_bonus_awarded = 0
+    hero_placements: list[int] = []  # Track hero power's final rank (1-7)
 
     # Pre-compute final scores for all games (only need to do this once per game)
     # Build position bonuses tuple from config
@@ -992,7 +994,49 @@ def build_trajectories(
     # Track SC counts for hero powers (one entry per game, not per step)
     seen_games_for_sc: set[int] = set()
 
-    # Iterate over all (g_idx, step_count) entries in fork_data
+    # =========================================================================
+    # Pass 1: Collect all step deltas for discounted return computation
+    # =========================================================================
+    # Structure: step_deltas[(g_idx, power)][step_count] = delta
+    step_deltas: dict[tuple[int, str], dict[int, float]] = {}
+
+    for (g_idx, step_count), power_data in fork_data.items():
+        if not power_data:
+            continue
+        for power, data in power_data.items():
+            key = (g_idx, power)
+            if key not in step_deltas:
+                step_deltas[key] = {}
+            score_before = data.get("score_before", 0.0)
+            score_after = data.get("score_after", 0.0)
+            step_deltas[key][step_count] = score_after - score_before
+
+    # =========================================================================
+    # Pass 2: Compute discounted cumulative returns for each (game, power)
+    # =========================================================================
+    # R_t = delta_t + γ * R_{t+1}  (computed backwards from last step)
+    # This gives earlier steps credit for future outcomes
+    discounted_returns: dict[tuple[int, str, int], float] = {}
+    gamma = cfg.reward_discount_gamma
+
+    for (g_idx, power), deltas_by_step in step_deltas.items():
+        if not deltas_by_step:
+            continue
+
+        # Sort steps chronologically
+        sorted_steps = sorted(deltas_by_step.keys())
+
+        # Compute returns backwards (from last step to first)
+        # R_T = delta_T, R_{t} = delta_t + γ * R_{t+1}
+        cumulative = 0.0
+        for step in reversed(sorted_steps):
+            delta = deltas_by_step[step]
+            cumulative = delta + gamma * cumulative
+            discounted_returns[(g_idx, power, step)] = cumulative
+
+    # =========================================================================
+    # Pass 3: Build trajectories using discounted returns
+    # =========================================================================
     for (g_idx, step_count), power_data in fork_data.items():
         if not power_data:
             continue
@@ -1000,14 +1044,36 @@ def build_trajectories(
         game = games[g_idx]
         final_scores = final_scores_by_game[g_idx]
 
-        # Track SC counts once per game (not per step)
+        # Track SC counts and placements once per game (not per step)
         if g_idx not in seen_games_for_sc:
             seen_games_for_sc.add(g_idx)
+
+            # Calculate SC counts and ranks for all powers in this game
+            game_sc_counts = {pn: len(p.centers) for pn, p in game.game.powers.items()}
+            sorted_powers = sorted(game_sc_counts.items(), key=lambda x: x[1], reverse=True)
+
+            # Assign ranks with tie handling (1 = best, 7 = worst)
+            power_ranks: dict[str, int] = {}
+            prev_sc = None
+            prev_rank = 0
+            for i, (power_name, sc_count) in enumerate(sorted_powers):
+                if sc_count == prev_sc:
+                    power_ranks[power_name] = prev_rank
+                else:
+                    power_ranks[power_name] = i + 1
+                    prev_rank = i + 1
+                prev_sc = sc_count
+
             for power in power_data.keys():
                 if adapter_config.hero_power and power != adapter_config.hero_power:
                     continue
                 n_sc = len(game.game.powers[power].centers)
                 sc_counts.append(n_sc)
+
+                # Track hero placement (rank 1-7)
+                hero_rank = power_ranks.get(power, 7)
+                hero_placements.append(hero_rank)
+
                 # Check if this power got win bonus (sole leader above threshold)
                 if n_sc >= cfg.winner_threshold_sc:
                     all_sc = [len(p.centers) for p in game.game.powers.values()]
@@ -1027,15 +1093,10 @@ def build_trajectories(
                 if completion_logprobs:
                     ref_logprobs = sum(completion_logprobs)
 
-            # Compute blended reward: step delta + final outcome
-            # This provides immediate feedback (step delta) while preserving
-            # long-term incentives (final game outcome)
-            score_before = data.get("score_before", 0.0)
-            score_after = data.get("score_after", 0.0)
-            step_delta = score_after - score_before
-
-            # Blend step reward with final game outcome
-            step_component = step_delta * cfg.step_reward_weight
+            # Compute blended reward using discounted cumulative step returns
+            # This gives credit to earlier moves that set up later captures
+            discounted_step_return = discounted_returns.get((g_idx, power, step_count), 0.0)
+            step_component = discounted_step_return * cfg.step_reward_weight
             final_component = final_scores[power] * cfg.final_reward_weight
 
             # Strategic awareness components
@@ -1071,6 +1132,7 @@ def build_trajectories(
         "sc_counts": sc_counts,
         "win_bonus_awarded": win_bonus_awarded,
         "total_games": len(games),
+        "hero_placements": hero_placements,
     }
 
     return trajectories, game_stats
