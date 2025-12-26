@@ -486,13 +486,13 @@ class ExperimentConfig(BaseModel):
         ),
     )
     ppo_epsilon_high: float = Field(
-        default=0.28,
+        default=0.5,
         ge=0.0,
         le=1.0,
         description=(
             "Upper bound for PPO ratio clipping: ratio <= 1 + epsilon_high. "
-            "DAPO recommends higher than epsilon_low (0.28 vs 0.2) to encourage "
-            "exploration for low-probability actions."
+            "Set to 0.5 to accommodate vLLM-HuggingFace logprobs mismatch (~1.49x ratio). "
+            "DAPO recommends higher than epsilon_low to encourage exploration."
         ),
     )
     use_token_level_loss: bool = Field(
@@ -501,6 +501,34 @@ class ExperimentConfig(BaseModel):
             "Weight loss by token count instead of sample count. "
             "Longer sequences get proportional influence on gradients. "
             "Recommended for GRPO with variable-length completions."
+        ),
+    )
+
+    # =========================================================================
+    # Importance Sampling Correction (for vLLM-HuggingFace logprobs mismatch)
+    # =========================================================================
+    importance_sampling_correction: bool = Field(
+        default=True,
+        description=(
+            "Apply importance sampling correction to account for numerical differences "
+            "between vLLM inference logprobs and HuggingFace training logprobs. "
+            "Recommended when using vLLM for rollout generation."
+        ),
+    )
+    importance_sampling_mode: Literal["sequence_truncate", "sequence_mask"] = Field(
+        default="sequence_truncate",
+        description=(
+            "How to handle large IS ratios. "
+            "'sequence_truncate': clip ratios to [1/cap, cap]. "
+            "'sequence_mask': zero out sequences where ratio > cap."
+        ),
+    )
+    importance_sampling_cap: float = Field(
+        default=3.0,
+        ge=1.0,
+        description=(
+            "Cap for importance sampling ratios. TRL default is 3.0. "
+            "Lower values (e.g., 2.0) are more aggressive in limiting mismatch effects."
         ),
     )
 

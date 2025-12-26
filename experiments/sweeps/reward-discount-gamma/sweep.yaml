@@ -32,25 +32,28 @@ defaults:
   # Keep other reward settings at defaults to isolate gamma effect
   step_reward_weight: 0.8
   final_reward_weight: 0.2
-  # Note: kl_beta=0.0 (default) is intentional for domain-specific RL.
-  # We WANT to diverge from base model. Stability comes from PPO clipping,
-  # not KL regularization. (Bug fix: PPO clipping now works properly)
   # Start fresh (don't resume from failed runs)
   disable_auto_resume: true
 
-  # STABILITY TUNING: Balance aggressive learning with stability
-  # Original collapse was due to: 2x LR + 2x grad_norm + no working PPO + no entropy bonus
-  # Now that PPO clipping works and entropy bonus is added, we can be more aggressive.
+  # STABILITY TUNING: KL penalty prevents runaway policy divergence
+  # Without KL penalty, policy can diverge too fast (KL explodes 0.03 → 0.5 in 6 steps)
+  # Small penalty + warmup allows initial exploration then constrains drift
+  kl_beta: 0.01            # Small KL penalty to constrain divergence
+  kl_beta_warmup_steps: 10 # Allow 10 steps of free exploration before penalty kicks in
 
-  learning_rate: 1e-5      # Keep aggressive - PPO clipping protects us
+  learning_rate: 5e-6      # Reduced from 1e-5 - previous runs exploded at step 10
   max_grad_norm: 5.0       # Conservative safety net (was 10.0, too permissive)
   lora_rank: 32            # Keep higher capacity
   entropy_coef: 0.01       # Prevents mode collapse to empty responses
 
-  # PPO tuning: Current clip_fraction ~30% is high (target: 10-20%)
-  # Slightly tighten epsilon to reduce wasted compute on clipped updates
-  ppo_epsilon_low: 0.15    # Was 0.2, tighter = less aggressive decreases
-  ppo_epsilon_high: 0.20   # Was 0.28, tighter = less aggressive increases
+  # PPO tuning: Wide bounds to accommodate vLLM-HuggingFace logprobs mismatch (~0.8-1.5x)
+  # IS correction handles extreme outliers; PPO clipping handles real policy drift
+  ppo_epsilon_low: 0.2     # ratio >= 0.8 (allows HF computing lower logprobs)
+  ppo_epsilon_high: 0.5    # ratio <= 1.5 (allows HF computing higher logprobs)
+
+  # Disable token-level loss weighting to test if it's causing instability
+  # With variable-length completions, longer samples dominate gradients
+  use_token_level_loss: false
 
 # Analysis configuration
 analysis:

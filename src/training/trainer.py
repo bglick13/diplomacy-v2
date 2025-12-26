@@ -46,6 +46,11 @@ class TrajectoryStats:
     effective_batch_size: int = 0  # Final batch size after all skipping
     skip_rate: float = 0.0  # Fraction of input trajectories skipped
 
+    # Logprobs diagnostics
+    logprobs_length_mismatches: int = (
+        0  # Trajectories with completion_logprobs != completion_token_ids length
+    )
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for logging."""
         return {
@@ -215,13 +220,18 @@ def process_trajectories(
                     # Tolerate length mismatch (vLLM sometimes excludes stop token logprobs)
                     ref_logprobs = sum(completion_logprobs)
                     if len(completion_logprobs) != len(completion_token_ids):
-                        # Log mismatch for debugging (only occasionally to avoid spam)
-                        import random
-
-                        if random.random() < 0.1:  # 10% sample rate
+                        stats.logprobs_length_mismatches = (
+                            getattr(stats, "logprobs_length_mismatches", 0) + 1
+                        )
+                        # Log first mismatch with details
+                        if not hasattr(process_trajectories, "_logged_length_mismatch"):
+                            process_trajectories._logged_length_mismatch = True  # type: ignore[attr-defined]
+                            diff = len(completion_token_ids) - len(completion_logprobs)
                             print(
                                 f"⚠️ Logprobs length mismatch: {len(completion_logprobs)} logprobs "
-                                f"vs {len(completion_token_ids)} tokens (using sum anyway)"
+                                f"vs {len(completion_token_ids)} tokens (diff={diff}). "
+                                f"Training will compute logprobs for {len(completion_token_ids)} tokens "
+                                f"but rollout sum only covers {len(completion_logprobs)}."
                             )
             else:
                 # Fallback: tokenize prompt + completion (old path)

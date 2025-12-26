@@ -365,8 +365,14 @@ def parse_completion_logprobs(logprobs_data: Any, token_ids: list[int]) -> list[
 
     Returns:
         List of logprobs for each token
+
+    Note:
+        When a token's logprob is missing (e.g., sampled token not in top-k),
+        we use the minimum logprob from that position as an estimate. This is
+        more accurate than defaulting to 0.0 (which would mean probability=1.0).
     """
     completion_logprobs: list[float] = []
+    missing_count = 0
 
     if not logprobs_data:
         return completion_logprobs
@@ -377,15 +383,41 @@ def parse_completion_logprobs(logprobs_data: Any, token_ids: list[int]) -> list[
             pos_logprobs = logprobs_data[i]
             if pos_logprobs and token_ids[i] in pos_logprobs:
                 completion_logprobs.append(pos_logprobs[token_ids[i]].logprob)
+            elif pos_logprobs:
+                # Token not in top-k, use minimum logprob as conservative estimate
+                # This happens with temperature sampling when a low-prob token is sampled
+                min_logprob = min(lp.logprob for lp in pos_logprobs.values())
+                completion_logprobs.append(min_logprob)
+                missing_count += 1
             else:
-                completion_logprobs.append(0.0)
+                # No logprobs at all - use a conservative default
+                # -10 ≈ log(0.00005) which is very low but not catastrophically wrong
+                completion_logprobs.append(-10.0)
+                missing_count += 1
     else:
         # Handle list[dict[int, Logprob]] format
         for i, pos_logprobs in enumerate(logprobs_data):
             if pos_logprobs and token_ids[i] in pos_logprobs:
                 completion_logprobs.append(pos_logprobs[token_ids[i]].logprob)
+            elif pos_logprobs:
+                # Token not in top-k, use minimum logprob as conservative estimate
+                min_logprob = min(lp.logprob for lp in pos_logprobs.values())
+                completion_logprobs.append(min_logprob)
+                missing_count += 1
             else:
-                completion_logprobs.append(0.0)
+                # No logprobs at all - use a conservative default
+                completion_logprobs.append(-10.0)
+                missing_count += 1
+
+    # Log if significant fraction of logprobs are missing (first occurrence only)
+    if missing_count > 0:
+        missing_rate = missing_count / len(token_ids) if token_ids else 0
+        if missing_rate > 0.1 and not getattr(parse_completion_logprobs, "_logged_missing", False):
+            parse_completion_logprobs._logged_missing = True  # type: ignore[attr-defined]
+            print(
+                f"⚠️ {missing_count}/{len(token_ids)} ({missing_rate:.1%}) token logprobs missing from vLLM. "
+                f"Using min logprob as estimate. Consider increasing logprobs param."
+            )
 
     return completion_logprobs
 
@@ -789,7 +821,7 @@ class InferenceEngine:
                         else:
                             # Debug: Log when logprobs are missing (only first occurrence)
                             if not hasattr(self, "_logged_missing_logprobs"):
-                                self._logged_missing_logprobs = True
+                                self._logged_missing_logprobs = True  # type: ignore[attr-defined]
                                 print(
                                     f"⚠️ vLLM returned no logprobs. "
                                     f"output.logprobs={output.logprobs}, "
@@ -1124,7 +1156,7 @@ class WebInferenceEngine:
                 max_tokens=max_new_tokens,  # type: ignore[arg-type]
                 extra_args={"valid_moves_dict": moves, "start_active": True},  # type: ignore[arg-type]
                 stop=["</orders>", "</Orders>"],  # type: ignore[arg-type]
-                logprobs=1,  # type: ignore[arg-type]
+                logprobs=1,
             )
 
             try:

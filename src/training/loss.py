@@ -141,6 +141,11 @@ class GRPOLossOutput:
     entropy_mean: float = 0.0
     entropy_std: float = 0.0
 
+    # Importance Sampling statistics (vLLM-HuggingFace mismatch correction)
+    is_ratio_mean: float = 1.0  # Raw IS ratio before correction
+    is_ratio_std: float = 0.0
+    is_masked_fraction: float = 0.0  # For mask mode: fraction of samples zeroed
+
 
 class GRPOLoss:
     """
@@ -167,6 +172,9 @@ class GRPOLoss:
         use_token_level_loss: bool = True,
         entropy_coef: float = 0.0,
         entropy_top_k: int = 100,
+        importance_sampling_correction: bool = True,
+        importance_sampling_mode: str = "sequence_truncate",
+        importance_sampling_cap: float = 3.0,
     ):
         """
         Args:
@@ -185,6 +193,9 @@ class GRPOLoss:
                 Set to 0.0 to disable. Typical values: 0.001-0.01.
             entropy_top_k: Number of top tokens to use for entropy approximation.
                 Lower = faster but less accurate. 100 is a good default.
+            importance_sampling_correction: Apply IS correction for vLLM-HF logprobs mismatch.
+            importance_sampling_mode: 'sequence_truncate' (clip ratios) or 'sequence_mask' (zero out).
+            importance_sampling_cap: Cap for IS ratios (TRL default 3.0).
         """
         self.model = model
         self.beta = beta
@@ -196,6 +207,9 @@ class GRPOLoss:
         self.use_token_level_loss = use_token_level_loss
         self.entropy_coef = entropy_coef
         self.entropy_top_k = entropy_top_k
+        self.importance_sampling_correction = importance_sampling_correction
+        self.importance_sampling_mode = importance_sampling_mode
+        self.importance_sampling_cap = importance_sampling_cap
 
     def compute_loss(self, batch: list[dict]) -> GRPOLossOutput:
         """
@@ -363,17 +377,49 @@ class GRPOLoss:
                         f"🔍 Item {i}: ref_logprobs={'ref_logprobs' in b}, rollout_logprobs={'rollout_logprobs' in b}"
                     )
 
+        # Track IS statistics for logging
+        is_ratio_mean = 1.0
+        is_ratio_std = 0.0
+        is_masked_fraction = 0.0
+
         if use_clipping:
             # Extract rollout logprobs (from generation time)
             rollout_log_probs = torch.tensor(
                 [b["rollout_logprobs"] for b in batch], dtype=torch.float32, device=device
             )
 
-            # Compute ratio: π_θ(a|s) / π_old(a|s) where π_old is rollout policy
+            # Compute raw ratio: π_θ(a|s) / π_old(a|s) where π_old is rollout policy
+            # This ratio includes BOTH:
+            # 1. Actual policy drift (what PPO wants to clip)
+            # 2. vLLM-HuggingFace numerical mismatch (systematic bias ~1.49x)
             log_ratio_ppo = completion_log_probs - rollout_log_probs
-            ratio = torch.exp(log_ratio_ppo)
+            ratio_raw = torch.exp(log_ratio_ppo)
 
-            # Compute clipping stats before clamping
+            # Track raw IS ratio stats (before any correction)
+            with torch.no_grad():
+                is_ratio_mean = ratio_raw.mean().item()
+                is_ratio_std = ratio_raw.std().item() if len(ratio_raw) > 1 else 0.0
+
+            # Apply importance sampling correction (TRL-style)
+            # This handles the systematic vLLM-HF mismatch before PPO clipping
+            if self.importance_sampling_correction:
+                cap = self.importance_sampling_cap
+
+                if self.importance_sampling_mode == "sequence_truncate":
+                    # Truncate: clip the IS weight applied to each sample
+                    # This bounds the influence of any single sample due to mismatch
+                    ratio = torch.clamp(ratio_raw, 1.0 / cap, cap)
+                elif self.importance_sampling_mode == "sequence_mask":
+                    # Mask: zero out samples with extreme ratios
+                    mask = (ratio_raw >= 1.0 / cap) & (ratio_raw <= cap)
+                    is_masked_fraction = 1.0 - mask.float().mean().item()
+                    ratio = ratio_raw * mask.float()
+                else:
+                    ratio = ratio_raw
+            else:
+                ratio = ratio_raw
+
+            # Compute PPO clipping stats (after IS correction)
             with torch.no_grad():
                 ratio_mean = ratio.mean().item()
                 ratio_std = ratio.std().item() if len(ratio) > 1 else 0.0
@@ -381,6 +427,24 @@ class GRPOLoss:
                 clipped_low = (ratio < 1.0 - self.ppo_epsilon_low).sum().item()
                 clipped_high = (ratio > 1.0 + self.ppo_epsilon_high).sum().item()
                 ratio_clipped_fraction = (clipped_low + clipped_high) / len(ratio)
+
+            # Debug: Log detailed ratio diagnostics on first batch
+            if not hasattr(self, "_logged_ratio_debug"):
+                self._logged_ratio_debug = True
+                with torch.no_grad():
+                    token_counts = token_mask.sum(dim=1).tolist()
+                    print(
+                        f"\n🔍 PPO Ratio Debug (IS correction={self.importance_sampling_correction}):\n"
+                        f"  completion_log_probs: mean={completion_log_probs.mean().item():.2f}, "
+                        f"std={completion_log_probs.std().item():.2f}\n"
+                        f"  rollout_log_probs:    mean={rollout_log_probs.mean().item():.2f}, "
+                        f"std={rollout_log_probs.std().item():.2f}\n"
+                        f"  raw IS ratio:         mean={is_ratio_mean:.4f}, std={is_ratio_std:.4f}\n"
+                        f"  corrected ratio:      mean={ratio_mean:.4f}, std={ratio_std:.4f}\n"
+                        f"  clip_frac after IS:   {ratio_clipped_fraction:.1%}\n"
+                        f"  token_counts:         mean={sum(token_counts) / len(token_counts):.1f}\n"
+                        f"  PPO bounds:           [{1 - self.ppo_epsilon_low:.2f}, {1 + self.ppo_epsilon_high:.2f}]"
+                    )
 
             # Asymmetric clipping: lower bound tighter than upper for exploration
             clipped_ratio = torch.clamp(
@@ -438,4 +502,7 @@ class GRPOLoss:
             rollout_logprobs_rate=rollout_logprobs_count / len(batch) if batch else 0.0,
             entropy_mean=entropy_mean,
             entropy_std=entropy_std,
+            is_ratio_mean=is_ratio_mean,
+            is_ratio_std=is_ratio_std,
+            is_masked_fraction=is_masked_fraction,
         )

@@ -516,23 +516,24 @@ def log_elo_to_wandb(
     """Log Elo metrics to WandB."""
     try:
         wandb.init(id=wandb_run_id, resume="allow", project="diplomacy-grpo")
-        wandb.log(
-            {
-                "elo/challenger": challenger_elo,
-                "elo/win_rate": win_rate,
-                "elo/games_played": total_games,
-                "elo/evaluation_step": training_step,
-            }
-        )
-        # Log per-opponent-type win rates
+        # Build all metrics in a single dict to avoid multiple wandb.log calls
+        # (each call increments WandB's internal step counter)
+        metrics: dict[str, float] = {
+            "elo/challenger": challenger_elo,
+            "elo/win_rate": win_rate,
+            "elo/games_played": total_games,
+            "elo/evaluation_step": training_step,
+        }
+        # Add per-opponent-type win rates
         if opponent_win_rates:
             for opp_type, opp_rate in opponent_win_rates.items():
-                wandb.log({f"elo/vs_{opp_type}_win_rate": opp_rate})
-        # Log Elo for all tracked agents
+                metrics[f"elo/vs_{opp_type}_win_rate"] = opp_rate
+        # Add Elo for all tracked agents
         for agent_name, elo in all_elos.items():
             if agent_name in [a.name for a in all_agents]:
                 safe_name = agent_name.replace("/", "_")
-                wandb.log({f"elo/{safe_name}": elo})
+                metrics[f"elo/{safe_name}"] = elo
+        wandb.log(metrics)
     except Exception as e:
         logger.warning(f"Failed to log to WandB: {e}")
 
@@ -1340,8 +1341,10 @@ async def evaluate_against_benchmarks(
     if wandb_run_id:
         try:
             wandb.init(id=wandb_run_id, resume="allow", project="diplomacy-grpo")
-            wandb.log(suite_result.to_wandb_dict())
-            wandb.log({"benchmark/evaluation_step": training_step})
+            # Single wandb.log call to avoid incrementing step counter multiple times
+            metrics = suite_result.to_wandb_dict()
+            metrics["benchmark/evaluation_step"] = training_step
+            wandb.log(metrics)
         except Exception as e:
             logger.warning(f"Failed to log to WandB: {e}")
 

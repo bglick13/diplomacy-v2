@@ -1,0 +1,152 @@
+# Ablation Study: Identify Source of Training Instability
+#
+# Training was stable before commit 6ea97cbb0. This sweep isolates each change
+# to identify which one(s) cause the instability (KL explosion, clip_frac > 60%).
+#
+# Changes since stable baseline:
+# 1. PPO clipping (ratio-based policy gradient)
+# 2. Token-level loss weighting (longer sequences weighted more)
+# 3. LoRA rank 16 → 32 (2x trainable params)
+# 4. LoRA target modules: added MLP layers (3x more params)
+# 5. Entropy bonus (encourages exploration)
+# 6. KL penalty with warmup
+# 7. IS correction for vLLM-HF mismatch
+#
+# Methodology: Start with known-stable config, add ONE change per run.
+
+metadata:
+  name: "stability-ablation"
+  description: "Isolate which change causes training instability"
+  hypothesis: |
+    One or more of the changes since 6ea97cbb0 causes training instability.
+    By testing each in isolation, we can identify the culprit(s).
+
+    Suspects ranked by likelihood:
+    1. LoRA rank increase (2x params = 2x capacity to diverge)
+    2. PPO clipping (new loss computation)
+    3. Token-level loss (variable weighting)
+    4. Entropy bonus (additional loss term)
+  experiment_tag_prefix: "stability-ablation"
+  created: "2024-12-26"
+  author: "claude-code"
+
+# Stable baseline config (before 6ea97cbb0)
+defaults:
+  total_steps: 20  # Short runs to quickly identify instability
+  disable_auto_resume: true
+
+  # Conservative LR to give each variant a fair chance
+  learning_rate: 5e-6
+  max_grad_norm: 5.0
+
+  # BASELINE: All new features OFF
+  use_ppo_clipping: false      # Vanilla REINFORCE
+  use_token_level_loss: false  # Equal sample weighting
+  entropy_coef: 0.0            # No entropy bonus
+  kl_beta: 0.0                 # No KL penalty
+  importance_sampling_correction: false  # No IS correction
+
+  # BASELINE: Old LoRA config
+  lora_rank: 16                # Was 16, changed to 32
+  lora_target_modules:         # Attention only (old config, no MLP)
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+
+  # Keep reward settings constant
+  reward_discount_gamma: 0.0   # No discounting (isolate other changes)
+  step_reward_weight: 0.8
+  final_reward_weight: 0.2
+
+# Success criteria
+analysis:
+  primary_metric: "kl/mean"
+  secondary_metrics:
+    - "ppo/clip_fraction"
+    - "benchmark/grad_norm"
+    - "benchmark/loss"
+  success_criteria:
+    - "KL stays < 0.5 through step 30"
+    - "Grad norm stays < 20"
+    - "Loss stays negative or near zero"
+
+runs:
+  # =========================================================================
+  # BASELINE: Should be stable (all old settings)
+  # =========================================================================
+  A:
+    name: "baseline-stable"
+    description: "All old settings - should be stable. If not, problem is elsewhere."
+    config:
+      experiment_tag: "${metadata.experiment_tag_prefix}-A-baseline"
+
+  # =========================================================================
+  # TEST EACH CHANGE IN ISOLATION
+  # =========================================================================
+  B:
+    name: "add-ppo-clipping"
+    description: "Baseline + PPO clipping only"
+    config:
+      use_ppo_clipping: true
+      ppo_epsilon_low: 0.2
+      ppo_epsilon_high: 0.5
+      experiment_tag: "${metadata.experiment_tag_prefix}-B-ppo-clip"
+
+  C:
+    name: "add-token-level-loss"
+    description: "Baseline + token-level loss weighting only"
+    config:
+      use_token_level_loss: true
+      experiment_tag: "${metadata.experiment_tag_prefix}-C-token-loss"
+
+  D:
+    name: "add-lora-rank-32"
+    description: "Baseline + LoRA rank 32 (2x params)"
+    config:
+      lora_rank: 32
+      experiment_tag: "${metadata.experiment_tag_prefix}-D-lora32"
+
+  E:
+    name: "add-entropy-bonus"
+    description: "Baseline + entropy bonus only"
+    config:
+      entropy_coef: 0.01
+      experiment_tag: "${metadata.experiment_tag_prefix}-E-entropy"
+
+  F:
+    name: "add-kl-penalty"
+    description: "Baseline + KL penalty (no warmup)"
+    config:
+      kl_beta: 0.01
+      kl_beta_warmup_steps: 0  # Immediate penalty
+      experiment_tag: "${metadata.experiment_tag_prefix}-F-kl"
+
+  G:
+    name: "add-mlp-modules"
+    description: "Baseline + MLP target modules (3x more params than attention-only)"
+    config:
+      lora_target_modules:
+        - "q_proj"
+        - "k_proj"
+        - "v_proj"
+        - "o_proj"
+        - "gate_proj"
+        - "up_proj"
+        - "down_proj"
+      experiment_tag: "${metadata.experiment_tag_prefix}-G-mlp"
+
+  H:
+    name: "add-lora-full"
+    description: "Baseline + LoRA rank 32 + MLP modules (current config, 6x params)"
+    config:
+      lora_rank: 32
+      lora_target_modules:
+        - "q_proj"
+        - "k_proj"
+        - "v_proj"
+        - "o_proj"
+        - "gate_proj"
+        - "up_proj"
+        - "down_proj"
+      experiment_tag: "${metadata.experiment_tag_prefix}-H-lora-full"

@@ -1055,6 +1055,10 @@ def build_wandb_metrics(
         # Policy entropy diagnostics (GTPO-style collapse detection)
         "policy/entropy_mean": step_metrics.get("entropy_mean", 0.0),
         "policy/entropy_std": step_metrics.get("entropy_std", 0.0),
+        # Importance sampling diagnostics (vLLM-HuggingFace mismatch correction)
+        "ppo/is_ratio_mean": step_metrics.get("is_ratio_mean", 1.0),
+        "ppo/is_ratio_std": step_metrics.get("is_ratio_std", 0.0),
+        "ppo/is_masked_fraction": step_metrics.get("is_masked_fraction", 0.0),
     }
 
     # NOTE: Cache metrics (cache/hit_rate, etc.) were removed because they never
@@ -1230,10 +1234,18 @@ def initialize_model_and_optimizer(
         use_token_level_loss=cfg.use_token_level_loss,
         entropy_coef=cfg.entropy_coef,
         entropy_top_k=cfg.entropy_top_k,
+        importance_sampling_correction=cfg.importance_sampling_correction,
+        importance_sampling_mode=cfg.importance_sampling_mode,
+        importance_sampling_cap=cfg.importance_sampling_cap,
     )
     if cfg.use_ppo_clipping:
         logger.info(
             f"📊 PPO clipping enabled: ε_low={cfg.ppo_epsilon_low}, ε_high={cfg.ppo_epsilon_high}"
+        )
+    if cfg.importance_sampling_correction:
+        logger.info(
+            f"📊 IS correction enabled: mode={cfg.importance_sampling_mode}, "
+            f"cap={cfg.importance_sampling_cap}"
         )
     if cfg.use_token_level_loss:
         logger.info("📊 Token-level loss weighting enabled")
@@ -1566,6 +1578,10 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     # Entropy metrics
                     "entropy_mean": train_metrics["entropy_mean"],
                     "entropy_std": train_metrics["entropy_std"],
+                    # Importance sampling metrics (vLLM-HF mismatch correction)
+                    "is_ratio_mean": train_metrics["is_ratio_mean"],
+                    "is_ratio_std": train_metrics["is_ratio_std"],
+                    "is_masked_fraction": train_metrics["is_masked_fraction"],
                     "reward_mean": traj_stats.reward_mean,
                     "reward_std": traj_stats.reward_std,
                     "total_tokens": traj_stats.total_tokens,
@@ -1863,6 +1879,10 @@ def _run_training_step(
     # Entropy metrics (GTPO-style)
     accum_entropy_mean = 0.0
     accum_entropy_std = 0.0
+    # Importance sampling metrics (vLLM-HF mismatch correction)
+    accum_is_ratio_mean = 0.0
+    accum_is_ratio_std = 0.0
+    accum_is_masked_fraction = 0.0
     # Use ceiling division to correctly count partial chunks at the end
     total_chunks = (len(batch_data) + cfg.chunk_size - 1) // cfg.chunk_size
 
@@ -1897,6 +1917,10 @@ def _run_training_step(
         # Entropy metrics
         accum_entropy_mean += loss_output.entropy_mean
         accum_entropy_std += loss_output.entropy_std
+        # Importance sampling metrics
+        accum_is_ratio_mean += loss_output.is_ratio_mean
+        accum_is_ratio_std += loss_output.is_ratio_std
+        accum_is_masked_fraction += loss_output.is_masked_fraction
 
     with profile_section(step_profile, "optimizer_step"):
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1925,6 +1949,10 @@ def _run_training_step(
         # Entropy metrics (GTPO-style)
         "entropy_mean": accum_entropy_mean / max(1, num_chunks),
         "entropy_std": accum_entropy_std / max(1, num_chunks),
+        # Importance sampling metrics (vLLM-HF mismatch correction)
+        "is_ratio_mean": accum_is_ratio_mean / max(1, num_chunks),
+        "is_ratio_std": accum_is_ratio_std / max(1, num_chunks),
+        "is_masked_fraction": accum_is_masked_fraction / max(1, num_chunks),
     }
 
 
