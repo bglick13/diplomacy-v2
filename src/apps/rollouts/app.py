@@ -728,12 +728,21 @@ async def process_synchronized_step(
 
             # Collect fork data if needed
             if collect_fork_data and adapter_config.should_collect_power(power_name):
+                # Debug: Log if logprobs are missing (first occurrence only)
+                logprobs = response_data.get("completion_logprobs", [])
+                if not logprobs and not hasattr(run_batched_inference, "_logged_missing_logprobs"):
+                    run_batched_inference._logged_missing_logprobs = True
+                    logger.warning(
+                        f"⚠️ Missing completion_logprobs in response_data. "
+                        f"Keys: {list(response_data.keys())}, "
+                        f"token_ids count: {len(response_data.get('token_ids', []))}"
+                    )
                 fork_data_for_step[power_name] = {
                     "prompt": fork_inputs_dict["prompts"][power_idx],
                     "completion": response_text,
                     "prompt_token_ids": response_data.get("prompt_token_ids", []),
                     "completion_token_ids": response_data.get("token_ids", []),
-                    "completion_logprobs": response_data.get("completion_logprobs", []),
+                    "completion_logprobs": logprobs,
                     # Store step-time metadata (not final game state)
                     "orders_expected": expected_count,
                     "year": game.get_year(),

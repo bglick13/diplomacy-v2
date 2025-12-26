@@ -505,6 +505,27 @@ class ExperimentConfig(BaseModel):
     )
 
     # =========================================================================
+    # Entropy Bonus Settings (prevents mode collapse)
+    # =========================================================================
+    entropy_coef: float = Field(
+        default=0.01,
+        ge=0.0,
+        description=(
+            "Coefficient for entropy bonus in loss. Higher = more exploration. "
+            "Prevents policy from collapsing to deterministic outputs. "
+            "Set to 0.0 to disable. Typical values: 0.001-0.01."
+        ),
+    )
+    entropy_top_k: int = Field(
+        default=100,
+        ge=10,
+        description=(
+            "Number of top tokens to use for memory-efficient entropy approximation. "
+            "Lower = faster but less accurate. 100 captures most probability mass."
+        ),
+    )
+
+    # =========================================================================
     # Advantage Processing Settings
     # =========================================================================
     advantage_clip: float | None = Field(

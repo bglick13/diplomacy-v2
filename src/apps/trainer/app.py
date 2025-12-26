@@ -239,6 +239,14 @@ def initialize_league_training(cfg: ExperimentConfig) -> LeagueContext | None:
     else:
         registry_path = Path(f"/data/league_{cfg.run_name}.json")
 
+    # When disable_auto_resume is set, also reset the league registry
+    # unless explicitly inheriting from another run
+    if cfg.disable_auto_resume and not cfg.league_inherit_from and registry_path.exists():
+        logger.warning(
+            f"🗑️ Resetting league registry due to disable_auto_resume (was: {registry_path})"
+        )
+        registry_path.unlink()
+
     logger.info(f"📂 League registry path: {registry_path}")
     league_registry = LeagueRegistry(registry_path, run_name=cfg.run_name)
 
@@ -1043,6 +1051,7 @@ def build_wandb_metrics(
         "ppo/ratio_mean": step_metrics.get("ratio_mean", 1.0),
         "ppo/ratio_std": step_metrics.get("ratio_std", 0.0),
         "ppo/clip_fraction": step_metrics.get("ratio_clipped_fraction", 0.0),
+        "ppo/rollout_logprobs_rate": step_metrics.get("rollout_logprobs_rate", 0.0),
         # Policy entropy diagnostics (GTPO-style collapse detection)
         "policy/entropy_mean": step_metrics.get("entropy_mean", 0.0),
         "policy/entropy_std": step_metrics.get("entropy_std", 0.0),
@@ -1219,6 +1228,8 @@ def initialize_model_and_optimizer(
         ppo_epsilon_low=cfg.ppo_epsilon_low,
         ppo_epsilon_high=cfg.ppo_epsilon_high,
         use_token_level_loss=cfg.use_token_level_loss,
+        entropy_coef=cfg.entropy_coef,
+        entropy_top_k=cfg.entropy_top_k,
     )
     if cfg.use_ppo_clipping:
         logger.info(
@@ -1226,6 +1237,8 @@ def initialize_model_and_optimizer(
         )
     if cfg.use_token_level_loss:
         logger.info("📊 Token-level loss weighting enabled")
+    if cfg.entropy_coef > 0:
+        logger.info(f"📊 Entropy bonus enabled: coef={cfg.entropy_coef}, top_k={cfg.entropy_top_k}")
 
     return policy_model, optimizer, tokenizer, loss_fn, kl_controller
 
@@ -1545,6 +1558,14 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     "effective_beta": train_metrics["effective_beta"],
                     "grad_norm": train_metrics["grad_norm"],
                     "used_cached_ref_logprobs": train_metrics["used_cached_ref_logprobs"],
+                    # PPO clipping metrics (DAPO-style)
+                    "ratio_mean": train_metrics["ratio_mean"],
+                    "ratio_std": train_metrics["ratio_std"],
+                    "ratio_clipped_fraction": train_metrics["ratio_clipped_fraction"],
+                    "rollout_logprobs_rate": train_metrics["rollout_logprobs_rate"],
+                    # Entropy metrics
+                    "entropy_mean": train_metrics["entropy_mean"],
+                    "entropy_std": train_metrics["entropy_std"],
                     "reward_mean": traj_stats.reward_mean,
                     "reward_std": traj_stats.reward_std,
                     "total_tokens": traj_stats.total_tokens,
@@ -1838,6 +1859,7 @@ def _run_training_step(
     accum_ratio_mean = 0.0
     accum_ratio_std = 0.0
     accum_ratio_clipped = 0.0
+    accum_rollout_logprobs_rate = 0.0
     # Entropy metrics (GTPO-style)
     accum_entropy_mean = 0.0
     accum_entropy_std = 0.0
@@ -1871,6 +1893,7 @@ def _run_training_step(
         accum_ratio_mean += loss_output.ratio_mean
         accum_ratio_std += loss_output.ratio_std
         accum_ratio_clipped += loss_output.ratio_clipped_fraction
+        accum_rollout_logprobs_rate += loss_output.rollout_logprobs_rate
         # Entropy metrics
         accum_entropy_mean += loss_output.entropy_mean
         accum_entropy_std += loss_output.entropy_std
@@ -1898,6 +1921,7 @@ def _run_training_step(
         "ratio_mean": accum_ratio_mean / max(1, num_chunks),
         "ratio_std": accum_ratio_std / max(1, num_chunks),
         "ratio_clipped_fraction": accum_ratio_clipped / max(1, num_chunks),
+        "rollout_logprobs_rate": accum_rollout_logprobs_rate / max(1, num_chunks),
         # Entropy metrics (GTPO-style)
         "entropy_mean": accum_entropy_mean / max(1, num_chunks),
         "entropy_std": accum_entropy_std / max(1, num_chunks),

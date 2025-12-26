@@ -859,7 +859,7 @@ class TestEntropyMonitoring:
         return MockPeftModel()
 
     def test_entropy_fields_exist(self, mock_model):
-        """Test that entropy fields exist in output (currently disabled, returns 0)."""
+        """Test that entropy fields exist in output with reasonable values."""
         from src.training.loss import GRPOLoss
 
         loss_fn = GRPOLoss(mock_model, beta=0.0)
@@ -875,15 +875,16 @@ class TestEntropyMonitoring:
 
         output = loss_fn.compute_loss(batch)
 
-        # Entropy fields should exist (currently disabled, returns 0)
+        # Entropy fields should exist with reasonable values
         assert hasattr(output, "entropy_mean")
         assert hasattr(output, "entropy_std")
-        # Currently disabled - returns 0.0
-        assert output.entropy_mean == 0.0
+        # Entropy should be positive (top-k approximation)
+        assert output.entropy_mean >= 0.0
+        # Single sample, std should be 0
         assert output.entropy_std == 0.0
 
-    def test_entropy_statistics_disabled(self, mock_model):
-        """Test that entropy statistics are 0 when disabled."""
+    def test_entropy_statistics_computed(self, mock_model):
+        """Test that entropy statistics are computed correctly for multiple samples."""
         from src.training.loss import GRPOLoss
 
         loss_fn = GRPOLoss(mock_model, beta=0.0)
@@ -905,9 +906,10 @@ class TestEntropyMonitoring:
 
         output = loss_fn.compute_loss(batch)
 
-        # Entropy is currently disabled, should be 0
-        assert output.entropy_mean == 0.0
-        assert output.entropy_std == 0.0
+        # Entropy should be positive (computed via top-k approximation)
+        assert output.entropy_mean > 0.0
+        # With 2 samples, std might be small but can be computed
+        assert output.entropy_std >= 0.0
 
 
 # =============================================================================

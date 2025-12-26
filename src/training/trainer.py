@@ -202,13 +202,27 @@ def process_trajectories(
                 labels = input_ids.clone()
                 labels[:prompt_len] = -100
 
-                # Process reference logprobs if available
-                # IMPORTANT: Only use if ALL trajectories in the batch will have them
-                # Otherwise, the loss function will mix cached and computed ref logprobs
+                # Process rollout logprobs if available
+                # These are the logprobs from the policy that generated the completion
+                # Used for: (1) KL divergence baseline, (2) PPO ratio computation
+                #
+                # Note: We use "ref_logprobs" naming for backward compatibility, but these
+                # are actually ROLLOUT policy logprobs, not reference (base) model logprobs.
+                # For true reference model KL, use compute_ref_logprobs_in_rollout=True.
                 ref_logprobs = None
-                if completion_logprobs and len(completion_logprobs) == len(completion_token_ids):
+                if completion_logprobs:
                     # Sum completion logprobs to get sequence-level logprob
+                    # Tolerate length mismatch (vLLM sometimes excludes stop token logprobs)
                     ref_logprobs = sum(completion_logprobs)
+                    if len(completion_logprobs) != len(completion_token_ids):
+                        # Log mismatch for debugging (only occasionally to avoid spam)
+                        import random
+
+                        if random.random() < 0.1:  # 10% sample rate
+                            print(
+                                f"⚠️ Logprobs length mismatch: {len(completion_logprobs)} logprobs "
+                                f"vs {len(completion_token_ids)} tokens (using sum anyway)"
+                            )
             else:
                 # Fallback: tokenize prompt + completion (old path)
                 stats.fallback_tokenized_count += 1

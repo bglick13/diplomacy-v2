@@ -10,7 +10,7 @@
 # This addresses the temporal credit assignment problem in multi-turn games.
 
 metadata:
-  name: "reward-discount-gamma"
+  name: "reward-discount-gamma-v2"
   description: "Ablation: Discount factor for temporal credit assignment"
   hypothesis: |
     Propagating future rewards backwards (gamma > 0) will improve learning by:
@@ -32,9 +32,25 @@ defaults:
   # Keep other reward settings at defaults to isolate gamma effect
   step_reward_weight: 0.8
   final_reward_weight: 0.2
-  # Add KL regularization for stability (prevents mode collapse with gamma=0.0)
-  kl_beta: 0.04
-  kl_beta_warmup_steps: 10
+  # Note: kl_beta=0.0 (default) is intentional for domain-specific RL.
+  # We WANT to diverge from base model. Stability comes from PPO clipping,
+  # not KL regularization. (Bug fix: PPO clipping now works properly)
+  # Start fresh (don't resume from failed runs)
+  disable_auto_resume: true
+
+  # STABILITY TUNING: Balance aggressive learning with stability
+  # Original collapse was due to: 2x LR + 2x grad_norm + no working PPO + no entropy bonus
+  # Now that PPO clipping works and entropy bonus is added, we can be more aggressive.
+
+  learning_rate: 1e-5      # Keep aggressive - PPO clipping protects us
+  max_grad_norm: 5.0       # Conservative safety net (was 10.0, too permissive)
+  lora_rank: 32            # Keep higher capacity
+  entropy_coef: 0.01       # Prevents mode collapse to empty responses
+
+  # PPO tuning: Current clip_fraction ~30% is high (target: 10-20%)
+  # Slightly tighten epsilon to reduce wasted compute on clipped updates
+  ppo_epsilon_low: 0.15    # Was 0.2, tighter = less aggressive decreases
+  ppo_epsilon_high: 0.20   # Was 0.28, tighter = less aggressive increases
 
 # Analysis configuration
 analysis:

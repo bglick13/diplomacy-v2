@@ -135,6 +135,7 @@ class GRPOLossOutput:
     ratio_mean: float = 1.0
     ratio_std: float = 0.0
     ratio_clipped_fraction: float = 0.0  # Fraction of samples that hit clip bounds
+    rollout_logprobs_rate: float = 0.0  # Fraction of batch items with rollout_logprobs
 
     # Policy entropy (GTPO-style monitoring)
     entropy_mean: float = 0.0
@@ -164,6 +165,8 @@ class GRPOLoss:
         ppo_epsilon_low: float = 0.2,
         ppo_epsilon_high: float = 0.28,
         use_token_level_loss: bool = True,
+        entropy_coef: float = 0.0,
+        entropy_top_k: int = 100,
     ):
         """
         Args:
@@ -178,6 +181,10 @@ class GRPOLoss:
             ppo_epsilon_high: Upper bound for ratio clipping (ratio <= 1 + epsilon_high).
                 Higher than epsilon_low to encourage exploration.
             use_token_level_loss: Weight loss by token count instead of sample count.
+            entropy_coef: Coefficient for entropy bonus. Higher = more exploration.
+                Set to 0.0 to disable. Typical values: 0.001-0.01.
+            entropy_top_k: Number of top tokens to use for entropy approximation.
+                Lower = faster but less accurate. 100 is a good default.
         """
         self.model = model
         self.beta = beta
@@ -187,6 +194,8 @@ class GRPOLoss:
         self.ppo_epsilon_low = ppo_epsilon_low
         self.ppo_epsilon_high = ppo_epsilon_high
         self.use_token_level_loss = use_token_level_loss
+        self.entropy_coef = entropy_coef
+        self.entropy_top_k = entropy_top_k
 
     def compute_loss(self, batch: list[dict]) -> GRPOLossOutput:
         """
@@ -242,10 +251,25 @@ class GRPOLoss:
         token_log_probs = token_log_probs_raw * token_mask
         num_completion_tokens = token_mask.sum().int().item()
 
-        # 4a. Entropy monitoring disabled - computing full softmax over 150k vocab is too expensive
-        # TODO: Re-enable with memory-efficient approximation (e.g., top-k entropy or sampling)
-        entropy_mean = 0.0
-        entropy_std = 0.0
+        # 4a. Memory-efficient entropy via top-k approximation
+        # Computing full softmax over 128k vocab is too expensive, so we use top-k tokens
+        # which contain most of the probability mass. This is accurate for peaked distributions.
+        # Always compute for monitoring; only add to loss if entropy_coef > 0
+        # Get top-k logits (memory: batch * seq * k instead of batch * seq * vocab)
+        top_logits, _ = logits.topk(self.entropy_top_k, dim=-1)
+        # Compute softmax over top-k only (renormalized)
+        top_log_probs = F.log_softmax(top_logits, dim=-1)
+        top_probs = top_log_probs.exp()
+        # Entropy = -sum(p * log(p)) for each position
+        token_entropy = -(top_probs * top_log_probs).sum(dim=-1)  # (batch, seq)
+        # Mask to only count completion tokens
+        masked_entropy = token_entropy * token_mask
+        # Average over completion tokens
+        entropy_per_sample = masked_entropy.sum(dim=1) / token_mask.sum(dim=1).clamp(min=1)
+        entropy_mean = entropy_per_sample.mean().item()
+        entropy_std = entropy_per_sample.std().item() if len(entropy_per_sample) > 1 else 0.0
+        # For loss: mean entropy across batch (with gradient)
+        mean_entropy_for_loss = entropy_per_sample.mean()
 
         # Sum log probs over the completion length per sequence
         completion_log_probs = token_log_probs.sum(dim=1)
@@ -317,20 +341,26 @@ class GRPOLoss:
         ratio_clipped_fraction = 0.0
 
         # Determine if we can use PPO clipping
-        has_rollout_logprobs = all("rollout_logprobs" in b for b in batch)
+        rollout_logprobs_count = sum(1 for b in batch if "rollout_logprobs" in b)
+        has_rollout_logprobs = rollout_logprobs_count == len(batch)
         use_clipping = self.use_ppo_clipping and has_rollout_logprobs
 
-        # Debug: Log if PPO clipping is unexpectedly disabled
-        if self.use_ppo_clipping and not has_rollout_logprobs:
-            missing_count = sum(1 for b in batch if "rollout_logprobs" not in b)
-            # Only log occasionally to avoid spam
-            if len(batch) > 0 and missing_count > 0:
-                import random
-
-                if random.random() < 0.01:  # 1% sample rate
+        # Debug: Always log the first batch to diagnose PPO clipping issues
+        if not hasattr(self, "_logged_ppo_debug"):
+            self._logged_ppo_debug = True
+            print(
+                f"🔍 PPO Debug: use_ppo_clipping={self.use_ppo_clipping}, "
+                f"has_rollout_logprobs={has_rollout_logprobs}, "
+                f"rollout_logprobs_count={rollout_logprobs_count}/{len(batch)}, "
+                f"all_have_ref_logprobs={all_have_ref_logprobs}"
+            )
+            if batch:
+                sample_keys = list(batch[0].keys())
+                print(f"🔍 Sample batch item keys: {sample_keys}")
+                # Sample a few items to see their ref_logprobs and rollout_logprobs status
+                for i, b in enumerate(batch[:3]):
                     print(
-                        f"⚠️ PPO clipping disabled: {missing_count}/{len(batch)} items "
-                        "missing rollout_logprobs"
+                        f"🔍 Item {i}: ref_logprobs={'ref_logprobs' in b}, rollout_logprobs={'rollout_logprobs' in b}"
                     )
 
         if use_clipping:
@@ -372,7 +402,12 @@ class GRPOLoss:
 
         total_loss = pg_loss + (effective_beta * kl)
 
-        # 7b. Token-Level Loss Weighting (DAPO-style)
+        # 7b. Entropy Bonus (prevents mode collapse)
+        # Subtract entropy from loss (we want to MAXIMIZE entropy = minimize -entropy)
+        if self.entropy_coef > 0:
+            total_loss = total_loss - (self.entropy_coef * mean_entropy_for_loss)
+
+        # 7c. Token-Level Loss Weighting (DAPO-style)
         # Weight samples by their token count so longer sequences contribute proportionally
         if self.use_token_level_loss:
             token_counts = token_mask.sum(dim=1)  # Tokens per sample
@@ -400,6 +435,7 @@ class GRPOLoss:
             ratio_mean=ratio_mean,
             ratio_std=ratio_std,
             ratio_clipped_fraction=ratio_clipped_fraction,
+            rollout_logprobs_rate=rollout_logprobs_count / len(batch) if batch else 0.0,
             entropy_mean=entropy_mean,
             entropy_std=entropy_std,
         )

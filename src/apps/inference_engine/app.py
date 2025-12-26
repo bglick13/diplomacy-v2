@@ -786,6 +786,15 @@ class InferenceEngine:
                             completion_logprobs = parse_completion_logprobs(
                                 output.logprobs, token_ids
                             )
+                        else:
+                            # Debug: Log when logprobs are missing (only first occurrence)
+                            if not hasattr(self, "_logged_missing_logprobs"):
+                                self._logged_missing_logprobs = True
+                                print(
+                                    f"⚠️ vLLM returned no logprobs. "
+                                    f"output.logprobs={output.logprobs}, "
+                                    f"token_count={len(token_ids)}"
+                                )
 
                 return {
                     "text": text,
