@@ -12,6 +12,7 @@ Diagnose GRPO training runs using WandB metrics and Axiom logs.
 | Question | Command |
 |----------|---------|
 | **Full Elo analysis** | `uv run python .claude/skills/experiment-analysis/analyze_elo.py <run>` |
+| **Compare sweep runs** | `uv run python .claude/skills/experiment-analysis/analyze_sweep.py --sweep <prefix>` |
 | Is model learning? | `uv run python scripts/wandb_cli.py get-metrics -r <run> --all-metrics` |
 | Rollout throughput? | `uv run python scripts/axiom_cli.py rollout-timing --last 6h` |
 | Any errors? | `uv run python scripts/axiom_cli.py errors --last 1h` |
@@ -42,13 +43,20 @@ Real-time logs and events. Use for:
 
 ## Key Metrics
 
-### Learning Signal
+### Learning Signal (Fixed Reference Analysis)
+
+**Key insight:** Win rate against a dynamic league is meaningless. Use FIXED references.
+
 | Metric | Good Sign | Bad Sign |
 |--------|-----------|----------|
-| Older checkpoint Elo | Declining | Stable |
+| base_model Elo | Declining | Stable/Rising |
 | Baseline bot Elo | Declining (exploited) | Rising |
-| reward_mean | Stable or rising | Declining |
+| Best checkpoint - base_model gap | Growing | Shrinking |
+| Older checkpoint Elo | Declining | Stable |
 | KL divergence | Stable <0.1 | Spikes >0.2 |
+
+**Fixed references** (base_model, chaos_bot, etc.) don't change, so their Elo changes = learning.
+**Elo gap** (best checkpoint - base_model) measures how much better trained model is.
 
 ### Performance
 | Metric | Target | Action if Miss |

@@ -1,0 +1,94 @@
+# Ablation: Does MLP Add Value When Properly Constrained?
+#
+# Finding from stability-ablation sweep:
+# - Run F (attention-only + KL penalty) was BEST: 27.3% win, 5.33 SC
+# - Run G (MLP modules) had 5x higher KL but similar performance
+# - Run D (rank 32 attention-only) was WORST: 4.7% win
+#
+# Hypothesis: MLP layers store "knowledge", attention stores "routing".
+# Without MLP, model can only re-route existing knowledge, not learn new strategies.
+#
+# This sweep tests: Does MLP help when KL-constrained?
+
+metadata:
+  name: "mlp-ablation"
+  description: "Test if MLP modules improve learning when KL-constrained"
+  hypothesis: |
+    MLP layers are needed to learn Diplomacy-specific knowledge.
+    Attention-only can re-route existing knowledge but can't acquire new strategies.
+
+    With KL penalty constraining divergence, MLP should be stable AND better.
+
+    Expected outcomes:
+    - If B (with MLP) outperforms A → MLP helps, use it
+    - If B explodes → MLP needs more constraints (try differential rank)
+    - If B same/worse → Attention-only sufficient, skip MLP complexity
+  experiment_tag_prefix: "mlp-ablation"
+  created: "2024-12-26"
+  author: "claude-code"
+
+# Base config: Run F settings (the winner) + longer training
+defaults:
+  total_steps: 75
+  disable_auto_resume: true
+
+  # Learning rate that was stable for all configs
+  learning_rate: 5e-6
+  max_grad_norm: 5.0
+
+  # KL penalty (the key to F's success)
+  kl_beta: 0.01
+  kl_beta_warmup_steps: 0  # Immediate penalty
+
+  # Other features OFF (isolate MLP effect)
+  use_ppo_clipping: false
+  use_token_level_loss: false
+  entropy_coef: 0.0
+  importance_sampling_correction: false
+
+  # LoRA rank
+  lora_rank: 16
+
+  # Reward settings
+  reward_discount_gamma: 0.0
+  step_reward_weight: 0.8
+  final_reward_weight: 0.2
+
+analysis:
+  primary_metric: "trueskill/display_rating"
+  secondary_metrics:
+    - "game/avg_sc_count"
+    - "game/win_bonus_rate"
+    - "placement/top3_rate"
+    - "kl/mean"
+    - "kl/max"
+    - "benchmark/grad_norm"
+  success_criteria:
+    - "Both runs complete 75 steps without KL explosion"
+    - "Clear winner emerges (>5% win rate difference)"
+
+runs:
+  A:
+    name: "attention-only-kl"
+    description: "Attention-only LoRA + KL penalty (replicates winning F config)"
+    config:
+      lora_target_modules:
+        - "q_proj"
+        - "k_proj"
+        - "v_proj"
+        - "o_proj"
+      experiment_tag: "${metadata.experiment_tag_prefix}-A-attn-kl"
+
+  B:
+    name: "attention-mlp-kl"
+    description: "Attention + MLP LoRA + KL penalty (test if MLP adds value)"
+    config:
+      lora_target_modules:
+        - "q_proj"
+        - "k_proj"
+        - "v_proj"
+        - "o_proj"
+        - "gate_proj"
+        - "up_proj"
+        - "down_proj"
+      experiment_tag: "${metadata.experiment_tag_prefix}-B-mlp-kl"

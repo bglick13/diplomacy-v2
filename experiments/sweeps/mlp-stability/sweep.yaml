@@ -1,0 +1,108 @@
+# MLP Stability Ablation: Find the right combination of constraints
+#
+# Problem: MLP learns faster but crashes (KL spike to 1.56 at step 24)
+# Hypothesis: Combining PPO clipping + KL penalty will prevent spikes
+#
+# PPO clipping limits per-step updates (ratio clipped to [0.8, 1.5])
+# KL penalty limits total drift (penalizes cumulative divergence)
+# Together they should give us stable MLP training.
+
+metadata:
+  name: "mlp-stability"
+  description: "Find stable MLP training config"
+  hypothesis: |
+    MLP + PPO clipping + KL penalty will be stable AND learn well.
+
+    - PPO clipping prevents single-step KL spikes (like 1.56 at step 24)
+    - KL penalty prevents cumulative drift
+    - MLP provides learning capacity
+
+    If this works, we have a recipe for long training runs.
+  experiment_tag_prefix: "mlp-stability"
+  created: "2024-12-26"
+  author: "claude-code"
+
+defaults:
+  total_steps: 30  # Short run - KL spike was at step 24, 30 is enough to validate
+  disable_auto_resume: true
+
+  learning_rate: 5e-6
+  max_grad_norm: 5.0
+  lora_rank: 16
+
+  # MLP modules for all runs
+  lora_target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+  # Reward settings
+  reward_discount_gamma: 0.0
+  step_reward_weight: 0.8
+  final_reward_weight: 0.2
+
+  # Disable other features
+  entropy_coef: 0.0
+  use_token_level_loss: false
+
+analysis:
+  primary_metric: "elo/base_model"
+  secondary_metrics:
+    - "kl/mean"
+    - "kl/max"
+    - "ppo/clip_fraction"
+    - "benchmark/grad_norm"
+  success_criteria:
+    - "All runs complete 30 steps without crash"
+    - "KL max stays < 1.0 (spike was 1.56 at step 24)"
+    - "If stable, proceed to reward-discount sweep with winning config"
+
+runs:
+  # Baseline: MLP + KL only (what crashed before)
+  A:
+    name: "mlp-kl-only"
+    description: "MLP + KL penalty only (baseline, expect crash ~step 60)"
+    config:
+      use_ppo_clipping: false
+      kl_beta: 0.01
+      kl_beta_warmup_steps: 0
+      experiment_tag: "${metadata.experiment_tag_prefix}-A-kl-only"
+
+  # Test: MLP + PPO clipping only
+  B:
+    name: "mlp-ppo-only"
+    description: "MLP + PPO clipping only (no KL penalty)"
+    config:
+      use_ppo_clipping: true
+      ppo_epsilon_low: 0.2
+      ppo_epsilon_high: 0.5
+      kl_beta: 0.0
+      experiment_tag: "${metadata.experiment_tag_prefix}-B-ppo-only"
+
+  # Test: MLP + PPO clipping + KL penalty (the hypothesis)
+  C:
+    name: "mlp-ppo-kl"
+    description: "MLP + PPO clipping + KL penalty (full stability stack)"
+    config:
+      use_ppo_clipping: true
+      ppo_epsilon_low: 0.2
+      ppo_epsilon_high: 0.5
+      kl_beta: 0.01
+      kl_beta_warmup_steps: 0
+      experiment_tag: "${metadata.experiment_tag_prefix}-C-ppo-kl"
+
+  # Test: MLP + PPO clipping + stronger KL penalty
+  D:
+    name: "mlp-ppo-kl-strong"
+    description: "MLP + PPO clipping + stronger KL penalty (kl_beta=0.02)"
+    config:
+      use_ppo_clipping: true
+      ppo_epsilon_low: 0.2
+      ppo_epsilon_high: 0.5
+      kl_beta: 0.02
+      kl_beta_warmup_steps: 0
+      experiment_tag: "${metadata.experiment_tag_prefix}-D-ppo-kl-strong"

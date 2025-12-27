@@ -35,39 +35,54 @@ defaults:
   # Start fresh (don't resume from failed runs)
   disable_auto_resume: true
 
-  # STABILITY TUNING: KL penalty prevents runaway policy divergence
-  # Without KL penalty, policy can diverge too fast (KL explodes 0.03 → 0.5 in 6 steps)
-  # Small penalty + warmup allows initial exploration then constrains drift
-  kl_beta: 0.01            # Small KL penalty to constrain divergence
-  kl_beta_warmup_steps: 10 # Allow 10 steps of free exploration before penalty kicks in
+  # ==========================================================================
+  # STABILITY CONFIG (from stability-ablation and mlp-ablation experiments)
+  # ==========================================================================
+  # Key findings:
+  # - MLP modules enable 3x more learning (+250 Elo gap vs +84 attention-only)
+  # - MLP + KL penalty crashed at step 57 with kl_mean=0.267
+  # - Attention-only was stable but plateaued
+  # Solution: MLP + stronger KL penalty (0.02 vs 0.01) for stability
 
-  learning_rate: 5e-6      # Reduced from 1e-5 - previous runs exploded at step 10
-  max_grad_norm: 5.0       # Conservative safety net (was 10.0, too permissive)
-  lora_rank: 32            # Keep higher capacity
-  entropy_coef: 0.01       # Prevents mode collapse to empty responses
+  # KL penalty: Slightly higher to prevent MLP instability
+  kl_beta: 0.02            # Increased from 0.01 - MLP needs more constraint
+  kl_beta_warmup_steps: 5  # Shorter warmup - get KL penalty active sooner
 
-  # PPO tuning: Wide bounds to accommodate vLLM-HuggingFace logprobs mismatch (~0.8-1.5x)
-  # IS correction handles extreme outliers; PPO clipping handles real policy drift
-  ppo_epsilon_low: 0.2     # ratio >= 0.8 (allows HF computing lower logprobs)
-  ppo_epsilon_high: 0.5    # ratio <= 1.5 (allows HF computing higher logprobs)
+  learning_rate: 5e-6      # Conservative LR for stability
+  max_grad_norm: 5.0       # Conservative gradient clipping
 
-  # Disable token-level loss weighting to test if it's causing instability
-  # With variable-length completions, longer samples dominate gradients
-  use_token_level_loss: false
+  # LoRA: MLP modules for learning capacity (attention-only plateaus)
+  lora_rank: 16            # Reduced from 32 - rank 32 alone didn't help
+  lora_target_modules:     # MLP modules enable learning new knowledge
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+  # Other stability settings
+  entropy_coef: 0.0        # Disabled - didn't help in ablation
+  use_ppo_clipping: false  # Disabled - didn't help in ablation
+  use_token_level_loss: false  # Disabled - can cause gradient issues
 
 # Analysis configuration
 analysis:
-  primary_metric: "trueskill/display_rating"
+  # Use fixed reference metrics (win rate against dynamic league is misleading)
+  primary_metric: "elo/base_model"  # Lower = better (league beats base model)
   secondary_metrics:
-    - "benchmark/reward_mean"
-    - "benchmark/reward_std"  # Expect lower variance with discounting
-    - "game/avg_sc_count"
-    - "game/win_bonus_rate"
+    - "elo_gap"  # Best checkpoint - base_model (higher = better)
+    - "elo/defensive_bot"  # Lower = exploiting fixed strategies
+    - "kl/mean"  # Stability indicator
+    - "kl/max"   # Stability indicator
   expected_ranking: ["B", "C", "A"]  # gamma=0.95 expected to win, baseline last
   success_criteria:
-    - "At least one gamma > 0 outperforms baseline (A, gamma=0.0)"
-    - "Reward variance decreases with discounting"
-    - "No training instability"
+    - "At least one gamma > 0 achieves lower base_model Elo than gamma=0.0"
+    - "No crashes (all runs complete 100 steps)"
+    - "KL mean stays < 0.3 throughout training"
+  analysis_command: |
+    uv run python .claude/skills/experiment-analysis/analyze_sweep.py --sweep ablation-gamma
 
 # Run definitions (3 variants: baseline + moderate discount + full future credit)
 runs:

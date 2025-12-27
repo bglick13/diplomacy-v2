@@ -280,7 +280,112 @@ python scripts/launch_training.py \
 
 ---
 
+## Exp 9: Stability Ablation Sweep
+
+**Hypothesis**: Training instability (KL explosion, clip_frac > 60%) was introduced after commit 6ea97cbb0. By testing each change in isolation, we can identify the culprit(s).
+
+**Changes tested** (each in isolation from stable baseline):
+- A: Baseline (attention-only LoRA r16, all new features OFF)
+- B: +PPO clipping
+- C: +Token-level loss weighting
+- D: +LoRA rank 32
+- E: +Entropy bonus
+- F: +KL penalty
+- G: +MLP target modules
+- H: +Full LoRA (rank 32 + MLP modules)
+
+**Key Config** (baseline):
+- `learning_rate: 5e-6`
+- `lora_rank: 16`
+- `lora_target_modules: [q_proj, k_proj, v_proj, o_proj]` (attention only)
+- All new features OFF
+
+**Status**: `completed`
+- Sweep config: `experiments/sweeps/stability-ablation/sweep.yaml`
+- Run names: `stability-ablation-{A-H}-20251226-124256`
+
+**Results** (Fixed Reference Analysis):
+
+| Run | Config | Elo Gap | Base Model Elo | KL Max | Verdict |
+|-----|--------|---------|----------------|--------|---------|
+| H | Full LoRA (r32+MLP) | **+250** | **1001** | 137.1 | **Most learning, unstable** |
+| C | +Token-level loss | +98 | 1050 | 3.6 | Good |
+| A | Baseline | +89 | 1072 | 0.8 | Stable baseline |
+| F | +KL penalty | +84 | 1024 | 1.8 | Stable, good |
+| G | +MLP modules | +62 | 1036 | 7.2 | Learning, some instability |
+| E | +Entropy bonus | +39 | 1097 | 1.0 | Underperformed |
+| D | +LoRA rank 32 | +33 | 1062 | 1.8 | **Worst attention-only** |
+| B | +PPO clipping | +22 | 1109 | 2.6 | Underperformed |
+
+**Key Learnings**:
+1. **MLP modules enable more learning**: H achieved +250 Elo gap (3x better than attention-only)
+2. **Win rate is misleading**: F had 27% win rate but only +84 Elo gap; H had 17% win rate but +250 gap
+3. **Fixed references are essential**: Use base_model Elo and Elo gap, not win rate
+4. **Attention rank increase alone hurts**: D was worst performer (more routing without knowledge)
+5. **MLP instability is manageable**: H learned despite KL_max=137
+
+**Analysis command**:
+```bash
+uv run python .claude/skills/experiment-analysis/analyze_sweep.py --sweep stability-ablation
+```
+
+---
+
+## Exp 10: MLP Ablation (Does MLP Help When KL-Constrained?)
+
+**Hypothesis**: MLP layers store "knowledge" while attention stores "routing". Adding MLP with KL penalty should enable learning Diplomacy-specific strategies while maintaining stability.
+
+**Runs**:
+- A: Attention-only r16 + KL penalty (replicates winning F config)
+- B: Attention + MLP r16 + KL penalty (test if MLP adds value)
+
+**Key Config**:
+- `learning_rate: 5e-6`
+- `kl_beta: 0.01` (immediate, no warmup)
+- `total_steps: 75`
+- All other features OFF
+
+**Status**: `completed`
+- Sweep config: `experiments/sweeps/mlp-ablation/sweep.yaml`
+- Run names: `mlp-ablation-{A,B}-20251226-182415`
+
+**Results** (Fixed Reference Analysis):
+
+| Run | Steps | Base Model Elo | Elo Gap | KL Mean | Total Ref Drop |
+|-----|-------|----------------|---------|---------|----------------|
+| **B (MLP + KL)** | 57 (crashed) | **1041** | **+99** | 0.267 | **524** |
+| A (attn + KL) | 75 | 1084 | +96 | 0.049 | 382 |
+
+**Key Findings**:
+1. **MLP learns faster**: B achieved lower base_model Elo (1041 vs 1084) in fewer steps
+2. **MLP crashed at step 57**: KL mean was 0.267 vs 0.049 for attention-only
+3. **Need stronger KL constraint for MLP**: kl_beta=0.01 wasn't enough
+
+**Conclusion**: MLP + KL penalty is the right approach, but needs:
+- Higher kl_beta (0.02 instead of 0.01)
+- Shorter warmup (5 steps instead of 10)
+
+**Follow-up**: Updated `reward-discount-gamma` sweep with these stability settings
+
+---
+
 ## Notes
+
+### Fixed Reference Analysis (NEW)
+
+**Key insight**: Win rate against a dynamic league is meaningless. As training progresses, the league gets stronger, so win rate can stay flat even if the model improves.
+
+**Use fixed references instead**:
+| Metric | What It Measures |
+|--------|------------------|
+| `base_model` Elo | Are we better than untrained? (lower = better) |
+| Elo Gap (best checkpoint - base_model) | How much better is trained model? (higher = better) |
+| Baseline bot Elo | Are we exploiting fixed strategies? (lower = better) |
+
+**Analysis command**:
+```bash
+uv run python .claude/skills/experiment-analysis/analyze_sweep.py --sweep <prefix>
+```
 
 ### Compute Estimates
 - Each rollout: ~60-90s depending on horizon
@@ -288,11 +393,21 @@ python scripts/launch_training.py \
 - Buffer depth 3 = ~3 rollouts prefetched
 
 ### Key Metrics to Track
-- `benchmark/reward_mean`: Primary training signal
-- `game/win_bonus_rate`: How often model achieves decisive wins
+
+**Learning Signal (Fixed References)**:
+- `elo/base_model`: Lower = league beats untrained model more (PRIMARY)
+- Elo Gap (best checkpoint - base_model): Higher = more improvement (PRIMARY)
+- `elo/chaos_bot`, `elo/defensive_bot`, etc.: Lower = exploiting fixed strategies
+
+**Performance (Relative to League)**:
+- `game/win_bonus_rate`: Misleading if league is dynamic - use with caution
 - `game/avg_sc_count`: Territory control indicator
-- `benchmark/kl`: Policy drift from reference (stability)
-- League Elo progression over training steps
+- `benchmark/reward_mean`: Training signal (but affected by opponent strength)
+
+**Stability**:
+- `kl/mean`: Policy drift from reference (target < 0.1)
+- `kl/max`: Peak divergence (warning if > 10)
+- `benchmark/grad_norm`: Gradient magnitude (warning if > 50)
 
 ### KL & Stability Metrics (New)
 - `kl/beta`: Effective KL penalty coefficient (shows warmup progress)
