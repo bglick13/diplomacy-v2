@@ -346,6 +346,16 @@ class ExperimentConfig(BaseModel):
         default=0.05,
         description="PFSP: Weight for baseline opponents (bots)",
     )
+    dumbbot_game_probability: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Probability that a rollout uses all DumbBot opponents (1v6 benchmark). "
+            "These games measure absolute skill vs a fixed baseline, similar to DipNet evaluation. "
+            "Win rate against 6 DumbBots is tracked separately in WandB. 0.0 disables."
+        ),
+    )
 
     # =========================================================================
     # Checkpointing & Resume

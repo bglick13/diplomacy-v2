@@ -9,7 +9,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
+
+if TYPE_CHECKING:
+    from src.league.matchmaker import MatchmakingResult
 
 import modal
 import numpy as np
@@ -621,8 +624,17 @@ class RolloutManager:
         hero_power = random.choice(self.league_ctx.matchmaker.POWERS)
         hero_agent_name = hero_adapter_path or "base_model"
 
-        # Sample opponents
-        if self.league_ctx.registry.num_checkpoints > 0:
+        # Check if this should be a dumbbot benchmark game
+        is_dumbbot_game = (
+            self.cfg.dumbbot_game_probability > 0
+            and random.random() < self.cfg.dumbbot_game_probability
+        )
+
+        if is_dumbbot_game:
+            # All-dumbbot game: hero vs 6 DumbBots
+            match_result = self._create_dumbbot_match(hero_power, hero_agent_name)
+        elif self.league_ctx.registry.num_checkpoints > 0:
+            # Normal PFSP opponent sampling
             hero_info = self.league_ctx.registry.get_agent(hero_agent_name)
             estimated_hero_rating = (
                 hero_info.display_rating
@@ -655,6 +667,31 @@ class RolloutManager:
         )
 
         return handle, match_result
+
+    def _create_dumbbot_match(self, hero_power: str, hero_agent_name: str) -> "MatchmakingResult":
+        """Create a match where all opponents are DumbBots."""
+        from src.league.matchmaker import MatchmakingResult
+
+        powers = ["AUSTRIA", "ENGLAND", "FRANCE", "GERMANY", "ITALY", "RUSSIA", "TURKEY"]
+        opponent_powers = [p for p in powers if p != hero_power]
+
+        power_adapters: dict[str, str | None] = {hero_power: None}  # Will be overridden
+        power_agent_names: dict[str, str] = {hero_power: hero_agent_name}
+        opponent_categories: dict[str, str] = {}
+
+        for power in opponent_powers:
+            power_adapters[power] = "dumb_bot"
+            power_agent_names[power] = "dumb_bot"
+            opponent_categories[power] = "dumbbot_benchmark"
+
+        return MatchmakingResult(
+            hero_power=hero_power,
+            hero_agent=hero_agent_name,
+            hero_rating=0.0,  # Not used for dumbbot games
+            power_adapters=power_adapters,
+            power_agent_names=power_agent_names,
+            opponent_categories=opponent_categories,
+        )
 
     def _spawn_legacy_rollout(self, hero_adapter_path: str | None) -> Any:
         """Spawn a single legacy (non-league) rollout."""
@@ -1072,6 +1109,78 @@ def build_wandb_metrics(
     return metrics
 
 
+class DumbbotGameStats(TypedDict):
+    """Aggregated statistics for dumbbot benchmark games."""
+
+    games_count: int
+    win_count: int  # 1st place
+    win_rate: float
+    top3_count: int
+    top3_rate: float
+    avg_sc_count: float
+    avg_placement: float
+    sc_counts: list[int]
+    placements: list[int]
+
+
+def aggregate_dumbbot_game_stats(
+    collected_results: list["RolloutResult"],
+) -> DumbbotGameStats | None:
+    """
+    Aggregate statistics for dumbbot benchmark games.
+
+    Dumbbot games are identified by having all 6 opponents with
+    opponent_categories = "dumbbot_benchmark".
+
+    Returns:
+        DumbbotGameStats if any dumbbot games found, None otherwise
+    """
+    sc_counts: list[int] = []
+    placements: list[int] = []
+
+    for result in collected_results:
+        match_result = result.match_result
+        if not match_result:
+            continue
+
+        # Check if this is a dumbbot benchmark game
+        opponent_categories = getattr(match_result, "opponent_categories", None)
+        if not opponent_categories:
+            continue
+
+        # All 6 opponents should be "dumbbot_benchmark"
+        non_hero_categories = [c for c in opponent_categories.values() if c != "hero"]
+        if not all(c == "dumbbot_benchmark" for c in non_hero_categories):
+            continue
+
+        # This is a dumbbot game - extract hero stats
+        game_stats = result.data.get("game_stats", {})
+        hero_sc_counts = game_stats.get("sc_counts", [])
+        hero_placements = game_stats.get("hero_placements", [])
+
+        sc_counts.extend(hero_sc_counts)
+        placements.extend(hero_placements)
+
+    if not placements:
+        return None
+
+    games_count = len(placements)
+    win_count = sum(1 for p in placements if p == 1)
+    top3_count = sum(1 for p in placements if p <= 3)
+
+    return DumbbotGameStats(
+        games_count=games_count,
+        win_count=win_count,
+        win_rate=win_count / games_count if games_count > 0 else 0.0,
+        top3_count=top3_count,
+        top3_rate=top3_count / games_count if games_count > 0 else 0.0,
+        avg_sc_count=sum(sc_counts) / len(sc_counts) if sc_counts else 0.0,
+        avg_placement=sum(placements) / len(placements) if placements else 0.0,
+        sc_counts=sc_counts,
+        placements=placements,
+    )
+
+
 def aggregate_rewards_by_opponent_type(
     collected_results: list["RolloutResult"],
 ) -> dict[str, dict[str, float]]:
@@ -1165,6 +1274,15 @@ def _add_league_metrics(
             metrics[f"opponent/{cat}/reward_mean"] = cat_metrics["reward_mean"]
             metrics[f"opponent/{cat}/game_count"] = cat_metrics["game_count"]
             metrics[f"opponent/{cat}/trajectory_count"] = cat_metrics["reward_count"]
+
+        # Add dumbbot benchmark metrics (DipNet paper: ~75% win rate is target)
+        dumbbot_stats = aggregate_dumbbot_game_stats(collected_results)
+        if dumbbot_stats:
+            metrics["dumbbot/games_count"] = dumbbot_stats["games_count"]
+            metrics["dumbbot/win_rate"] = dumbbot_stats["win_rate"]
+            metrics["dumbbot/top3_rate"] = dumbbot_stats["top3_rate"]
+            metrics["dumbbot/avg_sc_count"] = dumbbot_stats["avg_sc_count"]
+            metrics["dumbbot/avg_placement"] = dumbbot_stats["avg_placement"]
 
 
 # ============================================================================

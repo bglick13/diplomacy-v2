@@ -8,7 +8,14 @@ import cloudpickle
 import modal
 
 from src.agents import LLMAgent, PromptConfig
-from src.agents.baselines import ChaosBot, CoordinatedBot, DefensiveBot, RandomBot, TerritorialBot
+from src.agents.baselines import (
+    ChaosBot,
+    CoordinatedBot,
+    DefensiveBot,
+    DumbBot,
+    RandomBot,
+    TerritorialBot,
+)
 from src.apps.common.images import cpu_image
 from src.apps.common.volumes import REPLAYS_PATH, VOLUME_PATH, volume
 from src.engine.wrapper import DiplomacyWrapper
@@ -50,6 +57,7 @@ BASELINE_BOTS = {
     "territorial_bot": TerritorialBot(),
     "defensive_bot": DefensiveBot(),
     "coordinated_bot": CoordinatedBot(),
+    "dumb_bot": DumbBot(),
 }
 # Removed CURRENT_ROLLOUT_LORA global - unreliable across container restarts.
 # Instead, just check if adapter files exist on disk before each rollout.
