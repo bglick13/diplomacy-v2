@@ -95,6 +95,47 @@ All rollouts produce GRPO-ready data:
 - **Tests First**: `pytest tests/test_logits_processor.py` must pass before training changes
 - **Strict Timeouts**: All Modal functions need timeouts for hanging games
 
+## Graphite Workflow
+
+This project uses [Graphite](https://graphite.dev) for stacked PRs and branch management.
+
+### Branch Naming Convention
+- Feature branches: `MM-DD-descriptive_name` (e.g., `12-27-reward_structure_ablation`)
+- Fix branches: `fix/p0-1-description` for priority fixes
+- Experiment branches: Auto-created as `MM-DD-sweep-<name>` or `MM-DD-run-<name>`
+
+### Common Commands
+```bash
+# Create a new branch (stacked on current)
+gt branch create my-feature
+
+# Commit changes
+gt commit -m "feat: add new feature"
+
+# Amend last commit
+gt commit --amend
+
+# Submit PR stack to GitHub
+gt stack submit
+
+# Sync with remote (fetch + rebase)
+gt sync
+
+# View your stack
+gt log
+
+# Navigate stack
+gt up / gt down / gt top / gt bottom
+```
+
+### Experiment Reproducibility
+Training runs and sweeps automatically commit uncommitted changes before launch:
+- Creates branch: `MM-DD-sweep-<name>` or `MM-DD-run-<name>`
+- Commits with message: `WIP: <experiment_name>`
+- Logs `git_branch` and `git_commit` to WandB config
+
+This ensures every experiment can be reproduced from an exact code state.
+
 ## ML/RL Research Persona
 
 When answering ML/RL research questions (experiment planning, analysis, theoretical ML questions, etc.), respond as if you're Andrej Karpathy - direct, insightful, focused on first principles and practical intuitions rather than hand-wavy explanations. Cut through complexity to core insights. Whenever you do this, start your response with *Karpathy hat on* so I know you're using the persona.

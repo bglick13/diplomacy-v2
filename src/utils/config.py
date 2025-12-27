@@ -45,6 +45,16 @@ class ExperimentConfig(BaseModel):
     )
     wandb_project: str = Field(default="diplomacy-grpo", description="WandB project name")
 
+    # Git tracking (populated at launch time for reproducibility)
+    git_branch: str | None = Field(
+        default=None,
+        description="Git branch at launch time (auto-populated by launch scripts)",
+    )
+    git_commit: str | None = Field(
+        default=None,
+        description="Git commit SHA at launch time (auto-populated by launch scripts)",
+    )
+
     # =========================================================================
     # Loss Type (GRPO vs GSPO)
     # =========================================================================
@@ -507,6 +517,28 @@ class ExperimentConfig(BaseModel):
         default=0.5,
         gt=0,
         description="Maximum KL beta when using adaptive control.",
+    )
+
+    # =========================================================================
+    # EMA Reference Model (alternative to frozen base model reference)
+    # =========================================================================
+    use_ema_reference: bool = Field(
+        default=False,
+        description=(
+            "Use EMA of policy as reference instead of frozen base model. "
+            "This changes KL semantics from 'stay close to base' to 'don't change too fast'. "
+            "More suitable for domain adaptation where we want to learn new knowledge."
+        ),
+    )
+    ema_tau: float = Field(
+        default=0.99,
+        ge=0.9,
+        le=0.9999,
+        description=(
+            "EMA decay rate for reference model. Higher = slower update. "
+            "0.99 = ~100 step half-life, 0.995 = ~200 step half-life. "
+            "Only used when use_ema_reference=True."
+        ),
     )
 
     # =========================================================================

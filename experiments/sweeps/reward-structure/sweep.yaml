@@ -10,7 +10,7 @@
 # dense immediate rewards for learning good Diplomacy strategy?
 
 metadata:
-  name: "reward-structure"
+  name: "reward-structure-v2"
   description: "Ablation: Dense immediate vs sparse trajectory-level rewards"
   hypothesis: |
     Sparse trajectory-level rewards may outperform dense immediate rewards because:
@@ -38,9 +38,14 @@ defaults:
   disable_auto_resume: true
 
   # ==========================================================================
-  # STABILITY CONFIG (updated after reward-structure-A collapse at step 12)
+  # STABILITY CONFIG (using EMA reference for MLP training stability)
   # ==========================================================================
-  # KL penalty with adaptive control: Auto-adjusts beta to maintain target KL
+  # EMA reference: Compare to slowly-moving average instead of frozen base model
+  # Semantics change: "don't change too fast" instead of "stay close to base"
+  use_ema_reference: true  # Key stability fix for MLP LoRA
+  ema_tau: 0.99            # Slow update (~100 step half-life)
+
+  # KL penalty with adaptive control
   kl_beta: 0.02            # Initial beta (will be adjusted by adaptive control)
   kl_target: 0.05          # Target KL mean - triggers adjustment at 0.5x/1.5x
   kl_beta_warmup_steps: 0  # No warmup needed with PPO clipping active

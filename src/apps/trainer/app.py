@@ -1363,7 +1363,15 @@ def initialize_model_and_optimizer(
         importance_sampling_mode=cfg.importance_sampling_mode,
         importance_sampling_cap=cfg.importance_sampling_cap,
         loss_type=cfg.loss_type,
+        use_ema_reference=cfg.use_ema_reference,
+        ema_tau=cfg.ema_tau,
     )
+
+    # Initialize EMA if enabled
+    if cfg.use_ema_reference:
+        loss_fn.initialize_ema()
+        logger.info(f"📊 EMA reference enabled: tau={cfg.ema_tau}")
+
     logger.info(f"📊 Loss type: {cfg.loss_type.upper()}")
     if cfg.use_ppo_clipping:
         logger.info(
@@ -2067,6 +2075,10 @@ def _run_training_step(
             policy_model.parameters(), cfg.max_grad_norm
         ).item()
         optimizer.step()
+
+    # Update EMA reference weights after optimizer step
+    if loss_fn.use_ema_reference:
+        loss_fn.update_ema()
 
     # Note: reported loss is consistent with gradient scaling because:
     # - Gradients are scaled by 1/total_chunks before backward()

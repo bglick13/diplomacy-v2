@@ -1,3 +1,5 @@
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -164,6 +166,10 @@ class GRPOLoss:
 
     Optimization: When 'ref_logprobs' is present in batch items, skip the
     reference forward pass entirely. This saves ~50% of compute.
+
+    EMA Reference Mode: When use_ema_reference=True, uses an exponential moving
+    average of the LoRA weights as the reference instead of the frozen base model.
+    This changes KL semantics from "stay close to base" to "don't change too fast".
     """
 
     def __init__(
@@ -182,6 +188,8 @@ class GRPOLoss:
         importance_sampling_mode: str = "sequence_truncate",
         importance_sampling_cap: float = 3.0,
         loss_type: str = "grpo",
+        use_ema_reference: bool = False,
+        ema_tau: float = 0.99,
     ):
         """
         Args:
@@ -204,6 +212,8 @@ class GRPOLoss:
             importance_sampling_mode: 'sequence_truncate' (clip ratios) or 'sequence_mask' (zero out).
             importance_sampling_cap: Cap for IS ratios (TRL default 3.0).
             loss_type: 'grpo' for token-level IS or 'gspo' for sequence-level IS.
+            use_ema_reference: Use EMA of LoRA weights as reference instead of base model.
+            ema_tau: EMA decay rate (0.99 = slow update, 0.9 = faster).
         """
         self.model = model
         self.beta = beta
@@ -219,6 +229,73 @@ class GRPOLoss:
         self.importance_sampling_mode = importance_sampling_mode
         self.importance_sampling_cap = importance_sampling_cap
         self.loss_type = loss_type
+        self.use_ema_reference = use_ema_reference
+        self.ema_tau = ema_tau
+
+        # EMA state (initialized on first call to initialize_ema or update_ema)
+        self._ema_state_dict: dict[str, torch.Tensor] | None = None
+        self._ema_initialized = False
+
+    def initialize_ema(self) -> None:
+        """
+        Initialize EMA weights from current LoRA adapter weights.
+        Call this once before training starts.
+        """
+        if not self.use_ema_reference:
+            return
+
+        # Get current adapter state dict and clone tensors
+        adapter_state = {}
+        for name, param in self.model.named_parameters():
+            if "lora_" in name and param.requires_grad:
+                adapter_state[name] = param.data.clone()
+
+        self._ema_state_dict = adapter_state
+        self._ema_initialized = True
+        print(f"📊 EMA reference initialized with {len(adapter_state)} LoRA parameters")
+
+    def update_ema(self) -> None:
+        """
+        Update EMA weights: ema = tau * ema + (1 - tau) * current.
+        Call this after each training step.
+        """
+        if not self.use_ema_reference:
+            return
+
+        if not self._ema_initialized:
+            self.initialize_ema()
+            return
+
+        tau = self.ema_tau
+        ema_state = self._ema_state_dict
+        assert ema_state is not None  # Guaranteed by _ema_initialized check above
+        for name, param in self.model.named_parameters():
+            if name in ema_state:
+                ema_state[name].mul_(tau).add_(param.data, alpha=1 - tau)
+
+    @contextmanager
+    def _use_ema_weights(self) -> Generator[None, None, None]:
+        """
+        Context manager to temporarily swap in EMA weights for reference computation.
+        Saves current weights, loads EMA, yields, then restores original weights.
+        """
+        if not self._ema_initialized or self._ema_state_dict is None:
+            raise RuntimeError("EMA not initialized. Call initialize_ema() first.")
+
+        # Save current weights
+        saved_weights: dict[str, torch.Tensor] = {}
+        for name, param in self.model.named_parameters():
+            if name in self._ema_state_dict:
+                saved_weights[name] = param.data.clone()
+                param.data.copy_(self._ema_state_dict[name])
+
+        try:
+            yield
+        finally:
+            # Restore original weights
+            for name, param in self.model.named_parameters():
+                if name in saved_weights:
+                    param.data.copy_(saved_weights[name])
 
     def compute_loss(self, batch: list[dict]) -> GRPOLossOutput:
         """
@@ -326,10 +403,20 @@ class GRPOLoss:
             used_cached_ref = True
         else:
             # Fallback: Forward Pass (Reference Policy) for KL
-            # CRITICAL: Use disable_adapter() to get base model logprobs
+            # Use EMA weights if enabled, otherwise use base model (disabled adapter)
             with torch.no_grad():
-                with self.model.disable_adapter():
-                    ref_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                if self.use_ema_reference:
+                    # EMA reference: compare to slowly-moving average of policy
+                    # Semantics: "don't change too fast" instead of "stay close to base"
+                    if not self._ema_initialized:
+                        self.initialize_ema()
+                    with self._use_ema_weights():
+                        ref_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                else:
+                    # Base model reference: compare to frozen pre-trained model
+                    # Semantics: "stay close to base model capabilities"
+                    with self.model.disable_adapter():
+                        ref_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
                 ref_logits = ref_outputs.logits[:, :-1, :]
 
                 # Compute Reference LogProbs (memory-efficient: log_softmax + gather)

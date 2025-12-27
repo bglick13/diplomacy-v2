@@ -33,6 +33,7 @@ from typing import Any
 import modal
 
 from src.utils.config import ExperimentConfig, add_config_args, config_from_args
+from src.utils.git import ensure_clean_state_for_experiment
 
 
 @dataclass
@@ -226,6 +227,16 @@ def main():
     # Build config from args
     cfg = config_from_args(args, ExperimentConfig)  # type: ignore[type-var]
     assert isinstance(cfg, ExperimentConfig)
+
+    # Ensure git state is clean for reproducibility
+    print("\nChecking git state...")
+    git_info = ensure_clean_state_for_experiment(f"run-{cfg.run_name}")
+    print(f"  Branch: {git_info['branch']}")
+    print(f"  Commit: {git_info['commit'][:8]}")
+
+    # Update config with git info
+    cfg.git_branch = git_info["branch"]
+    cfg.git_commit = git_info["commit"]
 
     print(f"\n📦 Config:\n{cfg.model_dump_json(indent=2)}")
 

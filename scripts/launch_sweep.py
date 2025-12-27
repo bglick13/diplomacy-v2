@@ -33,6 +33,7 @@ from pathlib import Path
 
 import modal
 
+from src.utils.git import ensure_clean_state_for_experiment
 from src.utils.sweep_config import SweepConfig
 
 
@@ -157,6 +158,19 @@ def launch_sweep(
     print("\n" + "=" * 70)
     print(f"LAUNCHING SWEEP: {meta.name}")
     print("=" * 70)
+
+    # Ensure git state is clean for reproducibility
+    print("\nChecking git state...")
+    git_info = ensure_clean_state_for_experiment(f"sweep-{meta.name}")
+    print(f"  Branch: {git_info['branch']}")
+    print(f"  Commit: {git_info['commit'][:8]}")
+
+    # Store git info in sweep config defaults for logging
+    if sweep_config.defaults is None:
+        sweep_config.defaults = {}
+    sweep_config.defaults["git_branch"] = git_info["branch"]
+    sweep_config.defaults["git_commit"] = git_info["commit"]
+
     print(f"\nRuns to execute: {', '.join(requested_runs)}")
     print(f"Dry run: {dry_run}")
 
