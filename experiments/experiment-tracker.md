@@ -365,7 +365,102 @@ uv run python .claude/skills/experiment-analysis/analyze_sweep.py --sweep stabil
 - Higher kl_beta (0.02 instead of 0.01)
 - Shorter warmup (5 steps instead of 10)
 
-**Follow-up**: Updated `reward-discount-gamma` sweep with these stability settings
+**Follow-up**: → Exp 11 (MLP Stability Sweep)
+
+---
+
+## Exp 11: MLP Stability Sweep (PPO vs KL Regularization)
+
+**Hypothesis**: MLP modules need both PPO clipping AND KL penalty for stable training. Testing four configurations:
+- A: KL-only (no PPO clipping)
+- B: PPO-only (no KL penalty)
+- C: PPO + KL standard (β=0.01)
+- D: PPO + KL strong (β=0.02)
+
+**Key Config** (shared):
+- `lora_target_modules`: All (q,k,v,o + gate,up,down MLP)
+- `lora_rank: 16`
+- `learning_rate: 5e-6`
+- `total_steps: 30`
+
+**Config Variants**:
+| Run | PPO Clipping | KL Beta | Description |
+|-----|--------------|---------|-------------|
+| A | ❌ | 0.01 | KL regularization only |
+| B | ✅ | 0.00 | PPO clipping only |
+| C | ✅ | 0.01 | Both (standard KL) |
+| D | ✅ | 0.02 | Both (strong KL) |
+
+**Status**: `completed`
+- Sweep config: `experiments/sweeps/mlp-stability/sweep.yaml`
+- Run names: `mlp-stability-{A,B,C,D}-20251227-124027`
+- WandB: https://wandb.ai/bglick13/diplomacy-grpo
+
+**Results** (Fixed Reference Analysis):
+
+| Run | Elo Gap | Base Elo | KL Mean | KL Max | Win% | Top3% |
+|-----|---------|----------|---------|--------|------|-------|
+| **D** | **+171** | **1024** | 0.58 | **39** | 12% | 56% |
+| B | +108 | 1045 | 0.95 | 176 | 14% | 53% |
+| C | +38 | 1043 | 1.05 | **496** | 16% | 60% |
+| A | +31 | 1058 | 0.44 | 51 | 7% | 58% |
+
+**Clear Winner**: Config D (+171 Elo gap, 63 points ahead of runner-up B)
+
+**Key Learnings**:
+1. **You need BOTH regularizers**: Neither KL-only (A) nor PPO-only (B) matched the combined approach
+2. **PPO bounds local updates, KL bounds cumulative drift**: They serve different purposes
+   - PPO clipping prevents high-variance individual gradient updates
+   - KL penalty prevents the policy from drifting too far cumulatively
+3. **Standard KL (β=0.01) is too weak for MLP**: Config C had worst KL spikes (496!) despite both regularizers
+4. **Strong KL (β=0.02) enables stable exploration**: D explored more (KL mean 0.58 vs A's 0.44) but without instability
+5. **Unconstrained optimization isn't better**: B had more freedom but worse results than D
+
+**Core Insight**: The 2x KL penalty isn't "being conservative" — it's enabling *stable exploration* which compounds over training steps. Without it, the policy either stays too close (A) or random-walks through policy space (B, C).
+
+**Action**: Updated `reward-discount-gamma` sweep to use Config D settings:
+- `use_ppo_clipping: true`
+- `kl_beta: 0.02`
+- `kl_beta_warmup_steps: 0`
+
+---
+
+## Exp 12: Reward Structure (Dense vs Sparse)
+
+**Hypothesis**: Temporal credit assignment via `gamma > 0` creates correlated gradients that destabilize training. There are two theoretically sound approaches:
+- **Dense + Immediate** (gamma=0): Every step gets its immediate reward (no temporal credit)
+- **Sparse + Trajectory**: One sample per trajectory with final outcome as reward
+
+Sparse trajectory-level rewards compare "which overall strategy was better" rather than "which single move was better." This may better capture strategic positioning moves (like Spring maneuvers that enable Fall captures).
+
+**Key Config** (shared, from Exp 11 winner):
+- `kl_beta: 0.02`
+- `use_ppo_clipping: true`
+- `lora_target_modules: [attention + MLP]`
+- `total_steps: 100`
+
+**Config Variants** (matched effective batch size):
+| Run | Reward Type | Rollouts/Step | Samples/Step |
+|-----|-------------|---------------|--------------|
+| A | Dense (step deltas) | 16 | ~960 |
+| B | Sparse (final score) | 240 | ~960 |
+
+Note: Sparse needs 15x more rollouts to match sample count, isolating the reward structure effect.
+
+**Status**: `planned`
+- Sweep config: `experiments/sweeps/reward-structure/sweep.yaml`
+
+**Command**:
+```bash
+uv run python scripts/launch_sweep.py experiments/sweeps/reward-structure/sweep.yaml
+```
+
+**Key Questions**:
+1. Does 15x fewer samples significantly slow learning?
+2. Does trajectory-level comparison improve strategic play (dumbbot win rate)?
+3. Is sparse reward training stable (no KL/gradient issues)?
+
+**Results**: _pending_
 
 ---
 

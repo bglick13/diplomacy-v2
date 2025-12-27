@@ -278,6 +278,7 @@ DEFAULT_BASELINES: list[AgentInfo] = [
     AgentInfo.create_baseline("defensive_bot", elo=950.0),
     AgentInfo.create_baseline("territorial_bot", elo=950.0),
     AgentInfo.create_baseline("coordinated_bot", elo=1000.0),
+    AgentInfo.create_baseline("dumb_bot", elo=850.0),  # DipNet-style heuristic bot
 ]
 
 

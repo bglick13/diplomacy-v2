@@ -677,7 +677,7 @@ class RolloutManager:
 
         power_adapters: dict[str, str | None] = {hero_power: None}  # Will be overridden
         power_agent_names: dict[str, str] = {hero_power: hero_agent_name}
-        opponent_categories: dict[str, str] = {}
+        opponent_categories: dict[str, str] = {hero_power: "hero"}
 
         for power in opponent_powers:
             power_adapters[power] = "dumb_bot"
@@ -1096,6 +1096,13 @@ def build_wandb_metrics(
         "ppo/is_ratio_mean": step_metrics.get("is_ratio_mean", 1.0),
         "ppo/is_ratio_std": step_metrics.get("is_ratio_std", 0.0),
         "ppo/is_masked_fraction": step_metrics.get("is_masked_fraction", 0.0),
+        # GSPO metrics (sequence-level importance sampling)
+        "gspo/sequence_ratio_mean": step_metrics.get("gspo_sequence_ratio_mean", 1.0),
+        "gspo/sequence_ratio_std": step_metrics.get("gspo_sequence_ratio_std", 0.0),
+        "gspo/sequence_ratio_clipped_fraction": step_metrics.get(
+            "gspo_sequence_ratio_clipped_fraction", 0.0
+        ),
+        "gspo/log_ratio_mean": step_metrics.get("gspo_log_ratio_mean", 0.0),
     }
 
     # NOTE: Cache metrics (cache/hit_rate, etc.) were removed because they never
@@ -1355,7 +1362,9 @@ def initialize_model_and_optimizer(
         importance_sampling_correction=cfg.importance_sampling_correction,
         importance_sampling_mode=cfg.importance_sampling_mode,
         importance_sampling_cap=cfg.importance_sampling_cap,
+        loss_type=cfg.loss_type,
     )
+    logger.info(f"📊 Loss type: {cfg.loss_type.upper()}")
     if cfg.use_ppo_clipping:
         logger.info(
             f"📊 PPO clipping enabled: ε_low={cfg.ppo_epsilon_low}, ε_high={cfg.ppo_epsilon_high}"
@@ -1654,6 +1663,7 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     tokenizer,
                     advantage_clip=cfg.advantage_clip,
                     advantage_min_std=cfg.advantage_min_std,
+                    min_reward_variance=cfg.min_reward_variance,
                 )
 
             step_metrics["process_time_s"] = time.time() - process_start
@@ -2001,6 +2011,11 @@ def _run_training_step(
     accum_is_ratio_mean = 0.0
     accum_is_ratio_std = 0.0
     accum_is_masked_fraction = 0.0
+    # GSPO metrics (sequence-level importance sampling)
+    accum_gspo_sequence_ratio_mean = 0.0
+    accum_gspo_sequence_ratio_std = 0.0
+    accum_gspo_sequence_ratio_clipped_fraction = 0.0
+    accum_gspo_log_ratio_mean = 0.0
     # Use ceiling division to correctly count partial chunks at the end
     total_chunks = (len(batch_data) + cfg.chunk_size - 1) // cfg.chunk_size
 
@@ -2039,6 +2054,13 @@ def _run_training_step(
         accum_is_ratio_mean += loss_output.is_ratio_mean
         accum_is_ratio_std += loss_output.is_ratio_std
         accum_is_masked_fraction += loss_output.is_masked_fraction
+        # GSPO metrics
+        accum_gspo_sequence_ratio_mean += loss_output.gspo_sequence_ratio_mean
+        accum_gspo_sequence_ratio_std += loss_output.gspo_sequence_ratio_std
+        accum_gspo_sequence_ratio_clipped_fraction += (
+            loss_output.gspo_sequence_ratio_clipped_fraction
+        )
+        accum_gspo_log_ratio_mean += loss_output.gspo_log_ratio_mean
 
     with profile_section(step_profile, "optimizer_step"):
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -2071,6 +2093,12 @@ def _run_training_step(
         "is_ratio_mean": accum_is_ratio_mean / max(1, num_chunks),
         "is_ratio_std": accum_is_ratio_std / max(1, num_chunks),
         "is_masked_fraction": accum_is_masked_fraction / max(1, num_chunks),
+        # GSPO metrics (sequence-level importance sampling)
+        "gspo_sequence_ratio_mean": accum_gspo_sequence_ratio_mean / max(1, num_chunks),
+        "gspo_sequence_ratio_std": accum_gspo_sequence_ratio_std / max(1, num_chunks),
+        "gspo_sequence_ratio_clipped_fraction": accum_gspo_sequence_ratio_clipped_fraction
+        / max(1, num_chunks),
+        "gspo_log_ratio_mean": accum_gspo_log_ratio_mean / max(1, num_chunks),
     }
 
 

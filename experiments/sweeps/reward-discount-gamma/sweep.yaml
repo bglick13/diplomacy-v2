@@ -10,7 +10,7 @@
 # This addresses the temporal credit assignment problem in multi-turn games.
 
 metadata:
-  name: "reward-discount-gamma-v2"
+  name: "reward-discount-gamma-v3"
   description: "Ablation: Discount factor for temporal credit assignment"
   hypothesis: |
     Propagating future rewards backwards (gamma > 0) will improve learning by:
@@ -36,17 +36,26 @@ defaults:
   disable_auto_resume: true
 
   # ==========================================================================
-  # STABILITY CONFIG (from stability-ablation and mlp-ablation experiments)
+  # STABILITY CONFIG (from mlp-stability sweep, Exp 11)
   # ==========================================================================
-  # Key findings:
-  # - MLP modules enable 3x more learning (+250 Elo gap vs +84 attention-only)
-  # - MLP + KL penalty crashed at step 57 with kl_mean=0.267
-  # - Attention-only was stable but plateaued
-  # Solution: MLP + stronger KL penalty (0.02 vs 0.01) for stability
+  # Key findings from mlp-stability sweep:
+  # - Config D (PPO + KL β=0.02) achieved +171 Elo gap - clear winner
+  # - KL-only (A) and PPO-only (B) underperformed (+31 and +108 Elo gap)
+  # - Standard KL β=0.01 (C) had worst KL spikes (max 496!)
+  # - Strong KL β=0.02 (D) kept KL max to 39 while enabling exploration
+  #
+  # Core insight: You need BOTH regularizers:
+  # - PPO clipping bounds magnitude of individual gradient updates (local)
+  # - KL penalty bounds cumulative drift from base policy (global)
 
-  # KL penalty: Slightly higher to prevent MLP instability
-  kl_beta: 0.02            # Increased from 0.01 - MLP needs more constraint
-  kl_beta_warmup_steps: 5  # Shorter warmup - get KL penalty active sooner
+  # KL penalty: Strong enough to prevent MLP drift
+  kl_beta: 0.02            # 2x standard - enables stable exploration
+  kl_beta_warmup_steps: 0  # No warmup needed with PPO clipping active
+
+  # PPO clipping: Essential for stable gradients
+  use_ppo_clipping: true   # CRITICAL: Must be enabled with MLP modules
+  ppo_epsilon_low: 0.2     # Standard PPO epsilon
+  ppo_epsilon_high: 0.5    # Asymmetric clipping for GRPO
 
   learning_rate: 5e-6      # Conservative LR for stability
   max_grad_norm: 5.0       # Conservative gradient clipping
@@ -64,7 +73,6 @@ defaults:
 
   # Other stability settings
   entropy_coef: 0.0        # Disabled - didn't help in ablation
-  use_ppo_clipping: false  # Disabled - didn't help in ablation
   use_token_level_loss: false  # Disabled - can cause gradient issues
 
 # Analysis configuration

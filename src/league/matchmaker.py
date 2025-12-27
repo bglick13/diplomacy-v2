@@ -374,6 +374,7 @@ class PFSPMatchmaker:
             "defensive_bot",
             "territorial_bot",
             "coordinated_bot",
+            "dumb_bot",
         }
         if agent_name in baseline_bots:
             return agent_name

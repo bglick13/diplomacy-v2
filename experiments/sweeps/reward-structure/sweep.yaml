@@ -1,0 +1,118 @@
+# Ablation Study: Dense vs Sparse Reward Structure
+#
+# Motivation: Temporal credit assignment (gamma > 0) creates correlated gradients
+# that destabilize training. This sweep compares two theoretically sound approaches:
+#
+# A) Dense + Immediate (gamma=0): Every step gets immediate reward (no temporal credit)
+# B) Sparse + Trajectory: One sample per trajectory with final outcome as reward
+#
+# The key question: Does trajectory-level comparison (sparse but sound) outperform
+# dense immediate rewards for learning good Diplomacy strategy?
+
+metadata:
+  name: "reward-structure"
+  description: "Ablation: Dense immediate vs sparse trajectory-level rewards"
+  hypothesis: |
+    Sparse trajectory-level rewards may outperform dense immediate rewards because:
+    1. Trajectory-level compares "which overall strategy was better" (holistic signal)
+    2. Immediate rewards only compare "which single move was better" (myopic signal)
+    3. Spring positioning moves (no immediate gain) should be credited via final outcome
+
+    However, sparse rewards mean ~15x fewer training samples per rollout, which could
+    slow learning. This sweep will measure:
+    - Learning efficiency: Elo improvement per training step
+    - Final performance: base_model Elo and dumbbot win rate
+    - Training stability: KL, grad_norm, clip_fraction
+
+    Expected outcomes:
+    - Dense: Faster early learning (more samples), possible plateau
+    - Sparse: Slower early learning, potentially better final strategy
+  experiment_tag_prefix: "reward-structure"
+  created: "2024-12-27"
+  author: "claude-code"
+
+# Default config values shared across all runs
+# Uses stability config from mlp-stability Exp 11 (Config D winner)
+defaults:
+  total_steps: 100
+  disable_auto_resume: true
+
+  # ==========================================================================
+  # STABILITY CONFIG (updated after reward-structure-A collapse at step 12)
+  # ==========================================================================
+  # KL penalty with adaptive control: Auto-adjusts beta to maintain target KL
+  kl_beta: 0.02            # Initial beta (will be adjusted by adaptive control)
+  kl_target: 0.05          # Target KL mean - triggers adjustment at 0.5x/1.5x
+  kl_beta_warmup_steps: 0  # No warmup needed with PPO clipping active
+
+  # PPO clipping: Essential for stable gradients
+  use_ppo_clipping: true   # CRITICAL: Must be enabled with MLP modules
+  ppo_epsilon_low: 0.2     # Standard PPO epsilon
+  ppo_epsilon_high: 0.5    # Asymmetric clipping for GRPO
+
+  learning_rate: 5e-6      # Standard LR (reverted from 2.5e-6)
+  max_grad_norm: 5.0       # Conservative gradient clipping
+
+  # LoRA: MLP modules for learning capacity
+  lora_rank: 16
+  lora_target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+  # Other stability settings
+  entropy_coef: 0.0
+  use_token_level_loss: false
+  dumbbot_game_probability: 0.0  # Disabled to isolate stability issues
+
+  # Strategic awareness (same for both)
+  leader_gap_penalty_weight: 0.3
+  balance_bonus_weight: 0.2
+
+# Analysis configuration
+analysis:
+  primary_metric: "elo/base_model"  # Lower = better (we beat base model more)
+  secondary_metrics:
+    - "elo_gap"                     # Best checkpoint - base_model (higher = better)
+    - "dumbbot/win_rate"            # Absolute performance metric
+    - "dumbbot/top3_rate"           # Consistency metric
+    - "kl/mean"                     # Stability indicator
+    - "kl/beta"                     # Adaptive KL control - current beta
+    - "ppo/clip_fraction"           # Early warning if > 0.5
+    - "benchmark/grad_norm"         # Gradient health
+  expected_ranking: ["B", "A"]  # Hypothesis: sparse slightly better for strategy
+  success_criteria:
+    - "Both runs complete 100 steps without crash"
+    - "KL mean stays < 0.2 throughout training (adaptive control should maintain)"
+    - "Clip fraction stays < 0.6 (early warning threshold)"
+    - "At least one run shows base_model Elo decline > 50 points"
+  analysis_command: |
+    uv run python .claude/skills/experiment-analysis/analyze_sweep.py --sweep reward-structure
+
+# Run definitions
+runs:
+  A:
+    name: "dense-immediate"
+    description: "gamma=0, per-step rewards - current stable baseline"
+    config:
+      reward_discount_gamma: 0.0
+      use_trajectory_level_rewards: false
+      step_reward_weight: 0.8
+      final_reward_weight: 0.2
+      num_groups_per_step: 16  # 16 rollouts × 4 forks × ~15 steps ≈ 960 samples/step
+      experiment_tag: "${metadata.experiment_tag_prefix}-A-dense"
+
+  B:
+    name: "sparse-trajectory"
+    description: "Trajectory-level grouping with final score only (matched samples)"
+    config:
+      reward_discount_gamma: 0.0  # Not used in trajectory mode
+      use_trajectory_level_rewards: true
+      # 15x more rollouts to match sample count:
+      # 240 rollouts × 4 forks × 1 sample ≈ 960 samples/step
+      num_groups_per_step: 240
+      experiment_tag: "${metadata.experiment_tag_prefix}-B-sparse"

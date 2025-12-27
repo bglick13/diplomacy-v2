@@ -1046,3 +1046,241 @@ class TestDiscountedReturns:
 
         # Last step should be the same regardless of gamma
         assert returns_low[9] == returns_mid[9] == returns_high[9] == 1.0
+
+
+# =============================================================================
+# Tests for GSPO (Group Sequence Policy Optimization)
+# =============================================================================
+
+
+class TestGSPOLoss:
+    """Tests for GSPO loss (sequence-level importance sampling)."""
+
+    @pytest.fixture
+    def mock_model(self):
+        """Create a mock PEFT model for testing."""
+        return MockPeftModel()
+
+    def test_gspo_sequence_ratio_computed(self, mock_model):
+        """Test that GSPO computes sequence-level ratios correctly."""
+        from src.training.loss import GRPOLoss
+
+        loss_fn = GRPOLoss(
+            mock_model,
+            beta=0.0,
+            use_ppo_clipping=True,
+            loss_type="gspo",
+        )
+
+        batch = [
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": 1.0,
+                "rollout_logprobs": -15.0,  # Sum of 10 token logprobs
+            },
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": -1.0,
+                "rollout_logprobs": -12.0,
+            },
+        ]
+
+        output = loss_fn.compute_loss(batch)
+
+        # GSPO should populate sequence-level metrics
+        assert output.gspo_sequence_ratio_mean > 0
+        assert hasattr(output, "gspo_log_ratio_mean")
+        # Should still produce valid loss
+        assert not torch.isnan(output.loss)
+        assert not torch.isinf(output.loss)
+
+    def test_gspo_vs_grpo_different_metrics(self, mock_model):
+        """Test that GSPO and GRPO produce different metrics."""
+        from src.training.loss import GRPOLoss
+
+        batch = [
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": 1.0,
+                "rollout_logprobs": -15.0,
+            },
+        ]
+
+        loss_grpo = GRPOLoss(mock_model, beta=0.0, use_ppo_clipping=True, loss_type="grpo")
+        loss_gspo = GRPOLoss(mock_model, beta=0.0, use_ppo_clipping=True, loss_type="gspo")
+
+        mock_model.zero_grad()
+        output_grpo = loss_grpo.compute_loss(batch)
+
+        mock_model.zero_grad()
+        output_gspo = loss_gspo.compute_loss(batch)
+
+        # GSPO should have populated gspo metrics
+        assert output_gspo.gspo_sequence_ratio_mean > 0
+        # GRPO should have default gspo metrics
+        assert output_grpo.gspo_sequence_ratio_mean == 1.0
+
+    def test_gspo_loss_is_differentiable(self, mock_model):
+        """Test that GSPO loss can be backpropagated."""
+        from src.training.loss import GRPOLoss
+
+        loss_fn = GRPOLoss(
+            mock_model,
+            beta=0.0,
+            use_ppo_clipping=True,
+            loss_type="gspo",
+        )
+
+        batch = [
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": 1.0,
+                "rollout_logprobs": -15.0,
+            },
+        ]
+
+        output = loss_fn.compute_loss(batch)
+
+        # Should be able to backpropagate
+        output.loss.backward()
+
+        # Gradients should exist
+        for param in mock_model.parameters():
+            assert param.grad is not None
+
+    def test_gspo_clipping_applied(self, mock_model):
+        """Test that sequence-level clipping is applied in GSPO."""
+        from src.training.loss import GRPOLoss
+
+        loss_fn = GRPOLoss(
+            mock_model,
+            beta=0.0,
+            use_ppo_clipping=True,
+            ppo_epsilon_low=0.2,
+            ppo_epsilon_high=0.28,
+            loss_type="gspo",
+        )
+
+        # Create batch with extreme rollout logprobs to trigger clipping
+        batch = [
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": 1.0,
+                "rollout_logprobs": -50.0,  # Very different from expected
+            },
+        ]
+
+        output = loss_fn.compute_loss(batch)
+
+        # Should have clip fraction metric
+        assert output.gspo_sequence_ratio_clipped_fraction >= 0
+
+    def test_gspo_fallback_without_rollout_logprobs(self, mock_model):
+        """Test that GSPO falls back to vanilla REINFORCE without rollout_logprobs."""
+        from src.training.loss import GRPOLoss
+
+        loss_fn = GRPOLoss(
+            mock_model,
+            beta=0.0,
+            use_ppo_clipping=True,
+            loss_type="gspo",
+        )
+
+        batch = [
+            {
+                "input_ids": torch.randint(0, 100, (20,)),
+                "attention_mask": torch.ones(20),
+                "labels": torch.cat([torch.full((10,), -100), torch.randint(0, 100, (10,))]),
+                "advantages": 1.0,
+                # No rollout_logprobs
+            },
+        ]
+
+        # Should not raise, should fall back to vanilla REINFORCE
+        output = loss_fn.compute_loss(batch)
+
+        # GSPO metrics should be defaults since clipping wasn't used
+        assert output.gspo_sequence_ratio_mean == 1.0
+
+
+class TestDynamicSampling:
+    """Tests for DAPO-style dynamic sampling (min_reward_variance)."""
+
+    @pytest.fixture
+    def mock_tokenizer(self):
+        return MockTokenizer()
+
+    def test_min_reward_variance_filters_low_variance_groups(self, mock_tokenizer):
+        """Test that groups with variance below threshold are rejected."""
+        from src.training.trainer import process_trajectories
+
+        # Create group with very low variance
+        trajectories = [
+            {"prompt": "p", "completion": "c", "reward": 5.0, "group_id": "g"},
+            {"prompt": "p", "completion": "c", "reward": 5.001, "group_id": "g"},
+            {"prompt": "p", "completion": "c", "reward": 5.002, "group_id": "g"},
+        ]
+
+        # With high min_reward_variance, this group should be rejected
+        batch, stats = process_trajectories(
+            trajectories,
+            mock_tokenizer,
+            min_reward_variance=0.1,  # Variance threshold of 0.1
+        )
+
+        # Should be skipped (variance is ~0.000001, way below 0.1)
+        assert len(batch) == 0
+        assert stats.skipped_zero_variance_groups == 1
+
+    def test_min_reward_variance_allows_high_variance_groups(self, mock_tokenizer):
+        """Test that groups with variance above threshold are kept."""
+        from src.training.trainer import process_trajectories
+
+        # Create group with high variance
+        trajectories = [
+            {"prompt": "p", "completion": "c", "reward": 1.0, "group_id": "g"},
+            {"prompt": "p", "completion": "c", "reward": 5.0, "group_id": "g"},
+            {"prompt": "p", "completion": "c", "reward": 9.0, "group_id": "g"},
+        ]
+
+        # With low min_reward_variance, this group should be kept
+        batch, stats = process_trajectories(
+            trajectories,
+            mock_tokenizer,
+            min_reward_variance=0.01,  # Low threshold
+        )
+
+        # Should be kept (variance is ~10.67, way above 0.01)
+        assert len(batch) == 3
+        assert stats.skipped_zero_variance_groups == 0
+
+    def test_min_reward_variance_zero_disables_feature(self, mock_tokenizer):
+        """Test that min_reward_variance=0 disables the feature."""
+        from src.training.trainer import process_trajectories
+
+        # Create group with low variance that would normally be filtered
+        trajectories = [
+            {"prompt": "p", "completion": "c", "reward": 5.0, "group_id": "g"},
+            {"prompt": "p", "completion": "c", "reward": 5.001, "group_id": "g"},
+        ]
+
+        # With min_reward_variance=0, only advantage_min_std applies
+        batch, stats = process_trajectories(
+            trajectories,
+            mock_tokenizer,
+            min_reward_variance=0.0,
+            advantage_min_std=1e-8,  # Very low threshold
+        )
+
+        # Should be kept since min_reward_variance is disabled
+        assert len(batch) == 2

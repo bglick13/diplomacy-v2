@@ -146,6 +146,12 @@ class GRPOLossOutput:
     is_ratio_std: float = 0.0
     is_masked_fraction: float = 0.0  # For mask mode: fraction of samples zeroed
 
+    # GSPO-specific metrics (only populated when loss_type="gspo")
+    gspo_sequence_ratio_mean: float = 1.0  # Geometric mean of token ratios
+    gspo_sequence_ratio_std: float = 0.0
+    gspo_sequence_ratio_clipped_fraction: float = 0.0
+    gspo_log_ratio_mean: float = 0.0  # Mean of log ratios (before exp)
+
 
 class GRPOLoss:
     """
@@ -175,6 +181,7 @@ class GRPOLoss:
         importance_sampling_correction: bool = True,
         importance_sampling_mode: str = "sequence_truncate",
         importance_sampling_cap: float = 3.0,
+        loss_type: str = "grpo",
     ):
         """
         Args:
@@ -196,6 +203,7 @@ class GRPOLoss:
             importance_sampling_correction: Apply IS correction for vLLM-HF logprobs mismatch.
             importance_sampling_mode: 'sequence_truncate' (clip ratios) or 'sequence_mask' (zero out).
             importance_sampling_cap: Cap for IS ratios (TRL default 3.0).
+            loss_type: 'grpo' for token-level IS or 'gspo' for sequence-level IS.
         """
         self.model = model
         self.beta = beta
@@ -210,6 +218,7 @@ class GRPOLoss:
         self.importance_sampling_correction = importance_sampling_correction
         self.importance_sampling_mode = importance_sampling_mode
         self.importance_sampling_cap = importance_sampling_cap
+        self.loss_type = loss_type
 
     def compute_loss(self, batch: list[dict]) -> GRPOLossOutput:
         """
@@ -382,83 +391,167 @@ class GRPOLoss:
         is_ratio_std = 0.0
         is_masked_fraction = 0.0
 
+        # GSPO-specific metrics (only populated when loss_type="gspo")
+        gspo_sequence_ratio_mean = 1.0
+        gspo_sequence_ratio_std = 0.0
+        gspo_sequence_ratio_clipped_fraction = 0.0
+        gspo_log_ratio_mean = 0.0
+
         if use_clipping:
             # Extract rollout logprobs (from generation time)
             rollout_log_probs = torch.tensor(
                 [b["rollout_logprobs"] for b in batch], dtype=torch.float32, device=device
             )
 
-            # Compute raw ratio: π_θ(a|s) / π_old(a|s) where π_old is rollout policy
-            # This ratio includes BOTH:
-            # 1. Actual policy drift (what PPO wants to clip)
-            # 2. vLLM-HuggingFace numerical mismatch (systematic bias ~1.49x)
-            log_ratio_ppo = completion_log_probs - rollout_log_probs
-            ratio_raw = torch.exp(log_ratio_ppo)
+            # Compute token counts per sequence (needed for GSPO and logging)
+            token_counts = token_mask.sum(dim=1)  # [batch_size]
 
-            # Track raw IS ratio stats (before any correction)
-            with torch.no_grad():
-                is_ratio_mean = ratio_raw.mean().item()
-                is_ratio_std = ratio_raw.std().item() if len(ratio_raw) > 1 else 0.0
+            if self.loss_type == "gspo":
+                # ========== GSPO: Sequence-Level Importance Sampling ==========
+                # GSPO uses the geometric mean of token-level ratios:
+                # s_i = exp(mean_t(log(π_new/π_old))) = exp((Σlog - Σlog) / |o_i|)
+                # This aligns the optimization granularity with sequence-level rewards.
+                log_ratio_sequence = (
+                    completion_log_probs - rollout_log_probs
+                ) / token_counts.clamp(min=1)
+                s_i = torch.exp(log_ratio_sequence)
 
-            # Apply importance sampling correction (TRL-style)
-            # This handles the systematic vLLM-HF mismatch before PPO clipping
-            if self.importance_sampling_correction:
-                cap = self.importance_sampling_cap
+                # Track raw IS ratio stats (before any correction)
+                with torch.no_grad():
+                    is_ratio_mean = s_i.mean().item()
+                    is_ratio_std = s_i.std().item() if len(s_i) > 1 else 0.0
+                    gspo_log_ratio_mean = log_ratio_sequence.mean().item()
 
-                if self.importance_sampling_mode == "sequence_truncate":
-                    # Truncate: clip the IS weight applied to each sample
-                    # This bounds the influence of any single sample due to mismatch
-                    ratio = torch.clamp(ratio_raw, 1.0 / cap, cap)
-                elif self.importance_sampling_mode == "sequence_mask":
-                    # Mask: zero out samples with extreme ratios
-                    mask = (ratio_raw >= 1.0 / cap) & (ratio_raw <= cap)
-                    is_masked_fraction = 1.0 - mask.float().mean().item()
-                    ratio = ratio_raw * mask.float()
+                # Apply IS correction (same logic as GRPO, but on sequence ratio)
+                if self.importance_sampling_correction:
+                    cap = self.importance_sampling_cap
+                    if self.importance_sampling_mode == "sequence_truncate":
+                        ratio = torch.clamp(s_i, 1.0 / cap, cap)
+                    elif self.importance_sampling_mode == "sequence_mask":
+                        mask = (s_i >= 1.0 / cap) & (s_i <= cap)
+                        is_masked_fraction = 1.0 - mask.float().mean().item()
+                        ratio = s_i * mask.float()
+                    else:
+                        ratio = s_i
+                else:
+                    ratio = s_i
+
+                # Compute clipping stats (after IS correction)
+                with torch.no_grad():
+                    ratio_mean = ratio.mean().item()
+                    ratio_std = ratio.std().item() if len(ratio) > 1 else 0.0
+                    clipped_low = (ratio < 1.0 - self.ppo_epsilon_low).sum().item()
+                    clipped_high = (ratio > 1.0 + self.ppo_epsilon_high).sum().item()
+                    ratio_clipped_fraction = (clipped_low + clipped_high) / len(ratio)
+
+                    # Store GSPO-specific metrics
+                    gspo_sequence_ratio_mean = ratio_mean
+                    gspo_sequence_ratio_std = ratio_std
+                    gspo_sequence_ratio_clipped_fraction = ratio_clipped_fraction
+
+                # Debug: Log GSPO diagnostics on first batch
+                if not hasattr(self, "_logged_ratio_debug"):
+                    self._logged_ratio_debug = True
+                    with torch.no_grad():
+                        token_counts_list = token_counts.tolist()
+                        print(
+                            f"\n🔍 GSPO Ratio Debug (IS correction={self.importance_sampling_correction}):\n"
+                            f"  completion_log_probs: mean={completion_log_probs.mean().item():.2f}, "
+                            f"std={completion_log_probs.std().item():.2f}\n"
+                            f"  rollout_log_probs:    mean={rollout_log_probs.mean().item():.2f}, "
+                            f"std={rollout_log_probs.std().item():.2f}\n"
+                            f"  log_ratio_sequence:   mean={gspo_log_ratio_mean:.4f}\n"
+                            f"  raw sequence ratio:   mean={is_ratio_mean:.4f}, std={is_ratio_std:.4f}\n"
+                            f"  corrected ratio:      mean={ratio_mean:.4f}, std={ratio_std:.4f}\n"
+                            f"  clip_frac after IS:   {ratio_clipped_fraction:.1%}\n"
+                            f"  token_counts:         mean={sum(token_counts_list) / len(token_counts_list):.1f}\n"
+                            f"  PPO bounds:           [{1 - self.ppo_epsilon_low:.2f}, {1 + self.ppo_epsilon_high:.2f}]"
+                        )
+
+                # Clip sequence-level ratio
+                clipped_ratio = torch.clamp(
+                    ratio, 1.0 - self.ppo_epsilon_low, 1.0 + self.ppo_epsilon_high
+                )
+
+                # GSPO PPO surrogate: sequence-level ratio * advantage
+                # The ratio is shared across all tokens in the sequence
+                surr1 = -advantages.detach() * ratio
+                surr2 = -advantages.detach() * clipped_ratio
+                pg_loss = torch.max(surr1, surr2)
+
+            else:
+                # ========== GRPO: Token-Level Importance Sampling (Original) ==========
+                # Compute raw ratio: π_θ(a|s) / π_old(a|s) where π_old is rollout policy
+                # This ratio includes BOTH:
+                # 1. Actual policy drift (what PPO wants to clip)
+                # 2. vLLM-HuggingFace numerical mismatch (systematic bias ~1.49x)
+                log_ratio_ppo = completion_log_probs - rollout_log_probs
+                ratio_raw = torch.exp(log_ratio_ppo)
+
+                # Track raw IS ratio stats (before any correction)
+                with torch.no_grad():
+                    is_ratio_mean = ratio_raw.mean().item()
+                    is_ratio_std = ratio_raw.std().item() if len(ratio_raw) > 1 else 0.0
+
+                # Apply importance sampling correction (TRL-style)
+                # This handles the systematic vLLM-HF mismatch before PPO clipping
+                if self.importance_sampling_correction:
+                    cap = self.importance_sampling_cap
+
+                    if self.importance_sampling_mode == "sequence_truncate":
+                        # Truncate: clip the IS weight applied to each sample
+                        # This bounds the influence of any single sample due to mismatch
+                        ratio = torch.clamp(ratio_raw, 1.0 / cap, cap)
+                    elif self.importance_sampling_mode == "sequence_mask":
+                        # Mask: zero out samples with extreme ratios
+                        mask = (ratio_raw >= 1.0 / cap) & (ratio_raw <= cap)
+                        is_masked_fraction = 1.0 - mask.float().mean().item()
+                        ratio = ratio_raw * mask.float()
+                    else:
+                        ratio = ratio_raw
                 else:
                     ratio = ratio_raw
-            else:
-                ratio = ratio_raw
 
-            # Compute PPO clipping stats (after IS correction)
-            with torch.no_grad():
-                ratio_mean = ratio.mean().item()
-                ratio_std = ratio.std().item() if len(ratio) > 1 else 0.0
-                # Count samples outside clip bounds
-                clipped_low = (ratio < 1.0 - self.ppo_epsilon_low).sum().item()
-                clipped_high = (ratio > 1.0 + self.ppo_epsilon_high).sum().item()
-                ratio_clipped_fraction = (clipped_low + clipped_high) / len(ratio)
-
-            # Debug: Log detailed ratio diagnostics on first batch
-            if not hasattr(self, "_logged_ratio_debug"):
-                self._logged_ratio_debug = True
+                # Compute PPO clipping stats (after IS correction)
                 with torch.no_grad():
-                    token_counts = token_mask.sum(dim=1).tolist()
-                    print(
-                        f"\n🔍 PPO Ratio Debug (IS correction={self.importance_sampling_correction}):\n"
-                        f"  completion_log_probs: mean={completion_log_probs.mean().item():.2f}, "
-                        f"std={completion_log_probs.std().item():.2f}\n"
-                        f"  rollout_log_probs:    mean={rollout_log_probs.mean().item():.2f}, "
-                        f"std={rollout_log_probs.std().item():.2f}\n"
-                        f"  raw IS ratio:         mean={is_ratio_mean:.4f}, std={is_ratio_std:.4f}\n"
-                        f"  corrected ratio:      mean={ratio_mean:.4f}, std={ratio_std:.4f}\n"
-                        f"  clip_frac after IS:   {ratio_clipped_fraction:.1%}\n"
-                        f"  token_counts:         mean={sum(token_counts) / len(token_counts):.1f}\n"
-                        f"  PPO bounds:           [{1 - self.ppo_epsilon_low:.2f}, {1 + self.ppo_epsilon_high:.2f}]"
-                    )
+                    ratio_mean = ratio.mean().item()
+                    ratio_std = ratio.std().item() if len(ratio) > 1 else 0.0
+                    # Count samples outside clip bounds
+                    clipped_low = (ratio < 1.0 - self.ppo_epsilon_low).sum().item()
+                    clipped_high = (ratio > 1.0 + self.ppo_epsilon_high).sum().item()
+                    ratio_clipped_fraction = (clipped_low + clipped_high) / len(ratio)
 
-            # Asymmetric clipping: lower bound tighter than upper for exploration
-            clipped_ratio = torch.clamp(
-                ratio, 1.0 - self.ppo_epsilon_low, 1.0 + self.ppo_epsilon_high
-            )
+                # Debug: Log detailed ratio diagnostics on first batch
+                if not hasattr(self, "_logged_ratio_debug"):
+                    self._logged_ratio_debug = True
+                    with torch.no_grad():
+                        token_counts_list = token_counts.tolist()
+                        print(
+                            f"\n🔍 GRPO Ratio Debug (IS correction={self.importance_sampling_correction}):\n"
+                            f"  completion_log_probs: mean={completion_log_probs.mean().item():.2f}, "
+                            f"std={completion_log_probs.std().item():.2f}\n"
+                            f"  rollout_log_probs:    mean={rollout_log_probs.mean().item():.2f}, "
+                            f"std={rollout_log_probs.std().item():.2f}\n"
+                            f"  raw IS ratio:         mean={is_ratio_mean:.4f}, std={is_ratio_std:.4f}\n"
+                            f"  corrected ratio:      mean={ratio_mean:.4f}, std={ratio_std:.4f}\n"
+                            f"  clip_frac after IS:   {ratio_clipped_fraction:.1%}\n"
+                            f"  token_counts:         mean={sum(token_counts_list) / len(token_counts_list):.1f}\n"
+                            f"  PPO bounds:           [{1 - self.ppo_epsilon_low:.2f}, {1 + self.ppo_epsilon_high:.2f}]"
+                        )
 
-            # PPO surrogate: min(ratio * A, clip(ratio) * A)
-            # For positive advantages: we want to increase probability (ratio > 1)
-            #   - Clipping limits how much we can increase
-            # For negative advantages: we want to decrease probability (ratio < 1)
-            #   - Clipping limits how much we can decrease
-            surr1 = -advantages.detach() * ratio
-            surr2 = -advantages.detach() * clipped_ratio
-            pg_loss = torch.max(surr1, surr2)  # max because we negate advantage
+                # Asymmetric clipping: lower bound tighter than upper for exploration
+                clipped_ratio = torch.clamp(
+                    ratio, 1.0 - self.ppo_epsilon_low, 1.0 + self.ppo_epsilon_high
+                )
+
+                # PPO surrogate: min(ratio * A, clip(ratio) * A)
+                # For positive advantages: we want to increase probability (ratio > 1)
+                #   - Clipping limits how much we can increase
+                # For negative advantages: we want to decrease probability (ratio < 1)
+                #   - Clipping limits how much we can decrease
+                surr1 = -advantages.detach() * ratio
+                surr2 = -advantages.detach() * clipped_ratio
+                pg_loss = torch.max(surr1, surr2)  # max because we negate advantage
         else:
             # Vanilla REINFORCE (no clipping)
             # Used when use_ppo_clipping=False or rollout_logprobs not available
@@ -505,4 +598,8 @@ class GRPOLoss:
             is_ratio_mean=is_ratio_mean,
             is_ratio_std=is_ratio_std,
             is_masked_fraction=is_masked_fraction,
+            gspo_sequence_ratio_mean=gspo_sequence_ratio_mean,
+            gspo_sequence_ratio_std=gspo_sequence_ratio_std,
+            gspo_sequence_ratio_clipped_fraction=gspo_sequence_ratio_clipped_fraction,
+            gspo_log_ratio_mean=gspo_log_ratio_mean,
         )

@@ -1053,71 +1053,84 @@ def build_trajectories(
             discounted_returns[(g_idx, power, step)] = cumulative
 
     # =========================================================================
-    # Pass 3: Build trajectories using discounted returns
+    # Pass 3: Build trajectories
     # =========================================================================
-    for (g_idx, step_count), power_data in fork_data.items():
-        if not power_data:
-            continue
+    # Two modes:
+    # A) Dense per-step: emit one trajectory per (g_idx, power, step_count)
+    #    - Uses discounted returns + final score blend
+    #    - Groups by step across forks
+    # B) Sparse trajectory-level: emit ONE trajectory per (g_idx, power)
+    #    - Uses only final score (sparse temporal credit)
+    #    - Groups by trajectory across forks
+    #    - Avoids gradient correlation issue of dense + gamma > 0
 
-        game = games[g_idx]
-        final_scores = final_scores_by_game[g_idx]
+    if cfg.use_trajectory_level_rewards:
+        # =====================================================================
+        # Trajectory-Level Mode: ONE sample per (g_idx, power)
+        # =====================================================================
+        # Use the FIRST step's prompt/completion as representative of the
+        # trajectory's initial strategic decision. Reward = final outcome.
+        # This provides sparse but theoretically sound temporal credit.
 
-        # Track SC counts and placements once per game (not per step)
-        if g_idx not in seen_games_for_sc:
-            seen_games_for_sc.add(g_idx)
+        # Find first step for each (g_idx, power)
+        first_step_data: dict[tuple[int, str], tuple[int, dict]] = {}
+        for (g_idx, step_count), power_data in fork_data.items():
+            if not power_data:
+                continue
+            for power, data in power_data.items():
+                key = (g_idx, power)
+                if key not in first_step_data or step_count < first_step_data[key][0]:
+                    first_step_data[key] = (step_count, data)
 
-            # Calculate SC counts and ranks for all powers in this game
-            game_sc_counts = {pn: len(p.centers) for pn, p in game.game.powers.items()}
-            sorted_powers = sorted(game_sc_counts.items(), key=lambda x: x[1], reverse=True)
+        # Build one trajectory per (g_idx, power)
+        for (g_idx, power), (first_step, data) in first_step_data.items():
+            game = games[g_idx]
+            final_scores = final_scores_by_game[g_idx]
 
-            # Assign ranks with tie handling (1 = best, 7 = worst)
-            power_ranks: dict[str, int] = {}
-            prev_sc = None
-            prev_rank = 0
-            for i, (power_name, sc_count) in enumerate(sorted_powers):
-                if sc_count == prev_sc:
-                    power_ranks[power_name] = prev_rank
-                else:
-                    power_ranks[power_name] = i + 1
-                    prev_rank = i + 1
-                prev_sc = sc_count
-
-            for power in power_data.keys():
-                if adapter_config.hero_power and power != adapter_config.hero_power:
-                    continue
-                n_sc = len(game.game.powers[power].centers)
-                sc_counts.append(n_sc)
-
-                # Track hero placement (rank 1-7)
-                hero_rank = power_ranks.get(power, 7)
-                hero_placements.append(hero_rank)
-
-                # Check if this power got win bonus (sole leader above threshold)
-                if n_sc >= cfg.winner_threshold_sc:
-                    all_sc = [len(p.centers) for p in game.game.powers.values()]
-                    if n_sc == max(all_sc) and all_sc.count(n_sc) == 1:
-                        win_bonus_awarded += 1
-
-        for power, data in power_data.items():
             if power not in final_scores:
                 continue
 
-            # Get reference logprobs if computed (now keyed by step_count too)
-            ref_logprobs = ref_logprobs_map.get((g_idx, step_count, power))
+            # Track SC counts and placements once per game
+            if g_idx not in seen_games_for_sc:
+                seen_games_for_sc.add(g_idx)
+                game_sc_counts = {pn: len(p.centers) for pn, p in game.game.powers.items()}
+                sorted_powers = sorted(game_sc_counts.items(), key=lambda x: x[1], reverse=True)
 
-            # If no LoRA used, generation logprobs ARE reference logprobs
+                power_ranks: dict[str, int] = {}
+                prev_sc = None
+                prev_rank = 0
+                for i, (power_name, sc_count) in enumerate(sorted_powers):
+                    if sc_count == prev_sc:
+                        power_ranks[power_name] = prev_rank
+                    else:
+                        power_ranks[power_name] = i + 1
+                        prev_rank = i + 1
+                    prev_sc = sc_count
+
+                for p in first_step_data:
+                    if p[0] != g_idx:
+                        continue
+                    pwr = p[1]
+                    if adapter_config.hero_power and pwr != adapter_config.hero_power:
+                        continue
+                    n_sc = len(game.game.powers[pwr].centers)
+                    sc_counts.append(n_sc)
+                    hero_rank = power_ranks.get(pwr, 7)
+                    hero_placements.append(hero_rank)
+                    if n_sc >= cfg.winner_threshold_sc:
+                        all_sc = [len(p.centers) for p in game.game.powers.values()]
+                        if n_sc == max(all_sc) and all_sc.count(n_sc) == 1:
+                            win_bonus_awarded += 1
+
+            # Get reference logprobs for first step
+            ref_logprobs = ref_logprobs_map.get((g_idx, first_step, power))
             if ref_logprobs is None and not adapter_config.uses_lora(power):
                 completion_logprobs = data.get("completion_logprobs", [])
                 if completion_logprobs:
                     ref_logprobs = sum(completion_logprobs)
 
-            # Compute blended reward using discounted cumulative step returns
-            # This gives credit to earlier moves that set up later captures
-            discounted_step_return = discounted_returns.get((g_idx, power, step_count), 0.0)
-            step_component = discounted_step_return * cfg.step_reward_weight
-            final_component = final_scores[power] * cfg.final_reward_weight
-
-            # Strategic awareness components
+            # Trajectory-level reward: only final score (no step rewards)
+            # Strategic components based on final game state
             leader_gap = calculate_leader_gap_penalty(
                 game, power, threshold=cfg.leader_gap_threshold
             )
@@ -1127,15 +1140,15 @@ def build_trajectories(
                 + balance_bonus * cfg.balance_bonus_weight
             )
 
-            blended_reward = step_component + final_component + strategic_component
+            # Reward = final score + strategic (no step component)
+            trajectory_reward = final_scores[power] + strategic_component
 
-            # Use step_count in group_id for proper credit assignment
-            # This ensures trajectories from the same step across forks are grouped together
+            # Trajectory-level grouping: compare forks, not steps
             traj = {
                 "prompt": data["prompt"],
                 "completion": data["completion"],
-                "reward": blended_reward,
-                "group_id": f"{game_id}_{power}_step{step_count}",
+                "reward": trajectory_reward,
+                "group_id": f"{game_id}_{power}",  # No step_count → trajectory grouping
                 "prompt_token_ids": data.get("prompt_token_ids", []),
                 "completion_token_ids": data.get("completion_token_ids", []),
                 "completion_logprobs": data.get("completion_logprobs", []),
@@ -1145,6 +1158,101 @@ def build_trajectories(
                 traj["ref_logprobs"] = ref_logprobs
 
             trajectories.append(traj)
+
+    else:
+        # =====================================================================
+        # Dense Per-Step Mode: one trajectory per (g_idx, power, step_count)
+        # =====================================================================
+        for (g_idx, step_count), power_data in fork_data.items():
+            if not power_data:
+                continue
+
+            game = games[g_idx]
+            final_scores = final_scores_by_game[g_idx]
+
+            # Track SC counts and placements once per game (not per step)
+            if g_idx not in seen_games_for_sc:
+                seen_games_for_sc.add(g_idx)
+
+                # Calculate SC counts and ranks for all powers in this game
+                game_sc_counts = {pn: len(p.centers) for pn, p in game.game.powers.items()}
+                sorted_powers = sorted(game_sc_counts.items(), key=lambda x: x[1], reverse=True)
+
+                # Assign ranks with tie handling (1 = best, 7 = worst)
+                power_ranks: dict[str, int] = {}
+                prev_sc = None
+                prev_rank = 0
+                for i, (power_name, sc_count) in enumerate(sorted_powers):
+                    if sc_count == prev_sc:
+                        power_ranks[power_name] = prev_rank
+                    else:
+                        power_ranks[power_name] = i + 1
+                        prev_rank = i + 1
+                    prev_sc = sc_count
+
+                for power in power_data.keys():
+                    if adapter_config.hero_power and power != adapter_config.hero_power:
+                        continue
+                    n_sc = len(game.game.powers[power].centers)
+                    sc_counts.append(n_sc)
+
+                    # Track hero placement (rank 1-7)
+                    hero_rank = power_ranks.get(power, 7)
+                    hero_placements.append(hero_rank)
+
+                    # Check if this power got win bonus (sole leader above threshold)
+                    if n_sc >= cfg.winner_threshold_sc:
+                        all_sc = [len(p.centers) for p in game.game.powers.values()]
+                        if n_sc == max(all_sc) and all_sc.count(n_sc) == 1:
+                            win_bonus_awarded += 1
+
+            for power, data in power_data.items():
+                if power not in final_scores:
+                    continue
+
+                # Get reference logprobs if computed (now keyed by step_count too)
+                ref_logprobs = ref_logprobs_map.get((g_idx, step_count, power))
+
+                # If no LoRA used, generation logprobs ARE reference logprobs
+                if ref_logprobs is None and not adapter_config.uses_lora(power):
+                    completion_logprobs = data.get("completion_logprobs", [])
+                    if completion_logprobs:
+                        ref_logprobs = sum(completion_logprobs)
+
+                # Compute blended reward using discounted cumulative step returns
+                # This gives credit to earlier moves that set up later captures
+                discounted_step_return = discounted_returns.get((g_idx, power, step_count), 0.0)
+                step_component = discounted_step_return * cfg.step_reward_weight
+                final_component = final_scores[power] * cfg.final_reward_weight
+
+                # Strategic awareness components
+                leader_gap = calculate_leader_gap_penalty(
+                    game, power, threshold=cfg.leader_gap_threshold
+                )
+                balance_bonus = calculate_balance_of_power_score(game, power)
+                strategic_component = (
+                    leader_gap * cfg.leader_gap_penalty_weight
+                    + balance_bonus * cfg.balance_bonus_weight
+                )
+
+                blended_reward = step_component + final_component + strategic_component
+
+                # Use step_count in group_id for proper credit assignment
+                # This ensures trajectories from the same step across forks are grouped together
+                traj = {
+                    "prompt": data["prompt"],
+                    "completion": data["completion"],
+                    "reward": blended_reward,
+                    "group_id": f"{game_id}_{power}_step{step_count}",
+                    "prompt_token_ids": data.get("prompt_token_ids", []),
+                    "completion_token_ids": data.get("completion_token_ids", []),
+                    "completion_logprobs": data.get("completion_logprobs", []),
+                }
+
+                if ref_logprobs is not None:
+                    traj["ref_logprobs"] = ref_logprobs
+
+                trajectories.append(traj)
 
     game_stats = {
         "sc_counts": sc_counts,

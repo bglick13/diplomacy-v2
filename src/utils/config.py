@@ -46,6 +46,28 @@ class ExperimentConfig(BaseModel):
     wandb_project: str = Field(default="diplomacy-grpo", description="WandB project name")
 
     # =========================================================================
+    # Loss Type (GRPO vs GSPO)
+    # =========================================================================
+    loss_type: Literal["grpo", "gspo"] = Field(
+        default="grpo",
+        description=(
+            "Loss type for policy optimization. "
+            "'grpo' uses token-level importance sampling (standard). "
+            "'gspo' uses sequence-level importance sampling (geometric mean of token ratios)."
+        ),
+    )
+    min_reward_variance: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Minimum reward variance within a group to include in training (DAPO-style dynamic sampling). "
+            "Groups with lower variance are rejected (no gradient signal). "
+            "Set to 0.0 to disable (use advantage_min_std instead). "
+            "Recommended: 0.01 for GSPO."
+        ),
+    )
+
+    # =========================================================================
     # Model Settings
     # =========================================================================
     base_model_id: str = Field(
@@ -209,7 +231,7 @@ class ExperimentConfig(BaseModel):
         description="Weight for forward unit positioning in step scoring (+ per unit outside home)",
     )
     reward_discount_gamma: float = Field(
-        default=1.0,
+        default=0.0,
         ge=0.0,
         le=1.0,
         description=(
@@ -217,7 +239,18 @@ class ExperimentConfig(BaseModel):
             "Each step t receives discounted sum of future deltas: Σ γ^(k-t) × delta_k. "
             "gamma=1.0 means no discounting (all future steps weighted equally). "
             "gamma=0.95 gives ~35% weight to rewards 10 steps ahead. "
-            "gamma=0.0 means only immediate step delta (current behavior with gamma=1.0 disabled)."
+            "gamma=0.0 means only immediate step delta (no temporal credit). "
+            "WARNING: gamma > 0 creates correlated gradients that can destabilize training."
+        ),
+    )
+    use_trajectory_level_rewards: bool = Field(
+        default=False,
+        description=(
+            "If True, emit ONE sample per trajectory (using first step's prompt/completion) "
+            "with final score as reward. Groups by trajectory instead of by step. "
+            "This provides sparse but theoretically sound temporal credit assignment: "
+            "GRPO compares entire trajectories ('which fork's strategy was better?') "
+            "rather than individual steps. Avoids the gradient correlation issue of gamma > 0."
         ),
     )
 

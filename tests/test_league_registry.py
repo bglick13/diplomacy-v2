@@ -121,9 +121,9 @@ class TestLeagueRegistry:
         """New registry should have default baselines."""
         registry = LeagueRegistry(temp_registry_path, run_name="test-run")
 
-        # Should have 5 default baselines (removed random_bot, added stronger bots)
+        # Should have 6 default baselines (removed random_bot, added stronger bots + dumb_bot)
         baselines = registry.get_baselines()
-        assert len(baselines) == 5
+        assert len(baselines) == 6
 
         baseline_names = {b.name for b in baselines}
         assert baseline_names == {
@@ -132,6 +132,7 @@ class TestLeagueRegistry:
             "defensive_bot",
             "territorial_bot",
             "coordinated_bot",
+            "dumb_bot",
         }
 
         # Metadata should be initialized

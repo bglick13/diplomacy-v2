@@ -91,6 +91,7 @@ def process_trajectories(
     verbose: bool = False,
     advantage_clip: float | None = None,
     advantage_min_std: float = 1e-8,
+    min_reward_variance: float = 0.0,
 ) -> tuple[list[dict], TrajectoryStats]:
     """
     Takes raw rollouts and prepares tensors for the training loop.
@@ -118,6 +119,9 @@ def process_trajectories(
             extreme gradients from outliers.
         advantage_min_std: Minimum std for advantage normalization. Groups with
             std below this are skipped as they provide no gradient signal.
+        min_reward_variance: Minimum reward variance within group (DAPO-style dynamic
+            sampling). Groups with variance below this are rejected. Set to 0.0 to
+            disable. Recommended: 0.01 for GSPO.
 
     Returns:
         Tuple of (processed_batch, stats) where processed_batch is list of dicts
@@ -170,7 +174,12 @@ def process_trajectories(
 
         # Handle edge case: all rewards identical or near-identical (low std)
         # Skip groups with low variance - they provide no gradient signal
-        if std_r < advantage_min_std:
+        # Use the stricter of advantage_min_std and sqrt(min_reward_variance)
+        # (variance = std^2, so we compare std to sqrt(variance))
+        effective_min_std = max(
+            advantage_min_std, min_reward_variance**0.5 if min_reward_variance > 0 else 0.0
+        )
+        if std_r < effective_min_std:
             stats.skipped_zero_variance_groups += 1
             continue
 
