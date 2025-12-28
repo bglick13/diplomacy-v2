@@ -24,10 +24,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.apps.common.images import gpu_image
 from src.apps.common.volumes import MODELS_PATH, TRACE_PATH, VOLUME_PATH, trace_volume, volume
-from src.training.loss import AdaptiveKLController, GRPOLoss, KLControllerConfig
+from src.training.loss import AdaptiveKLController, GRPOLoss, ISOutlier, KLControllerConfig
 from src.training.trainer import TrajectoryStats, process_trajectories
 from src.utils.config import ExperimentConfig
 from src.utils.observability import GPUStatsLogger, axiom, logger, stopwatch
+from src.utils.weave_traces import (
+    ISOutlierTrace,
+    init_weave,
+    is_weave_initialized,
+    log_is_outliers_batch,
+)
 
 app = modal.App("diplomacy-grpo-trainer")
 
@@ -1095,7 +1101,16 @@ def build_wandb_metrics(
         # Importance sampling diagnostics (vLLM-HuggingFace mismatch correction)
         "ppo/is_ratio_mean": step_metrics.get("is_ratio_mean", 1.0),
         "ppo/is_ratio_std": step_metrics.get("is_ratio_std", 0.0),
+        "ppo/is_ratio_min": step_metrics.get("is_ratio_min", 1.0),
+        "ppo/is_ratio_max": step_metrics.get("is_ratio_max", 1.0),
         "ppo/is_masked_fraction": step_metrics.get("is_masked_fraction", 0.0),
+        # Token-level log_prob diagnostics (vLLM-HF mismatch debugging)
+        "logprob/token_min": step_metrics.get("token_logprob_min", 0.0),
+        "logprob/token_max": step_metrics.get("token_logprob_max", 0.0),
+        "logprob/token_mean": step_metrics.get("token_logprob_mean", 0.0),
+        "logprob/diff_mean": step_metrics.get("logprob_diff_mean", 0.0),
+        "logprob/diff_std": step_metrics.get("logprob_diff_std", 0.0),
+        "logprob/diff_max": step_metrics.get("logprob_diff_max", 0.0),
         # GSPO metrics (sequence-level importance sampling)
         "gspo/sequence_ratio_mean": step_metrics.get("gspo_sequence_ratio_mean", 1.0),
         "gspo/sequence_ratio_std": step_metrics.get("gspo_sequence_ratio_std", 0.0),
@@ -1417,6 +1432,12 @@ def initialize_wandb(
 
     wandb.init(**wandb_kwargs)
 
+    # Initialize Weave for trajectory/outlier tracing (uses same WandB auth)
+    try:
+        init_weave("diplomacy-grpo")
+    except Exception as e:
+        logger.warning(f"⚠️ Weave init failed (outlier logging disabled): {e}")
+
 
 # ============================================================================
 # PROFILING HELPERS
@@ -1717,7 +1738,16 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                     # Importance sampling metrics (vLLM-HF mismatch correction)
                     "is_ratio_mean": train_metrics["is_ratio_mean"],
                     "is_ratio_std": train_metrics["is_ratio_std"],
+                    "is_ratio_min": train_metrics["is_ratio_min"],
+                    "is_ratio_max": train_metrics["is_ratio_max"],
                     "is_masked_fraction": train_metrics["is_masked_fraction"],
+                    # Token-level log_prob diagnostics
+                    "token_logprob_min": train_metrics["token_logprob_min"],
+                    "token_logprob_max": train_metrics["token_logprob_max"],
+                    "token_logprob_mean": train_metrics["token_logprob_mean"],
+                    "logprob_diff_mean": train_metrics["logprob_diff_mean"],
+                    "logprob_diff_std": train_metrics["logprob_diff_std"],
+                    "logprob_diff_max": train_metrics["logprob_diff_max"],
                     "reward_mean": traj_stats.reward_mean,
                     "reward_std": traj_stats.reward_std,
                     "total_tokens": traj_stats.total_tokens,
@@ -1746,6 +1776,32 @@ def train_grpo(config_dict: dict | None = None, **kwargs) -> dict:
                 profile_snapshots.append(step_profile)
 
             metrics["step_metrics"].append(step_metrics)
+
+            # Log IS outliers to Weave (for vLLM-HF mismatch debugging)
+            is_outliers = train_metrics.get("is_outliers", [])
+            if is_outliers and is_weave_initialized():
+                try:
+                    weave_outliers = [
+                        ISOutlierTrace(
+                            run_name=cfg.run_name,
+                            step=step,
+                            prompt=outlier.prompt,
+                            completion=outlier.completion,
+                            is_ratio=outlier.is_ratio,
+                            logprob_diff=outlier.logprob_diff,
+                            completion_logprob=outlier.completion_logprob,
+                            rollout_logprob=outlier.rollout_logprob,
+                            num_tokens=outlier.num_tokens,
+                            group_id=outlier.group_id,
+                            reward=outlier.reward,
+                            advantage=outlier.advantage,
+                        )
+                        for outlier in is_outliers
+                    ]
+                    log_is_outliers_batch(weave_outliers)
+                    logger.debug(f"📊 Logged {len(weave_outliers)} IS outliers to Weave")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to log IS outliers to Weave: {e}")
 
             # Log to console
             extraction_rate_pct = extraction_stats["extraction_rate"] * 100
@@ -2018,12 +2074,23 @@ def _run_training_step(
     # Importance sampling metrics (vLLM-HF mismatch correction)
     accum_is_ratio_mean = 0.0
     accum_is_ratio_std = 0.0
+    accum_is_ratio_min = float("inf")
+    accum_is_ratio_max = 0.0
     accum_is_masked_fraction = 0.0
+    # Token-level log_prob diagnostics (vLLM-HF mismatch debugging)
+    accum_token_logprob_min = float("inf")
+    accum_token_logprob_max = float("-inf")
+    accum_token_logprob_mean = 0.0
+    accum_logprob_diff_mean = 0.0
+    accum_logprob_diff_std = 0.0
+    accum_logprob_diff_max = 0.0
     # GSPO metrics (sequence-level importance sampling)
     accum_gspo_sequence_ratio_mean = 0.0
     accum_gspo_sequence_ratio_std = 0.0
     accum_gspo_sequence_ratio_clipped_fraction = 0.0
     accum_gspo_log_ratio_mean = 0.0
+    # IS outliers for debugging (collected across all chunks)
+    all_is_outliers: list[ISOutlier] = []
     # Use ceiling division to correctly count partial chunks at the end
     total_chunks = (len(batch_data) + cfg.chunk_size - 1) // cfg.chunk_size
 
@@ -2061,7 +2128,16 @@ def _run_training_step(
         # Importance sampling metrics
         accum_is_ratio_mean += loss_output.is_ratio_mean
         accum_is_ratio_std += loss_output.is_ratio_std
+        accum_is_ratio_min = min(accum_is_ratio_min, loss_output.is_ratio_min)
+        accum_is_ratio_max = max(accum_is_ratio_max, loss_output.is_ratio_max)
         accum_is_masked_fraction += loss_output.is_masked_fraction
+        # Token-level log_prob diagnostics
+        accum_token_logprob_min = min(accum_token_logprob_min, loss_output.token_logprob_min)
+        accum_token_logprob_max = max(accum_token_logprob_max, loss_output.token_logprob_max)
+        accum_token_logprob_mean += loss_output.token_logprob_mean
+        accum_logprob_diff_mean += loss_output.logprob_diff_mean
+        accum_logprob_diff_std += loss_output.logprob_diff_std
+        accum_logprob_diff_max = max(accum_logprob_diff_max, loss_output.logprob_diff_max)
         # GSPO metrics
         accum_gspo_sequence_ratio_mean += loss_output.gspo_sequence_ratio_mean
         accum_gspo_sequence_ratio_std += loss_output.gspo_sequence_ratio_std
@@ -2069,6 +2145,9 @@ def _run_training_step(
             loss_output.gspo_sequence_ratio_clipped_fraction
         )
         accum_gspo_log_ratio_mean += loss_output.gspo_log_ratio_mean
+        # Collect IS outliers (limit total to avoid memory issues)
+        if loss_output.is_outliers and len(all_is_outliers) < 10:
+            all_is_outliers.extend(loss_output.is_outliers[: 10 - len(all_is_outliers)])
 
     with profile_section(step_profile, "optimizer_step"):
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -2104,13 +2183,28 @@ def _run_training_step(
         # Importance sampling metrics (vLLM-HF mismatch correction)
         "is_ratio_mean": accum_is_ratio_mean / max(1, num_chunks),
         "is_ratio_std": accum_is_ratio_std / max(1, num_chunks),
+        "is_ratio_min": accum_is_ratio_min if accum_is_ratio_min != float("inf") else 1.0,
+        "is_ratio_max": accum_is_ratio_max,
         "is_masked_fraction": accum_is_masked_fraction / max(1, num_chunks),
+        # Token-level log_prob diagnostics (vLLM-HF mismatch debugging)
+        "token_logprob_min": accum_token_logprob_min
+        if accum_token_logprob_min != float("inf")
+        else 0.0,
+        "token_logprob_max": accum_token_logprob_max
+        if accum_token_logprob_max != float("-inf")
+        else 0.0,
+        "token_logprob_mean": accum_token_logprob_mean / max(1, num_chunks),
+        "logprob_diff_mean": accum_logprob_diff_mean / max(1, num_chunks),
+        "logprob_diff_std": accum_logprob_diff_std / max(1, num_chunks),
+        "logprob_diff_max": accum_logprob_diff_max,
         # GSPO metrics (sequence-level importance sampling)
         "gspo_sequence_ratio_mean": accum_gspo_sequence_ratio_mean / max(1, num_chunks),
         "gspo_sequence_ratio_std": accum_gspo_sequence_ratio_std / max(1, num_chunks),
         "gspo_sequence_ratio_clipped_fraction": accum_gspo_sequence_ratio_clipped_fraction
         / max(1, num_chunks),
         "gspo_log_ratio_mean": accum_gspo_log_ratio_mean / max(1, num_chunks),
+        # IS outliers for Weave debugging
+        "is_outliers": all_is_outliers,
     }
 
 

@@ -209,6 +209,68 @@ def log_batch_summary(summary: TrajectoryBatchSummary) -> TrajectoryBatchSummary
     return summary
 
 
+class ISOutlierTrace(BaseModel):
+    """
+    Importance Sampling outlier for debugging vLLM-HuggingFace mismatch.
+
+    These samples have extreme IS ratios (> threshold), which cause training
+    instability when not properly capped/masked.
+    """
+
+    # Identification
+    run_name: str = Field(default="", description="Training run name")
+    step: int = Field(default=0, description="Training step when outlier was detected")
+
+    # The actual completion data
+    prompt: str = Field(description="Full prompt (truncated to 500 chars)")
+    completion: str = Field(description="LLM completion (truncated to 500 chars)")
+
+    # IS ratio diagnostics
+    is_ratio: float = Field(description="Raw IS ratio (π_new / π_old) before capping")
+    logprob_diff: float = Field(
+        description="Sequence-level log_prob difference (HF - vLLM) in nats"
+    )
+    completion_logprob: float = Field(description="HuggingFace computed log_prob")
+    rollout_logprob: float = Field(description="vLLM computed log_prob (from rollout)")
+    num_tokens: int = Field(description="Number of completion tokens")
+
+    # Context
+    group_id: str = Field(description="GRPO group ID")
+    reward: float = Field(description="Reward for this trajectory")
+    advantage: float = Field(description="Computed advantage")
+
+
+@weave.op()
+def log_is_outlier(outlier: ISOutlierTrace) -> ISOutlierTrace:
+    """
+    Log an IS outlier to Weave for debugging.
+
+    IS outliers are samples where vLLM and HuggingFace compute significantly
+    different log probabilities, causing extreme importance sampling ratios.
+
+    Args:
+        outlier: ISOutlierTrace with outlier details
+
+    Returns:
+        The input outlier (for chaining)
+    """
+    return outlier
+
+
+@weave.op()
+def log_is_outliers_batch(outliers: list[ISOutlierTrace]) -> list[ISOutlierTrace]:
+    """
+    Log multiple IS outliers to Weave in a single operation.
+
+    Args:
+        outliers: List of ISOutlierTrace objects
+
+    Returns:
+        The input outliers (for chaining)
+    """
+    return outliers
+
+
 def create_trajectory_from_rollout_data(
     data: dict,
     game_id: str,

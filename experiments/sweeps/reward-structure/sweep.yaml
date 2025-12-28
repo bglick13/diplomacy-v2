@@ -10,7 +10,7 @@
 # dense immediate rewards for learning good Diplomacy strategy?
 
 metadata:
-  name: "reward-structure-v2"
+  name: "reward-structure-v3"
   description: "Ablation: Dense immediate vs sparse trajectory-level rewards"
   hypothesis: |
     Sparse trajectory-level rewards may outperform dense immediate rewards because:
@@ -36,6 +36,9 @@ metadata:
 defaults:
   total_steps: 100
   disable_auto_resume: true
+  loss_type: "gspo"
+  min_reward_variance: 0.01
+  temperature: 0.65
 
   # ==========================================================================
   # STABILITY CONFIG (using EMA reference for MLP training stability)
@@ -46,16 +49,16 @@ defaults:
   ema_tau: 0.99            # Slow update (~100 step half-life)
 
   # KL penalty with adaptive control
-  kl_beta: 0.02            # Initial beta (will be adjusted by adaptive control)
-  kl_target: 0.05          # Target KL mean - triggers adjustment at 0.5x/1.5x
+  kl_beta: 0.04            # Initial beta (will be adjusted by adaptive control)
   kl_beta_warmup_steps: 0  # No warmup needed with PPO clipping active
 
   # PPO clipping: Essential for stable gradients
   use_ppo_clipping: true   # CRITICAL: Must be enabled with MLP modules
   ppo_epsilon_low: 0.2     # Standard PPO epsilon
   ppo_epsilon_high: 0.5    # Asymmetric clipping for GRPO
+  importance_sampling_cap: 1.5
 
-  learning_rate: 5e-6      # Standard LR (reverted from 2.5e-6)
+  learning_rate: 1e-6      # Standard LR (reverted from 2.5e-6)
   max_grad_norm: 5.0       # Conservative gradient clipping
 
   # LoRA: MLP modules for learning capacity

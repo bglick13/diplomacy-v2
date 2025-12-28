@@ -276,6 +276,9 @@ def process_trajectories(
                 "advantages": float(advantage),
                 "group_id": group_id,  # Keep for debugging
                 "reward": item["reward"],  # Keep for debugging
+                # Original text for outlier logging (vLLM-HF mismatch debugging)
+                "prompt": item.get("prompt", ""),
+                "completion": item.get("completion", ""),
             }
 
             # Add reference logprobs if available (enables skipping reference forward pass)

@@ -1,6 +1,6 @@
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
@@ -9,6 +9,22 @@ from torch.nn.utils.rnn import pad_sequence
 
 if TYPE_CHECKING:
     from peft import PeftModel
+
+
+@dataclass
+class ISOutlier:
+    """Info about a sample with extreme IS ratio (for debugging vLLM-HF mismatch)."""
+
+    prompt: str
+    completion: str
+    is_ratio: float  # Raw IS ratio (before capping)
+    logprob_diff: float  # completion_logprob - rollout_logprob (sequence-level)
+    completion_logprob: float  # HuggingFace computed
+    rollout_logprob: float  # vLLM computed
+    num_tokens: int
+    group_id: str
+    reward: float
+    advantage: float
 
 
 @dataclass
@@ -146,13 +162,26 @@ class GRPOLossOutput:
     # Importance Sampling statistics (vLLM-HuggingFace mismatch correction)
     is_ratio_mean: float = 1.0  # Raw IS ratio before correction
     is_ratio_std: float = 0.0
+    is_ratio_min: float = 1.0  # Min raw ratio (before capping)
+    is_ratio_max: float = 1.0  # Max raw ratio (before capping) - KEY DIAGNOSTIC
     is_masked_fraction: float = 0.0  # For mask mode: fraction of samples zeroed
+
+    # Token-level log_prob diagnostics (for debugging vLLM/HF mismatch)
+    token_logprob_min: float = 0.0  # Min token log_prob in batch (most rare token)
+    token_logprob_max: float = 0.0  # Max token log_prob in batch
+    token_logprob_mean: float = 0.0  # Mean token log_prob
+    logprob_diff_mean: float = 0.0  # Mean of (completion_logprobs - rollout_logprobs)
+    logprob_diff_std: float = 0.0  # Std of sequence-level log_prob differences
+    logprob_diff_max: float = 0.0  # Max absolute difference (worst mismatch)
 
     # GSPO-specific metrics (only populated when loss_type="gspo")
     gspo_sequence_ratio_mean: float = 1.0  # Geometric mean of token ratios
     gspo_sequence_ratio_std: float = 0.0
     gspo_sequence_ratio_clipped_fraction: float = 0.0
     gspo_log_ratio_mean: float = 0.0  # Mean of log ratios (before exp)
+
+    # Outliers for debugging (samples with extreme IS ratios)
+    is_outliers: list[ISOutlier] = field(default_factory=list)
 
 
 class GRPOLoss:
@@ -187,6 +216,8 @@ class GRPOLoss:
         importance_sampling_correction: bool = True,
         importance_sampling_mode: str = "sequence_truncate",
         importance_sampling_cap: float = 3.0,
+        is_outlier_threshold: float = 5.0,
+        is_outlier_max_per_batch: int = 3,
         loss_type: str = "grpo",
         use_ema_reference: bool = False,
         ema_tau: float = 0.99,
@@ -211,6 +242,8 @@ class GRPOLoss:
             importance_sampling_correction: Apply IS correction for vLLM-HF logprobs mismatch.
             importance_sampling_mode: 'sequence_truncate' (clip ratios) or 'sequence_mask' (zero out).
             importance_sampling_cap: Cap for IS ratios (TRL default 3.0).
+            is_outlier_threshold: Log samples with IS ratio > this threshold (for debugging).
+            is_outlier_max_per_batch: Max outliers to log per batch (to avoid spam).
             loss_type: 'grpo' for token-level IS or 'gspo' for sequence-level IS.
             use_ema_reference: Use EMA of LoRA weights as reference instead of base model.
             ema_tau: EMA decay rate (0.99 = slow update, 0.9 = faster).
@@ -228,6 +261,8 @@ class GRPOLoss:
         self.importance_sampling_correction = importance_sampling_correction
         self.importance_sampling_mode = importance_sampling_mode
         self.importance_sampling_cap = importance_sampling_cap
+        self.is_outlier_threshold = is_outlier_threshold
+        self.is_outlier_max_per_batch = is_outlier_max_per_batch
         self.loss_type = loss_type
         self.use_ema_reference = use_ema_reference
         self.ema_tau = ema_tau
@@ -374,6 +409,19 @@ class GRPOLoss:
         # Sum log probs over the completion length per sequence
         completion_log_probs = token_log_probs.sum(dim=1)
 
+        # 4b. Token-level log_prob diagnostics (for debugging vLLM/HF mismatch)
+        with torch.no_grad():
+            # Only look at completion tokens (where mask=1)
+            completion_token_logprobs = token_log_probs_raw[token_mask.bool()]
+            if len(completion_token_logprobs) > 0:
+                token_logprob_min = completion_token_logprobs.min().item()
+                token_logprob_max = completion_token_logprobs.max().item()
+                token_logprob_mean = completion_token_logprobs.mean().item()
+            else:
+                token_logprob_min = 0.0
+                token_logprob_max = 0.0
+                token_logprob_mean = 0.0
+
         # 5. Reference LogProbs: Use cached or compute via forward pass
         # Check if ALL batch items have pre-computed reference logprobs
         # CRITICAL: Must be all-or-nothing to avoid mixing cached and computed logprobs
@@ -476,13 +524,23 @@ class GRPOLoss:
         # Track IS statistics for logging
         is_ratio_mean = 1.0
         is_ratio_std = 0.0
+        is_ratio_min = 1.0
+        is_ratio_max = 1.0
         is_masked_fraction = 0.0
+
+        # Track log_prob difference statistics (vLLM vs HF mismatch)
+        logprob_diff_mean = 0.0
+        logprob_diff_std = 0.0
+        logprob_diff_max = 0.0
 
         # GSPO-specific metrics (only populated when loss_type="gspo")
         gspo_sequence_ratio_mean = 1.0
         gspo_sequence_ratio_std = 0.0
         gspo_sequence_ratio_clipped_fraction = 0.0
         gspo_log_ratio_mean = 0.0
+
+        # Outliers for debugging (samples with extreme IS ratios)
+        is_outliers: list[ISOutlier] = []
 
         if use_clipping:
             # Extract rollout logprobs (from generation time)
@@ -507,7 +565,38 @@ class GRPOLoss:
                 with torch.no_grad():
                     is_ratio_mean = s_i.mean().item()
                     is_ratio_std = s_i.std().item() if len(s_i) > 1 else 0.0
+                    is_ratio_min = s_i.min().item()
+                    is_ratio_max = s_i.max().item()
                     gspo_log_ratio_mean = log_ratio_sequence.mean().item()
+
+                    # Log_prob difference stats (vLLM vs HF mismatch diagnostic)
+                    seq_diff = completion_log_probs - rollout_log_probs
+                    logprob_diff_mean = seq_diff.mean().item()
+                    logprob_diff_std = seq_diff.std().item() if len(seq_diff) > 1 else 0.0
+                    logprob_diff_max = seq_diff.abs().max().item()
+
+                    # Collect outliers (samples with extreme IS ratios)
+                    outlier_mask = s_i > self.is_outlier_threshold
+                    if outlier_mask.any():
+                        outlier_indices = outlier_mask.nonzero(as_tuple=True)[0].tolist()
+                        # Sort by ratio (descending) and take top N
+                        outlier_ratios = [(idx, s_i[idx].item()) for idx in outlier_indices]
+                        outlier_ratios.sort(key=lambda x: x[1], reverse=True)
+                        for idx, ratio_val in outlier_ratios[: self.is_outlier_max_per_batch]:
+                            is_outliers.append(
+                                ISOutlier(
+                                    prompt=batch[idx].get("prompt", "")[:500],  # Truncate
+                                    completion=batch[idx].get("completion", "")[:500],
+                                    is_ratio=ratio_val,
+                                    logprob_diff=seq_diff[idx].item(),
+                                    completion_logprob=completion_log_probs[idx].item(),
+                                    rollout_logprob=rollout_log_probs[idx].item(),
+                                    num_tokens=int(token_counts[idx].item()),
+                                    group_id=batch[idx].get("group_id", ""),
+                                    reward=batch[idx].get("reward", 0.0),
+                                    advantage=advantages[idx].item(),
+                                )
+                            )
 
                 # Apply IS correction (same logic as GRPO, but on sequence ratio)
                 if self.importance_sampling_correction:
@@ -579,6 +668,37 @@ class GRPOLoss:
                 with torch.no_grad():
                     is_ratio_mean = ratio_raw.mean().item()
                     is_ratio_std = ratio_raw.std().item() if len(ratio_raw) > 1 else 0.0
+                    is_ratio_min = ratio_raw.min().item()
+                    is_ratio_max = ratio_raw.max().item()
+
+                    # Log_prob difference stats (vLLM vs HF mismatch diagnostic)
+                    seq_diff = completion_log_probs - rollout_log_probs
+                    logprob_diff_mean = seq_diff.mean().item()
+                    logprob_diff_std = seq_diff.std().item() if len(seq_diff) > 1 else 0.0
+                    logprob_diff_max = seq_diff.abs().max().item()
+
+                    # Collect outliers (samples with extreme IS ratios)
+                    outlier_mask = ratio_raw > self.is_outlier_threshold
+                    if outlier_mask.any():
+                        outlier_indices = outlier_mask.nonzero(as_tuple=True)[0].tolist()
+                        # Sort by ratio (descending) and take top N
+                        outlier_ratios = [(idx, ratio_raw[idx].item()) for idx in outlier_indices]
+                        outlier_ratios.sort(key=lambda x: x[1], reverse=True)
+                        for idx, ratio_val in outlier_ratios[: self.is_outlier_max_per_batch]:
+                            is_outliers.append(
+                                ISOutlier(
+                                    prompt=batch[idx].get("prompt", "")[:500],  # Truncate
+                                    completion=batch[idx].get("completion", "")[:500],
+                                    is_ratio=ratio_val,
+                                    logprob_diff=seq_diff[idx].item(),
+                                    completion_logprob=completion_log_probs[idx].item(),
+                                    rollout_logprob=rollout_log_probs[idx].item(),
+                                    num_tokens=int(token_counts[idx].item()),
+                                    group_id=batch[idx].get("group_id", ""),
+                                    reward=batch[idx].get("reward", 0.0),
+                                    advantage=advantages[idx].item(),
+                                )
+                            )
 
                 # Apply importance sampling correction (TRL-style)
                 # This handles the systematic vLLM-HF mismatch before PPO clipping
@@ -684,9 +804,18 @@ class GRPOLoss:
             entropy_std=entropy_std,
             is_ratio_mean=is_ratio_mean,
             is_ratio_std=is_ratio_std,
+            is_ratio_min=is_ratio_min,
+            is_ratio_max=is_ratio_max,
             is_masked_fraction=is_masked_fraction,
+            token_logprob_min=token_logprob_min,
+            token_logprob_max=token_logprob_max,
+            token_logprob_mean=token_logprob_mean,
+            logprob_diff_mean=logprob_diff_mean,
+            logprob_diff_std=logprob_diff_std,
+            logprob_diff_max=logprob_diff_max,
             gspo_sequence_ratio_mean=gspo_sequence_ratio_mean,
             gspo_sequence_ratio_std=gspo_sequence_ratio_std,
             gspo_sequence_ratio_clipped_fraction=gspo_sequence_ratio_clipped_fraction,
             gspo_log_ratio_mean=gspo_log_ratio_mean,
+            is_outliers=is_outliers,
         )
