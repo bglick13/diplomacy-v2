@@ -81,6 +81,7 @@ class MatchmakingResult:
     power_adapters: dict[str, str | None]  # Power -> adapter path or bot name
     power_agent_names: dict[str, str]  # Power -> agent name (for rating updates)
     opponent_categories: dict[str, str]  # Power -> category (self, peer, baseline, etc.)
+    power_elos: dict[str, float] | None = None  # Power -> Elo rating (for Elo-conditioned rewards)
 
     def to_wandb_dict(self) -> dict[str, Any]:
         """Format for WandB logging."""
@@ -214,6 +215,21 @@ class PFSPMatchmaker:
                 power_agent_names[power] = hero_agent
                 opponent_categories[power] = "self"
 
+        # Build power_elos for Elo-conditioned rewards
+        power_elos: dict[str, float] = {}
+        for power, agent_name in power_agent_names.items():
+            if power == hero_power:
+                # Use hero_rating (which may be overridden or from registry)
+                power_elos[power] = hero_rating
+            else:
+                # Look up agent's rating from registry
+                agent_info = self.registry.get_agent(agent_name)
+                if agent_info:
+                    power_elos[power] = agent_info.display_rating
+                else:
+                    # Fallback for baseline bots or unknown agents
+                    power_elos[power] = 0.0
+
         return MatchmakingResult(
             hero_power=hero_power,
             hero_agent=hero_agent,
@@ -221,6 +237,7 @@ class PFSPMatchmaker:
             power_adapters=power_adapters,
             power_agent_names=power_agent_names,
             opponent_categories=opponent_categories,
+            power_elos=power_elos,
         )
 
     def _sample_category(self) -> str:
@@ -434,6 +451,14 @@ class PFSPMatchmaker:
             power_agent_names[power] = bot_name
             opponent_categories[power] = "baseline"
 
+        # Build power_elos for Elo-conditioned rewards
+        # Use fallback ratings since registry may not have these bots yet
+        COLD_START_ELOS = {"base_model": 1000.0, "random_bot": 900.0, "chaos_bot": 900.0}
+        power_elos: dict[str, float] = {hero_power: COLD_START_ELOS.get("base_model", 1000.0)}
+        for power, agent_name in power_agent_names.items():
+            if power != hero_power:
+                power_elos[power] = COLD_START_ELOS.get(agent_name, 900.0)
+
         return MatchmakingResult(
             hero_power=hero_power,
             hero_agent="base_model",
@@ -441,6 +466,7 @@ class PFSPMatchmaker:
             power_adapters=power_adapters,
             power_agent_names=power_agent_names,
             opponent_categories=opponent_categories,
+            power_elos=power_elos,
         )
 
     def get_sampling_stats(self, results: list[MatchmakingResult]) -> dict[str, Any]:

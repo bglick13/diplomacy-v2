@@ -429,28 +429,36 @@ class GRPOLoss:
         all_have_ref_logprobs = all(has_ref_logprobs)
         none_have_ref_logprobs = not any(has_ref_logprobs)
 
-        # Validate consistency
-        if not all_have_ref_logprobs and not none_have_ref_logprobs:
-            # Mixed batch - some have ref_logprobs, some don't
-            # This is a bug in trajectory processing
-            num_with = sum(has_ref_logprobs)
-            num_without = len(batch) - num_with
-            raise ValueError(
-                f"Inconsistent reference logprobs in batch: {num_with} items have ref_logprobs, "
-                f"{num_without} don't. This creates biased KL estimates. "
-                "All trajectories in a batch must have the same ref_logprobs availability."
-            )
+        # Validate consistency (only when not using EMA reference)
+        if not self.use_ema_reference:
+            if not all_have_ref_logprobs and not none_have_ref_logprobs:
+                # Mixed batch - some have ref_logprobs, some don't
+                # This is a bug in trajectory processing
+                num_with = sum(has_ref_logprobs)
+                num_without = len(batch) - num_with
+                raise ValueError(
+                    f"Inconsistent reference logprobs in batch: {num_with} items have ref_logprobs, "
+                    f"{num_without} don't. This creates biased KL estimates. "
+                    "All trajectories in a batch must have the same ref_logprobs availability."
+                )
 
         used_cached_ref = False
 
-        if all_have_ref_logprobs:
+        # CRITICAL: When using EMA reference, ALWAYS compute ref logprobs using EMA weights.
+        # Do NOT use cached ref_logprobs from rollouts - those are from the rollout policy,
+        # not the EMA reference. Using them would measure vLLM-HF mismatch instead of
+        # policy drift from EMA, causing KL to explode as the policy becomes more peaked.
+        should_use_cached = all_have_ref_logprobs and not self.use_ema_reference
+
+        if should_use_cached:
             # OPTIMIZATION: Use pre-computed reference logprobs (skip forward pass!)
+            # Only valid when comparing to base model (not EMA)
             ref_completion_log_probs = torch.tensor(
                 [b["ref_logprobs"] for b in batch], dtype=torch.float32, device=device
             )
             used_cached_ref = True
         else:
-            # Fallback: Forward Pass (Reference Policy) for KL
+            # Compute reference logprobs via forward pass
             # Use EMA weights if enabled, otherwise use base model (disabled adapter)
             with torch.no_grad():
                 if self.use_ema_reference:
@@ -458,6 +466,13 @@ class GRPOLoss:
                     # Semantics: "don't change too fast" instead of "stay close to base"
                     if not self._ema_initialized:
                         self.initialize_ema()
+                    # Log once to confirm EMA is being used (not bypassed by cached ref_logprobs)
+                    if not hasattr(self, "_logged_ema_used"):
+                        self._logged_ema_used = True
+                        print(
+                            "📊 EMA reference: Computing ref logprobs using EMA weights "
+                            "(not using cached ref_logprobs from rollouts)"
+                        )
                     with self._use_ema_weights():
                         ref_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
                 else:

@@ -669,6 +669,7 @@ class RolloutManager:
             self.cfg.model_dump(),
             power_adapters=power_adapters,
             power_agent_names=power_agent_names,
+            power_elos=match_result.power_elos,
             hero_power=hero_power,
         )
 
@@ -681,14 +682,26 @@ class RolloutManager:
         powers = ["AUSTRIA", "ENGLAND", "FRANCE", "GERMANY", "ITALY", "RUSSIA", "TURKEY"]
         opponent_powers = [p for p in powers if p != hero_power]
 
+        # Look up dynamically updated ratings from registry
+        # DumbBot rating is updated via TrueSkill after each game it plays
+        dumbbot_elo = 850.0  # Fallback to initial rating
+        hero_elo = 0.0
+        if self.league_ctx:
+            dumbbot_info = self.league_ctx.registry.get_agent("dumb_bot")
+            if dumbbot_info:
+                dumbbot_elo = dumbbot_info.display_rating
+            hero_elo = self.league_ctx.registry.best_display_rating
+
         power_adapters: dict[str, str | None] = {hero_power: None}  # Will be overridden
         power_agent_names: dict[str, str] = {hero_power: hero_agent_name}
         opponent_categories: dict[str, str] = {hero_power: "hero"}
+        power_elos: dict[str, float] = {hero_power: hero_elo}
 
         for power in opponent_powers:
             power_adapters[power] = "dumb_bot"
             power_agent_names[power] = "dumb_bot"
             opponent_categories[power] = "dumbbot_benchmark"
+            power_elos[power] = dumbbot_elo
 
         return MatchmakingResult(
             hero_power=hero_power,
@@ -697,6 +710,7 @@ class RolloutManager:
             power_adapters=power_adapters,
             power_agent_names=power_agent_names,
             opponent_categories=opponent_categories,
+            power_elos=power_elos,
         )
 
     def _spawn_legacy_rollout(self, hero_adapter_path: str | None) -> Any:

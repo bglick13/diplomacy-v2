@@ -447,18 +447,101 @@ Sparse trajectory-level rewards compare "which overall strategy was better" rath
 
 Note: Sparse needs 15x more rollouts to match sample count, isolating the reward structure effect.
 
-**Status**: `planned`
+**Status**: `completed` (invalidated by EMA bug - see below)
 - Sweep config: `experiments/sweeps/reward-structure/sweep.yaml`
+- Run names: `reward-structure-v3-{A,B}-20251228-005158`
+
+**Results** (before EMA bug discovery):
+
+| Run | Steps | Base Model Δ | DumbBot Δ | KL Max | Verdict |
+|-----|-------|--------------|-----------|--------|---------|
+| A (Dense) | 40 (crashed) | **-78** ✓ | +7 | 1,598 | **Better learning** |
+| B (Sparse) | 100 (unstable) | -21 | +68 ✗ | 129,633 | Slower, worse |
+
+**Observations**:
+- Dense dropped base_model Elo by 78 points in 40 steps (~2 Elo/step)
+- Sparse only dropped 21 points in 100 steps (~0.2 Elo/step) - 10x slower
+- Sparse LOST to dumbbot more over time (+68 Elo) - learning wrong things
+- Both crashed due to KL explosion
+
+**Key Finding**: Dense per-step rewards work better for Diplomacy. Sparse trajectory-level rewards provide too weak/delayed a signal.
+
+**INVALIDATED**: Both runs used `use_ema_reference=True` which was buggy (see Bug Discovery below). The EMA reference was never actually used - KL measured vLLM-HF mismatch instead of policy drift. Need to re-run after fix.
+
+---
+
+## Bug Discovery: EMA Reference Bypass (2024-12-28)
+
+**Problem Found**: When `use_ema_reference=True`, the EMA weights were initialized and updated correctly, but **never used for computing reference logprobs**.
+
+**Root Cause**: In `loss.py`, cached `ref_logprobs` from rollouts were used whenever available, bypassing the EMA forward pass entirely:
+
+```python
+if all_have_ref_logprobs:  # Always True when rollouts provide logprobs
+    ref_completion_log_probs = torch.tensor([b["ref_logprobs"] for b in batch], ...)
+    # ^^^ This skips EMA entirely!
+```
+
+**What This Means**:
+- KL was measuring `HuggingFace_logprobs - vLLM_rollout_logprobs` (numerical mismatch)
+- NOT measuring policy drift from EMA reference
+- As policy became more peaked, small numerical differences exploded
+- `used_cached_ref_logprobs = True` in all affected runs confirms the bug
+
+**Fix Applied**: `src/training/loss.py` now checks `should_use_cached = all_have_ref_logprobs and not self.use_ema_reference`
+
+**Affected Experiments**:
+- `reward-structure-v3-{A,B}` - invalidated
+- `reward-structure-v2-A` - invalidated
+- Any run with `use_ema_reference=True` and rollout logprobs
+
+**Verification**: After fix, runs should show:
+- `used_cached_ref_logprobs = False` (EMA actually being used)
+- `kl/max < 10` (no explosion)
+- Stable training for 100+ steps
+
+---
+
+## Exp 13: GRPO Grouping Strategies
+
+**Hypothesis**: Two orthogonal improvements to GRPO training:
+1. **State-stratified groups**: Only compare actions from similar game situations (same SC bucket × year bucket)
+2. **Elo-conditioned rewards**: Calibrate rewards by opponent difficulty (beating strong = higher reward)
+
+State stratification should reduce noise from comparing early-game defense with late-game expansion. Elo conditioning should help when playing mixed-strength opponents.
+
+**Key Config** (EMA reference fixed + dense rewards + MLP LoRA):
+- `use_ema_reference: true` (now correctly used after bug fix)
+- `use_trajectory_level_rewards: false` (dense, validated in Exp 12)
+- `lora_target_modules: [attention + MLP]`
+- `total_steps: 30` (quick validation)
+
+**Config Variants** (2×2 factorial):
+| Run | State Stratified | Elo Conditioned | Description |
+|-----|------------------|-----------------|-------------|
+| A | ❌ | ❌ | Baseline control |
+| B | ✅ | ❌ | Stratification only |
+| C | ❌ | ✅ | Elo conditioning only |
+| D | ✅ | ✅ | Both combined |
+
+**Status**: `planned`
+- Sweep config: `experiments/sweeps/grpo-grouping/sweep.yaml`
 
 **Command**:
 ```bash
-uv run python scripts/launch_sweep.py experiments/sweeps/reward-structure/sweep.yaml
+uv run modal deploy -m src.apps.deploy  # Deploy EMA fix first
+uv run python scripts/launch_sweep.py experiments/sweeps/grpo-grouping/sweep.yaml
 ```
 
+**Success Criteria** (validates EMA fix):
+1. All runs complete 30 steps without KL explosion (`kl/max < 10`)
+2. `used_cached_ref_logprobs = False` (EMA actually being used)
+3. At least one run shows `base_model` Elo decline
+
 **Key Questions**:
-1. Does 15x fewer samples significantly slow learning?
-2. Does trajectory-level comparison improve strategic play (dumbbot win rate)?
-3. Is sparse reward training stable (no KL/gradient issues)?
+1. Does state stratification improve learning signal quality?
+2. Does Elo conditioning help with mixed-strength opponents?
+3. Do they interact positively or negatively when combined?
 
 **Results**: _pending_
 

@@ -264,6 +264,63 @@ class ExperimentConfig(BaseModel):
         ),
     )
 
+    # =========================================================================
+    # GRPO Group Stratification (reduces same-action-different-reward noise)
+    # =========================================================================
+    use_state_stratified_groups: bool = Field(
+        default=False,
+        description=(
+            "Stratify GRPO groups by game state (SC count, year). "
+            "Only compares actions from similar strategic situations, reducing noise "
+            "from comparing early-game defense with late-game expansion."
+        ),
+    )
+    state_bucket_sc_thresholds: list[int] = Field(
+        default_factory=lambda: [3, 5],
+        description=(
+            "SC count thresholds for state bucketing. Creates N+1 buckets. "
+            "Default [3, 5] creates: low (≤3), mid (4-5), high (6+). "
+            "Only used when use_state_stratified_groups=True."
+        ),
+    )
+    state_bucket_year_thresholds: list[int] = Field(
+        default_factory=lambda: [1902, 1905],
+        description=(
+            "Year thresholds for state bucketing. Creates N+1 buckets. "
+            "Default [1902, 1905] creates: early (≤1902), mid (1903-1905), late (1906+). "
+            "Only used when use_state_stratified_groups=True."
+        ),
+    )
+
+    # =========================================================================
+    # Elo-Conditioned Rewards (calibrates rewards by opponent difficulty)
+    # =========================================================================
+    use_elo_conditioned_rewards: bool = Field(
+        default=False,
+        description=(
+            "Adjust rewards based on expected performance given opponent Elos. "
+            "Reward = actual_outcome - expected_outcome(opponent_elos). "
+            "Beating strong opponents gives positive reward; losing to weak gives negative."
+        ),
+    )
+    elo_conditioning_scale: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "How much to weight Elo conditioning vs raw reward. "
+            "0.0 = raw reward only, 1.0 = fully Elo-conditioned. "
+            "0.5 = blend of both. Only used when use_elo_conditioned_rewards=True."
+        ),
+    )
+    elo_baseline: float = Field(
+        default=1500.0,
+        description=(
+            "Baseline Elo for reward normalization. Hero at this Elo vs opponents at this Elo "
+            "has expected_rank = 4 (middle). Only used when use_elo_conditioned_rewards=True."
+        ),
+    )
+
     # Strategic awareness reward shaping
     leader_gap_penalty_weight: float = Field(
         default=0.3,

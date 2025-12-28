@@ -84,6 +84,7 @@ class AdapterConfig:
     power_agent_names: dict[str, str]  # For Elo updates (uses names, not paths)
     unique_loras: set[str]
     hero_power: str | None
+    power_elos: dict[str, float] | None = None  # Elos for Elo-conditioned rewards
 
     @classmethod
     def from_params(
@@ -92,6 +93,7 @@ class AdapterConfig:
         power_adapters: dict[str, str | None] | None,
         hero_power: str | None,
         power_agent_names: dict[str, str] | None = None,
+        power_elos: dict[str, float] | None = None,
     ) -> "AdapterConfig":
         """Build adapter config from legacy and new parameters."""
         # Build power_adapters from legacy lora_name if not provided
@@ -135,6 +137,7 @@ class AdapterConfig:
             power_agent_names=power_agent_names,
             unique_loras=unique_loras,
             hero_power=hero_power,
+            power_elos=power_elos,
         )
 
     def should_collect_power(self, power: str) -> bool:
@@ -155,6 +158,23 @@ class AdapterConfig:
         if self.hero_power:
             return self.uses_lora(self.hero_power)
         return bool(self.unique_loras)
+
+    def get_hero_elo(self, default: float = 1500.0) -> float:
+        """Get hero power's Elo rating, or default if not available."""
+        if not self.power_elos or not self.hero_power:
+            return default
+        return self.power_elos.get(self.hero_power, default)
+
+    def get_opponent_elos(self, default: float = 1500.0) -> list[float]:
+        """Get list of opponent Elos (all non-hero powers)."""
+        if not self.power_elos:
+            return [default] * 6  # 6 opponents in Diplomacy
+
+        opponent_elos = []
+        for power in POWERS:
+            if power != self.hero_power:
+                opponent_elos.append(self.power_elos.get(power, default))
+        return opponent_elos
 
 
 def ensure_adapters_loaded(adapter_config: AdapterConfig) -> float:
@@ -229,6 +249,132 @@ def create_no_orders_response() -> PowerResult:
             "completion_logprobs": [],
         },
     )
+
+
+# ============================================================================
+# STATE-STRATIFIED GROUPING HELPERS
+# ============================================================================
+
+
+def get_state_bucket(
+    sc_count: int,
+    year: int,
+    sc_thresholds: list[int],
+    year_thresholds: list[int],
+) -> str:
+    """
+    Compute state bucket for GRPO group stratification.
+
+    Buckets by SC count and year to ensure GRPO only compares actions
+    from similar strategic situations.
+
+    Args:
+        sc_count: Number of supply centers the power controls
+        year: Current game year
+        sc_thresholds: SC thresholds for bucketing (e.g., [3, 5] → low/mid/high)
+        year_thresholds: Year thresholds (e.g., [1902, 1905] → early/mid/late)
+
+    Returns:
+        Bucket string like "sc_mid_year_early"
+    """
+    # SC bucket
+    sc_bucket = "high"
+    for i, threshold in enumerate(sorted(sc_thresholds)):
+        if sc_count <= threshold:
+            sc_bucket = ["low", "mid", "high"][min(i, 2)]
+            break
+
+    # Year bucket
+    year_bucket = "late"
+    for i, threshold in enumerate(sorted(year_thresholds)):
+        if year <= threshold:
+            year_bucket = ["early", "mid", "late"][min(i, 2)]
+            break
+
+    return f"sc_{sc_bucket}_year_{year_bucket}"
+
+
+# ============================================================================
+# ELO-CONDITIONED REWARDS HELPERS
+# ============================================================================
+
+
+def compute_expected_rank(
+    hero_elo: float,
+    opponent_elos: list[float],
+    elo_baseline: float = 1500.0,
+) -> float:
+    """
+    Compute expected rank (1-7) given Elo ratings.
+
+    Uses Elo win probability formula to compute expected performance.
+    Rank 1 = best (leader), Rank 7 = worst (eliminated).
+
+    Args:
+        hero_elo: Hero's Elo rating
+        opponent_elos: List of opponent Elo ratings (length 6 for Diplomacy)
+        elo_baseline: Baseline Elo for normalization
+
+    Returns:
+        Expected rank from 1.0 (always win) to 7.0 (always lose)
+    """
+    if not opponent_elos:
+        return 4.0  # Middle rank if no opponents
+
+    # Compute win probability vs each opponent using Elo formula
+    # P(win) = 1 / (1 + 10^((opponent_elo - hero_elo) / 400))
+    total_win_prob = 0.0
+    for opp_elo in opponent_elos:
+        win_prob = 1.0 / (1.0 + 10 ** ((opp_elo - hero_elo) / 400.0))
+        total_win_prob += win_prob
+
+    # Average win probability across all opponents
+    avg_win_prob = total_win_prob / len(opponent_elos)
+
+    # Map to expected rank: 1.0 (100% win) to 7.0 (0% win)
+    # Linear interpolation: rank = 7 - 6 * avg_win_prob
+    expected_rank = 7.0 - 6.0 * avg_win_prob
+
+    return expected_rank
+
+
+def compute_elo_conditioned_reward(
+    raw_reward: float,
+    actual_rank: int,
+    hero_elo: float,
+    opponent_elos: list[float],
+    elo_baseline: float = 1500.0,
+    conditioning_scale: float = 0.5,
+) -> float:
+    """
+    Compute Elo-conditioned reward.
+
+    Adjusts reward based on actual vs expected performance given opponent difficulty.
+    Beating strong opponents = positive adjustment; losing to weak = negative.
+
+    Args:
+        raw_reward: Original reward before Elo conditioning
+        actual_rank: Actual finishing rank (1-7, lower is better)
+        hero_elo: Hero's Elo rating
+        opponent_elos: List of opponent Elo ratings
+        elo_baseline: Baseline Elo for normalization
+        conditioning_scale: How much to weight conditioning (0=raw, 1=full)
+
+    Returns:
+        Elo-conditioned reward
+    """
+    expected_rank = compute_expected_rank(hero_elo, opponent_elos, elo_baseline)
+
+    # Outperformance: positive when actual rank < expected rank (did better)
+    # Scale by 2 to make the adjustment meaningful (rank diff of 1 = 2 points)
+    outperformance = (expected_rank - actual_rank) * 2.0
+
+    # Blend raw reward with Elo conditioning
+    conditioned_reward = (1.0 - conditioning_scale) * raw_reward + conditioning_scale * (
+        raw_reward + outperformance
+    )
+
+    return conditioned_reward
 
 
 def collect_llm_powers(
@@ -1143,12 +1289,55 @@ def build_trajectories(
             # Reward = final score + strategic (no step component)
             trajectory_reward = final_scores[power] + strategic_component
 
-            # Trajectory-level grouping: compare forks, not steps
+            # Apply Elo conditioning if enabled
+            if cfg.use_elo_conditioned_rewards and adapter_config.power_elos:
+                # Compute power_ranks for this game (needed for Elo conditioning)
+                game_sc_counts_elo = {pn: len(p.centers) for pn, p in game.game.powers.items()}
+                sorted_powers_elo = sorted(
+                    game_sc_counts_elo.items(), key=lambda x: x[1], reverse=True
+                )
+                power_ranks_elo: dict[str, int] = {}
+                prev_sc_elo = None
+                prev_rank_elo = 0
+                for i, (power_name, sc_count_elo) in enumerate(sorted_powers_elo):
+                    if sc_count_elo == prev_sc_elo:
+                        power_ranks_elo[power_name] = prev_rank_elo
+                    else:
+                        power_ranks_elo[power_name] = i + 1
+                        prev_rank_elo = i + 1
+                    prev_sc_elo = sc_count_elo
+
+                hero_elo = adapter_config.get_hero_elo(cfg.elo_baseline)
+                opponent_elos = adapter_config.get_opponent_elos(cfg.elo_baseline)
+                hero_rank = power_ranks_elo.get(power, 4)
+                trajectory_reward = compute_elo_conditioned_reward(
+                    raw_reward=trajectory_reward,
+                    actual_rank=hero_rank,
+                    hero_elo=hero_elo,
+                    opponent_elos=opponent_elos,
+                    elo_baseline=cfg.elo_baseline,
+                    conditioning_scale=cfg.elo_conditioning_scale,
+                )
+
+            # Build group_id with optional state stratification
+            if cfg.use_state_stratified_groups:
+                step_year = data.get("year", 1901)
+                step_sc = len(game.game.powers[power].centers)
+                state_bucket = get_state_bucket(
+                    sc_count=step_sc,
+                    year=step_year,
+                    sc_thresholds=cfg.state_bucket_sc_thresholds,
+                    year_thresholds=cfg.state_bucket_year_thresholds,
+                )
+                group_id = f"{power}_{state_bucket}"  # No step_count → trajectory grouping
+            else:
+                group_id = f"{game_id}_{power}"  # No step_count → trajectory grouping
+
             traj = {
                 "prompt": data["prompt"],
                 "completion": data["completion"],
                 "reward": trajectory_reward,
-                "group_id": f"{game_id}_{power}",  # No step_count → trajectory grouping
+                "group_id": group_id,
                 "prompt_token_ids": data.get("prompt_token_ids", []),
                 "completion_token_ids": data.get("completion_token_ids", []),
                 "completion_logprobs": data.get("completion_logprobs", []),
@@ -1237,13 +1426,57 @@ def build_trajectories(
 
                 blended_reward = step_component + final_component + strategic_component
 
-                # Use step_count in group_id for proper credit assignment
-                # This ensures trajectories from the same step across forks are grouped together
+                # Apply Elo conditioning if enabled
+                # Adjusts reward based on actual vs expected performance given opponent difficulty
+                if cfg.use_elo_conditioned_rewards and adapter_config.power_elos:
+                    # Compute power_ranks for this game (needed for Elo conditioning)
+                    game_sc_counts_elo = {pn: len(p.centers) for pn, p in game.game.powers.items()}
+                    sorted_powers_elo = sorted(
+                        game_sc_counts_elo.items(), key=lambda x: x[1], reverse=True
+                    )
+                    power_ranks_elo: dict[str, int] = {}
+                    prev_sc_elo = None
+                    prev_rank_elo = 0
+                    for i, (power_name, sc_count_elo) in enumerate(sorted_powers_elo):
+                        if sc_count_elo == prev_sc_elo:
+                            power_ranks_elo[power_name] = prev_rank_elo
+                        else:
+                            power_ranks_elo[power_name] = i + 1
+                            prev_rank_elo = i + 1
+                        prev_sc_elo = sc_count_elo
+
+                    hero_elo = adapter_config.get_hero_elo(cfg.elo_baseline)
+                    opponent_elos = adapter_config.get_opponent_elos(cfg.elo_baseline)
+                    hero_rank = power_ranks_elo.get(power, 4)
+                    blended_reward = compute_elo_conditioned_reward(
+                        raw_reward=blended_reward,
+                        actual_rank=hero_rank,
+                        hero_elo=hero_elo,
+                        opponent_elos=opponent_elos,
+                        elo_baseline=cfg.elo_baseline,
+                        conditioning_scale=cfg.elo_conditioning_scale,
+                    )
+
+                # Build group_id with optional state stratification
+                # State stratification ensures GRPO only compares actions from similar situations
+                if cfg.use_state_stratified_groups:
+                    step_year = data.get("year", 1901)
+                    step_sc = len(game.game.powers[power].centers)  # Use current game SC
+                    state_bucket = get_state_bucket(
+                        sc_count=step_sc,
+                        year=step_year,
+                        sc_thresholds=cfg.state_bucket_sc_thresholds,
+                        year_thresholds=cfg.state_bucket_year_thresholds,
+                    )
+                    group_id = f"{power}_{state_bucket}_step{step_count}"
+                else:
+                    group_id = f"{game_id}_{power}_step{step_count}"
+
                 traj = {
                     "prompt": data["prompt"],
                     "completion": data["completion"],
                     "reward": blended_reward,
-                    "group_id": f"{game_id}_{power}_step{step_count}",
+                    "group_id": group_id,
                     "prompt_token_ids": data.get("prompt_token_ids", []),
                     "completion_token_ids": data.get("completion_token_ids", []),
                     "completion_logprobs": data.get("completion_logprobs", []),
@@ -1427,6 +1660,7 @@ async def run_rollout(
     *,
     power_adapters: dict[str, str | None] | None = None,
     power_agent_names: dict[str, str] | None = None,
+    power_elos: dict[str, float] | None = None,
     hero_power: str | None = None,
 ):
     """
@@ -1443,6 +1677,8 @@ async def run_rollout(
                        If None, falls back to using lora_name for all powers.
         power_agent_names: Mapping of power name to agent name (for Elo updates).
                           Uses proper agent names (e.g., "adapter_v50") not paths.
+        power_elos: Mapping of power name to Elo rating (for Elo-conditioned rewards).
+                   If None, Elo conditioning is disabled.
         hero_power: Which power's trajectories to collect for training.
                    If None, collects trajectories for ALL powers (original behavior).
     """
@@ -1453,7 +1689,7 @@ async def run_rollout(
     try:
         cfg = ExperimentConfig(**config_dict)
         adapter_config = AdapterConfig.from_params(
-            lora_name, power_adapters, hero_power, power_agent_names
+            lora_name, power_adapters, hero_power, power_agent_names, power_elos
         )
 
         # Get InferenceEngine class from deployed app

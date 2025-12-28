@@ -1,0 +1,142 @@
+# Ablation Study: GRPO Grouping Strategies
+#
+# Tests two orthogonal improvements to GRPO training:
+# 1. State-stratified groups: Only compare actions from similar game situations
+# 2. Elo-conditioned rewards: Calibrate rewards by opponent difficulty
+#
+# This is a 2x2 factorial design to measure individual and combined effects.
+# Run after fixing EMA reference bug to ensure KL stability.
+
+metadata:
+  name: "grpo-grouping"
+  description: "Ablation: State stratification and Elo conditioning for GRPO"
+  hypothesis: |
+    State stratification should improve learning by ensuring GRPO only compares
+    "apples to apples" - early-game positioning vs early-game, late-game expansion
+    vs late-game. Without stratification, a defensive move that prevents elimination
+    might be compared against an aggressive expansion, confusing the gradient signal.
+
+    Elo conditioning should help calibrate rewards when playing mixed-strength
+    opponents. Beating a strong opponent should be rewarded more than beating a
+    weak one, and losing to a weak opponent should be penalized more.
+
+    Expected outcomes:
+    - A (baseline): Reasonable learning, some noise from mixed comparisons
+    - B (stratified): Cleaner gradient signal, possibly faster learning
+    - C (elo-cond): Better calibration when opponent diversity is high
+    - D (both): Best of both worlds, or potential interaction effects
+
+  experiment_tag_prefix: "grpo-grouping"
+  created: "2024-12-28"
+  author: "claude-code"
+
+# Default config: EMA reference (fixed) + dense rewards + MLP LoRA
+defaults:
+  total_steps: 30
+  disable_auto_resume: true
+  loss_type: "gspo"
+  min_reward_variance: 0.01
+  temperature: 0.65
+
+  # ==========================================================================
+  # STABILITY CONFIG (EMA reference now correctly used after bug fix)
+  # ==========================================================================
+  use_ema_reference: true
+  ema_tau: 0.99
+
+  # KL penalty
+  kl_beta: 0.04
+  kl_beta_warmup_steps: 0
+
+  # PPO clipping
+  use_ppo_clipping: true
+  ppo_epsilon_low: 0.2
+  ppo_epsilon_high: 0.5
+  importance_sampling_cap: 1.5
+
+  learning_rate: 1e-6
+  max_grad_norm: 5.0
+
+  # LoRA: MLP modules for learning capacity
+  lora_rank: 16
+  lora_target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+  # Dense rewards (validated as better than sparse)
+  use_trajectory_level_rewards: false
+  reward_discount_gamma: 0.0
+  step_reward_weight: 0.8
+  final_reward_weight: 0.2
+
+  # Strategic awareness
+  leader_gap_penalty_weight: 0.3
+  balance_bonus_weight: 0.2
+
+  # Other settings
+  entropy_coef: 0.0
+  use_token_level_loss: false
+  dumbbot_game_probability: 0.0
+  num_groups_per_step: 16
+
+# Analysis configuration
+analysis:
+  primary_metric: "elo/base_model"
+  secondary_metrics:
+    - "elo_gap"
+    - "dumbbot/win_rate"
+    - "kl/mean"
+    - "kl/max"
+    - "benchmark/grad_norm"
+  expected_ranking: ["D", "B", "C", "A"]  # Hypothesis: combined best, stratified second
+  success_criteria:
+    - "All runs complete 30 steps without KL explosion (kl/max < 10)"
+    - "EMA reference correctly used (used_cached_ref_logprobs = False)"
+    - "At least one run shows base_model Elo decline"
+  analysis_command: |
+    uv run python .claude/skills/experiment-analysis/analyze_sweep.py --sweep grpo-grouping
+
+# Run definitions (2x2 factorial)
+runs:
+  A:
+    name: "baseline"
+    description: "No stratification, no Elo conditioning - control"
+    config:
+      use_state_stratified_groups: false
+      use_elo_conditioned_rewards: false
+      experiment_tag: "${metadata.experiment_tag_prefix}-A-baseline"
+
+  B:
+    name: "state-stratified"
+    description: "State-stratified groups only"
+    config:
+      use_state_stratified_groups: true
+      state_bucket_sc_thresholds: [3, 5]
+      state_bucket_year_thresholds: [1902, 1905]
+      use_elo_conditioned_rewards: false
+      experiment_tag: "${metadata.experiment_tag_prefix}-B-stratified"
+
+  C:
+    name: "elo-conditioned"
+    description: "Elo-conditioned rewards only"
+    config:
+      use_state_stratified_groups: false
+      use_elo_conditioned_rewards: true
+      elo_conditioning_scale: 0.5
+      experiment_tag: "${metadata.experiment_tag_prefix}-C-elo-cond"
+
+  D:
+    name: "both"
+    description: "State stratification + Elo conditioning"
+    config:
+      use_state_stratified_groups: true
+      state_bucket_sc_thresholds: [3, 5]
+      state_bucket_year_thresholds: [1902, 1905]
+      use_elo_conditioned_rewards: true
+      elo_conditioning_scale: 0.5
+      experiment_tag: "${metadata.experiment_tag_prefix}-D-both"

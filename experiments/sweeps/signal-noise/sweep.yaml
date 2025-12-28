@@ -1,0 +1,155 @@
+# Ablation Study: Signal-to-Noise Improvements
+#
+# Motivation: Weave trajectory analysis revealed high variance in same-action rewards.
+# For example, "A BUR D" (disband in Burgundy) had reward range [-6.3, 12.5] with std=4.59.
+# This creates noisy gradients: model learns nothing when same action has opposite signals.
+#
+# This sweep tests three approaches to improve signal-to-noise ratio:
+#
+# A) Baseline: Current config from reward-structure-v3
+# B) State-Stratified Grouping: GRPO groups by game state (SC count, year) instead of game_id
+#    - Only compares actions from similar strategic situations
+#    - Reduces noise from comparing early-game defense with late-game expansion
+# C) Elo-Conditioned Rewards: Adjusts rewards based on opponent strength
+#    - Winning against 1200 Elo bot matters less than winning against 1500 Elo
+#    - Uses sparse trajectory-level rewards (proven stable) + Elo adjustment
+#
+# Key question: Which approach provides cleaner learning signal?
+
+metadata:
+  name: "signal-noise-v1"
+  description: "Ablation: Signal-to-noise improvements via state stratification and Elo conditioning"
+  hypothesis: |
+    Two approaches to reduce gradient noise from same-action-different-reward situations:
+
+    State-stratified grouping (B) improves learning by:
+    1. Only comparing actions from similar game states (SC count, year)
+    2. Reducing noise from comparing early-game defense with late-game expansion
+    Trade-off: Smaller effective group size but cleaner comparisons.
+
+    Elo-conditioned rewards (C) improves learning by:
+    1. Adjusting raw rewards based on expected vs actual performance
+    2. Beating weak opponents gives less reward than beating strong ones
+    3. Uses proven-stable sparse trajectory-level rewards
+    Trade-off: Adds complexity but directly addresses "did you outperform expectations?"
+
+    Expected outcomes:
+    - Baseline (A): Stable learning, potential noise from mismatched comparisons
+    - State-Stratified (B): Cleaner signal within buckets, may have smaller groups
+    - Elo-Conditioned (C): Most direct noise reduction, highest signal quality expected
+
+    Success metrics:
+    - All runs complete 100 steps stably
+    - Compare loss variance (lower = cleaner signal)
+    - Compare Elo progression and final performance
+  experiment_tag_prefix: "signal-noise"
+  created: "2024-12-27"
+  author: "claude-code"
+
+# Default config values - same stability config as reward-structure-v3
+defaults:
+  total_steps: 100
+  disable_auto_resume: true
+  loss_type: "gspo"
+  min_reward_variance: 0.01
+  temperature: 0.65
+
+  # ==========================================================================
+  # STABILITY CONFIG (same as reward-structure-v3)
+  # ==========================================================================
+  use_ema_reference: true
+  ema_tau: 0.99
+  kl_beta: 0.04
+  kl_beta_warmup_steps: 0
+  use_ppo_clipping: true
+  ppo_epsilon_low: 0.2
+  ppo_epsilon_high: 0.5
+  importance_sampling_cap: 1.5
+  learning_rate: 1e-6
+  max_grad_norm: 5.0
+
+  # LoRA: MLP modules
+  lora_rank: 16
+  lora_target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+  # Other settings
+  entropy_coef: 0.0
+  use_token_level_loss: false
+  dumbbot_game_probability: 0.0
+
+  # Strategic awareness
+  leader_gap_penalty_weight: 0.3
+  balance_bonus_weight: 0.2
+
+  # Dense per-step mode (not trajectory-level)
+  reward_discount_gamma: 0.0
+  use_trajectory_level_rewards: false
+  step_reward_weight: 0.8
+  final_reward_weight: 0.2
+  num_groups_per_step: 16
+
+# Analysis configuration
+analysis:
+  primary_metric: "elo/base_model"
+  secondary_metrics:
+    - "elo_gap"
+    - "dumbbot/win_rate"
+    - "kl/mean"
+    - "benchmark/grad_norm"
+    - "ppo/clip_fraction"
+  expected_ranking: ["C", "B", "A"]  # Hypothesis: Elo conditioning > stratified > baseline
+  success_criteria:
+    - "All runs complete 100 steps without crash"
+    - "KL mean stays < 0.2 throughout training"
+    - "Compare loss variance between runs (lower = cleaner signal)"
+  analysis_command: |
+    uv run python .claude/skills/experiment-analysis/analyze_sweep.py --sweep signal-noise
+
+# Run definitions
+runs:
+  A:
+    name: "baseline"
+    description: "Current config - groups by game_id (random comparison)"
+    config:
+      use_state_stratified_groups: false
+      experiment_tag: "${metadata.experiment_tag_prefix}-A-baseline"
+
+  B:
+    name: "state-stratified"
+    description: "Groups by (power, SC_bucket, year_bucket) for similar-state comparisons"
+    config:
+      use_state_stratified_groups: true
+      # State bucket thresholds:
+      # SC: low (<=3), mid (4-5), high (6+)
+      # Year: early (<=1902), mid (1903-1905), late (1906+)
+      state_bucket_sc_thresholds:
+        - 3
+        - 5
+      state_bucket_year_thresholds:
+        - 1902
+        - 1905
+      experiment_tag: "${metadata.experiment_tag_prefix}-B-stratified"
+
+  C:
+    name: "elo-conditioned"
+    description: "Sparse rewards with Elo-based adjustment for opponent strength"
+    config:
+      # Use sparse trajectory-level rewards (proven stable)
+      use_trajectory_level_rewards: true
+      reward_discount_gamma: 0.99
+      step_reward_weight: 0.0
+      final_reward_weight: 1.0
+      # Enable Elo conditioning
+      use_elo_conditioned_rewards: true
+      elo_conditioning_scale: 0.5  # Blend 50% raw, 50% outperformance
+      elo_baseline: 1500.0
+      # No state stratification (test Elo conditioning in isolation)
+      use_state_stratified_groups: false
+      experiment_tag: "${metadata.experiment_tag_prefix}-C-elo-conditioned"
