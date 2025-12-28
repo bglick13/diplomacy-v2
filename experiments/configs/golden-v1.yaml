@@ -1,0 +1,110 @@
+# Golden Config v1: Long Training Run
+#
+# Consolidates learnings from Exp 9-13:
+# - EMA reference fix (KL now measures real policy drift)
+# - MLP LoRA (more capacity than attention-only)
+# - Dense rewards (better than sparse trajectory-level)
+# - State stratification (cleaner gradients, validated in Exp 13)
+# - Higher LR (we had 170x headroom on grad norm)
+#
+# Simplified from previous configs:
+# - Removed Elo conditioning (hurt learning)
+# - Relaxed IS cap (was compensating for the bug)
+# - Removed entropy bonus (not needed)
+#
+# Target: 200+ steps for meaningful Elo separation
+
+# =============================================================================
+# CORE TRAINING
+# =============================================================================
+total_steps: 200
+num_groups_per_step: 16
+samples_per_group: 8  # Default, more samples = better GRPO advantage estimation
+rollout_horizon_years: 5
+rollout_long_horizon_years: 8  # 20% of games run longer for strategic depth
+
+# Learning rate: 5x increase from 1e-6
+# Justified by: grad_norm=0.29 with target<50, PPO clip=0%
+learning_rate: 5e-6
+max_grad_norm: 10.0  # Relaxed from 5.0, still conservative
+
+# =============================================================================
+# MODEL: MLP LoRA (validated in Exp 9-10)
+# =============================================================================
+lora_rank: 16
+lora_target_modules:
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "o_proj"
+  - "gate_proj"  # MLP
+  - "up_proj"    # MLP
+  - "down_proj"  # MLP
+
+# =============================================================================
+# STABILITY: EMA Reference (now correctly implemented)
+# =============================================================================
+# KL measures "don't change too fast" vs slowly-moving EMA
+# This is the right semantics for long training runs
+use_ema_reference: true
+ema_tau: 0.99  # ~100 step half-life
+
+# KL penalty: moderate, no warmup needed with PPO clipping
+kl_beta: 0.04
+kl_beta_warmup_steps: 0
+
+# PPO clipping: will start triggering at higher LR
+use_ppo_clipping: true
+ppo_epsilon_low: 0.2
+ppo_epsilon_high: 0.5
+
+# IS correction: relaxed (was compensating for bug)
+importance_sampling_correction: true
+importance_sampling_cap: 3.0  # Relaxed from 1.5
+
+# =============================================================================
+# LOSS: GSPO with dense rewards (validated in Exp 12)
+# =============================================================================
+loss_type: "gspo"
+use_trajectory_level_rewards: false  # Dense per-step rewards
+reward_discount_gamma: 0.0  # No temporal credit (cleaner gradients)
+
+# Reward weights (standard)
+step_reward_weight: 0.8
+final_reward_weight: 0.2
+leader_gap_penalty_weight: 0.3
+balance_bonus_weight: 0.2
+
+# =============================================================================
+# GROUPING: State stratification (validated in Exp 13)
+# =============================================================================
+use_state_stratified_groups: true
+state_bucket_sc_thresholds: [3, 5]    # low/mid/high SC
+state_bucket_year_thresholds: [1902, 1905]  # early/mid/late game
+
+# Skip low-variance groups (GRPO needs contrast)
+min_reward_variance: 0.01
+min_group_size: 2
+
+# =============================================================================
+# REMOVED/DISABLED (not needed or hurt learning)
+# =============================================================================
+use_elo_conditioned_rewards: false  # Hurt learning in Exp 13
+entropy_coef: 0.0  # Not needed
+use_token_level_loss: false  # Standard sample-level
+
+# =============================================================================
+# OPPONENT MIX
+# =============================================================================
+# dumbbot_game_probability: 0.0 (default)
+# Matchmaking uses rating-based Gaussian sampling (sigma=150 Elo)
+# Baseline bots are in the pool and get matched when close to hero's rating
+# No need for explicit dumbbot probability
+
+# =============================================================================
+# INFRASTRUCTURE
+# =============================================================================
+temperature: 0.65
+buffer_depth: 3
+checkpoint_every_n_steps: 10
+disable_auto_resume: false  # Allow resume for long run

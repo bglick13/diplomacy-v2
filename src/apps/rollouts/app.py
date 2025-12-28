@@ -1570,9 +1570,14 @@ def sample_and_log_trajectories(
             reward = 0.0
 
             # Match by group_id pattern
-            group_pattern = f"_{power}_"
+            # Pattern must handle both formats:
+            # - Non-stratified: {game_id}_{power}_step{step_count} (e.g., "abc123_FRANCE_step5")
+            # - Stratified: {power}_{state_bucket}_step{step_count} (e.g., "FRANCE_sc_mid_year_early_step5")
             for traj in trajectories:
-                if group_pattern in traj.get("group_id", "") and traj.get("prompt") == prompt:
+                group_id = traj.get("group_id", "")
+                # Check if power appears at start or after underscore
+                power_in_group = group_id.startswith(f"{power}_") or f"_{power}_" in group_id
+                if power_in_group and traj.get("prompt") == prompt:
                     reward = traj.get("reward", 0.0)
                     break
 
