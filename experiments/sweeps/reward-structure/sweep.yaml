@@ -122,5 +122,5 @@ runs:
       use_trajectory_level_rewards: true
       # 15x more rollouts to match sample count:
       # 240 rollouts × 4 forks × 1 sample ≈ 960 samples/step
-      num_groups_per_step: 240
+      num_groups_per_step: 16
       experiment_tag: "${metadata.experiment_tag_prefix}-B-sparse"
